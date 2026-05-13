@@ -74,6 +74,7 @@ touch the same checkout.
 ```text
 Enter    submit task or slash command
 Tab      switch backend
+o        open the model picker
 j/k      select agent run
 x        expand or collapse selected run
 l        expand transcript
@@ -91,6 +92,7 @@ Slash commands are available inside the TUI:
 
 ```text
 /backend claude|codex|acpx
+/model
 /model <model>
 /agent [runId]
 /interrupt [runId]
@@ -103,18 +105,30 @@ Slash commands are available inside the TUI:
 /exit
 ```
 
+`/model` opens a picker for the active backend. Claude options include the
+latest aliases plus pinned Opus/Sonnet and large-context variants when your
+Claude Code account supports them. Codex options include the current GPT/Codex
+models Rudder knows about, and `/model <id>` still accepts any custom model id.
+
 After an agent finishes, Rudder waits 10 seconds for user input and then sends
 an automatic steering prompt asking what remains, whether the work looks good,
 and whether the relevant checks were run. Each run also updates
 `.rudder/agent-context.md`; that generated file is injected into new agent
-prompts so agents can see what other agents are working on.
+prompts so agents can see what other agents are working on. The full-screen UI
+plays a short completion sound when a run finishes while Rudder is open.
+
+Codex runs use `codex exec` with `danger-full-access`, bypassed approvals,
+`approval_policy="never"`, xhigh reasoning effort, detailed reasoning
+summaries, and the experimental `goals` feature enabled. Claude runs use
+Claude Code's print mode with `bypassPermissions`, `--dangerously-skip-permissions`,
+xhigh effort, verbose stream JSON, and session resume/fork support.
 
 Direct one-shot commands still work:
 
 ```bash
 rudder "fix the failing tests"
 rudder claude "fix the auth redirect bug"
-rudder codex --model gpt-5.4-codex "refactor the parser"
+rudder codex --model gpt-5.5 "refactor the parser"
 rudder run -d "rewrite this module"
 ```
 

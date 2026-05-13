@@ -84,10 +84,10 @@ export function defaultConfig(): RudderConfig {
       claude: { profileId: "anthropic:claude-code", model: "opus", effort: "xhigh" },
       codex: {
         profileId: "openai-codex:default",
-        model: "gpt-5.4-codex",
+        model: "gpt-5.5",
         reasoningEffort: "xhigh",
       },
-      acpx: { model: "gpt-5.4-codex", reasoningEffort: "xhigh" },
+      acpx: { model: "gpt-5.5", reasoningEffort: "xhigh" },
     },
   };
 }

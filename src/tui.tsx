@@ -1,5 +1,7 @@
 import fsp from "node:fs/promises";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
 import { currentBranch, findRepoRoot } from "./git.js";
 import {
@@ -32,6 +34,13 @@ type WorkItem = {
 };
 
 const BACKENDS: BackendId[] = ["claude", "codex", "acpx"];
+const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
+
+type ModelOption = {
+  label: string;
+  value?: string;
+  detail: string;
+};
 
 export async function runInteractiveTui(defaults?: TuiDefaults): Promise<void> {
   const instance = render(<RudderTui defaults={defaults ?? {}} />, {
@@ -59,8 +68,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [input, setInput] = useState("");
   const [notice, setNotice] = useState("Ready");
   const [helpOpen, setHelpOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modelMenuIndex, setModelMenuIndex] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
+  const notifiedFinishedRuns = useRef<Set<string> | null>(null);
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -72,6 +84,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     setRepoRoot(root);
     setConfig(nextConfig);
     setBranch(nextBranch);
+    notifyFinishedRuns(nextRuns, notifiedFinishedRuns);
     setRuns(nextRuns);
     if (!preferencesLoaded) {
       setBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
@@ -94,6 +107,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const targetRun = targetRunId ? runs.find((run) => run.id === targetRunId) : undefined;
   const activeCount = runs.filter((run) => isActive(run.status)).length;
   const selectedExpanded = Boolean(selectedRun && expandedRunIds.has(selectedRun.id));
+  const modelOptions = useMemo(() => modelOptionsForBackend(backend, config), [backend, config]);
 
   const submitTask = useCallback(async (task: string) => {
     const trimmed = task.trim();
@@ -188,8 +202,15 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setInput("");
         return;
       case "model":
-        setModel(args.join(" ") || undefined);
-        setNotice(args.length ? `Model ${args.join(" ")}` : "Using backend default model");
+        if (args.length === 0) {
+          setModelMenuOpen(true);
+          setModelMenuIndex(0);
+          setNotice(`Pick a ${backend} model`);
+        } else {
+          const nextModel = args.join(" ");
+          setModel(nextModel);
+          setNotice(`Model ${nextModel}`);
+        }
         setInput("");
         return;
       case "worktree":
@@ -218,11 +239,47 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setNotice(`Unknown command: /${command}`);
         setInput("");
     }
-  }, [app, refresh, runs, selectedRun?.id]);
+  }, [app, backend, refresh, runs, selectedRun?.id]);
+
+  const selectModelOption = useCallback((index: number) => {
+    const option = modelOptions[index];
+    if (!option) {
+      return;
+    }
+    setModel(option.value);
+    setModelMenuOpen(false);
+    setModelMenuIndex(index);
+    setNotice(option.value ? `Model ${option.value}` : "Using backend default model");
+  }, [modelOptions]);
 
   useInput((value, key) => {
     if (key.ctrl && value === "c") {
       app.exit();
+      return;
+    }
+    if (modelMenuOpen) {
+      if (key.escape) {
+        setModelMenuOpen(false);
+        setNotice("Model unchanged");
+        return;
+      }
+      if (key.upArrow || value === "k") {
+        setModelMenuIndex((current) => Math.max(0, current - 1));
+        return;
+      }
+      if (key.downArrow || value === "j") {
+        setModelMenuIndex((current) => Math.min(modelOptions.length - 1, current + 1));
+        return;
+      }
+      if (key.return) {
+        selectModelOption(modelMenuIndex);
+        return;
+      }
+      const numeric = Number(value);
+      if (Number.isInteger(numeric) && numeric >= 1 && numeric <= modelOptions.length) {
+        selectModelOption(numeric - 1);
+        return;
+      }
       return;
     }
     if (key.escape) {
@@ -295,6 +352,12 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       cycleBackend(backend, setBackend, setModel, setNotice);
       return;
     }
+    if (input.length === 0 && value === "o") {
+      setModelMenuOpen(true);
+      setModelMenuIndex(0);
+      setNotice(`Pick a ${backend} model`);
+      return;
+    }
     if (input.length === 0 && value === "c" && selectedRun) {
       setTargetRunId(selectedRun.id);
       setNotice(`${isActive(selectedRun.status) ? "Type redirect, Enter interrupts" : "Typing to"} ${shortId(selectedRun.id)}`);
@@ -350,6 +413,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         </Box>
       </Box>
       {helpOpen ? <Help /> : null}
+      {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} /> : null}
       <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} />
       <Footer />
     </Box>
@@ -481,8 +545,32 @@ function Help(): React.ReactElement {
       <Text bold color="yellow">keys</Text>
       <Text><Text color="cyan">Enter</Text> submit task or slash command   <Text color="cyan">Tab</Text> switch backend   <Text color="cyan">j/k</Text> or arrows select run</Text>
       <Text><Text color="cyan">Esc/c</Text> type to selected or interrupt running   <Text color="cyan">n</Text> new agent   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
-      <Text><Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m</Text> merge selected   <Text color="cyan">M</Text> merge all ready</Text>
-      <Text color="gray">Slash: /backend claude|codex|acpx, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
+      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m</Text> merge selected   <Text color="cyan">M</Text> merge all ready</Text>
+      <Text color="gray">Slash: /backend claude|codex|acpx, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
+    </Box>
+  );
+}
+
+function ModelMenu(props: {
+  backend: BackendId;
+  options: ModelOption[];
+  selectedIndex: number;
+  currentModel?: string;
+}): React.ReactElement {
+  return (
+    <Box borderStyle="single" borderColor="magenta" paddingX={1} flexDirection="column">
+      <Text bold color="magenta">model: {props.backend}</Text>
+      {props.options.map((option, index) => {
+        const selected = index === props.selectedIndex;
+        const active = option.value === props.currentModel || (!option.value && !props.currentModel);
+        const label = `${index + 1}. ${option.label}${active ? "  current" : ""}`;
+        return (
+          <Text key={`${option.label}-${index}`} color={selected ? "white" : "gray"} bold={selected} wrap="truncate">
+            {selected ? "> " : "  "}{label.padEnd(28, " ")} {option.detail}
+          </Text>
+        );
+      })}
+      <Text color="gray">Enter selects, Esc cancels, j/k or arrows move. Type /model &lt;id&gt; for a custom model.</Text>
     </Box>
   );
 }
@@ -511,7 +599,7 @@ function PromptDock(props: {
 function Footer(): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">Enter submit  Tab backend  Esc/c edit  n new  j/k  m/M merge  ? help  q quit</Text>
+      <Text color="gray">Enter submit  Tab backend  o model  Esc/c edit  n new  j/k  m/M merge  ? help  q quit</Text>
     </Box>
   );
 }
@@ -752,6 +840,64 @@ function modelForBackend(backend: BackendId, config: RudderConfig | null): strin
   return config.backends.acpx?.model;
 }
 
+function modelOptionsForBackend(backend: BackendId, config: RudderConfig | null): ModelOption[] {
+  const configuredDefault = modelForBackend(backend, config);
+  const defaultDetail = configuredDefault ? `configured default: ${configuredDefault}` : "use the backend's default";
+  if (backend === "claude") {
+    return [
+      { label: "Default", value: undefined, detail: defaultDetail },
+      { label: "Opus latest", value: "opus", detail: "Claude Code latest Opus alias" },
+      { label: "Opus latest 1M", value: "opus[1m]", detail: "large-context Opus alias when your account supports it" },
+      { label: "Opus 4.7", value: "claude-opus-4-7", detail: "pin Opus 4.7" },
+      { label: "Opus 4.7 1M", value: "claude-opus-4-7[1m]", detail: "pin Opus 4.7 with 1M context when available" },
+      { label: "Sonnet latest", value: "sonnet", detail: "Claude Code latest Sonnet alias" },
+      { label: "Sonnet latest 1M", value: "sonnet[1m]", detail: "large-context Sonnet alias when available" },
+      { label: "Sonnet 4.6", value: "claude-sonnet-4-6", detail: "stable explicit Sonnet id" },
+      { label: "Haiku latest", value: "haiku", detail: "fast lightweight Claude alias" },
+    ];
+  }
+  return [
+    { label: "Default", value: undefined, detail: defaultDetail },
+    { label: "GPT-5.5", value: "gpt-5.5", detail: "frontier Codex coding model" },
+    { label: "GPT-5.4 Codex", value: "gpt-5.4-codex", detail: "Codex-tuned model" },
+    { label: "GPT-5.4", value: "gpt-5.4", detail: "general coding model" },
+    { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", detail: "faster lower-cost option" },
+    { label: "GPT-5.3 Codex", value: "gpt-5.3-codex", detail: "older Codex-tuned model" },
+    { label: "GPT-5.3 Codex Spark", value: "gpt-5.3-codex-spark", detail: "fast Codex variant" },
+  ];
+}
+
+function notifyFinishedRuns(runs: UiRun[], ref: React.MutableRefObject<Set<string> | null>): void {
+  const finished = new Set(runs.filter((run) => isTerminal(run.status)).map((run) => run.id));
+  if (!ref.current) {
+    ref.current = finished;
+    return;
+  }
+  for (const run of runs) {
+    if (isTerminal(run.status) && !ref.current.has(run.id)) {
+      playCompletionSound();
+      ref.current.add(run.id);
+    }
+  }
+}
+
+function playCompletionSound(): void {
+  try {
+    const player = process.platform === "darwin" ? "afplay" : "ffplay";
+    const args = process.platform === "darwin"
+      ? [COMPLETION_SOUND]
+      : ["-nodisp", "-autoexit", "-loglevel", "quiet", COMPLETION_SOUND];
+    const child = spawn(player, args, {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.on("error", () => process.stdout.write("\u0007"));
+    child.unref();
+  } catch {
+    process.stdout.write("\u0007");
+  }
+}
+
 function resolveUiRun(runs: UiRun[], runId: string | undefined): UiRun | undefined {
   if (!runId) {
     return undefined;
@@ -769,6 +915,10 @@ function isPrintable(value: string): boolean {
 
 function isActive(status: RunStatus): boolean {
   return status === "created" || status === "running" || status === "steering" || status === "verifying";
+}
+
+function isTerminal(status: RunStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled" || status === "merged" || status === "merge-conflict";
 }
 
 function statusGlyph(status: RunStatus): string {

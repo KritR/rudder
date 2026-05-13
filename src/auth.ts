@@ -248,7 +248,7 @@ async function configureOpenAI(
     config.backends.codex = {
       ...(config.backends.codex ?? {}),
       profileId: store.profiles["openai-codex:default"] ? "openai-codex:default" : "openai:env",
-      model: config.backends.codex?.model ?? "gpt-5.4-codex",
+      model: config.backends.codex?.model ?? "gpt-5.5",
       reasoningEffort: "xhigh",
     };
     return store;
