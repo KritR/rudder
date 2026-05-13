@@ -73,12 +73,13 @@ touch the same checkout.
 
 ```text
 Enter    submit task or slash command
-Tab      switch backend
+Tab      switch focus between agents, worker, and task panes
+b        switch backend
 o        open the model picker
 j/k      select agent run
 x        expand or collapse selected run
 l        expand transcript
-Esc/c    type a follow-up to the selected agent; if it is running, Enter interrupts and redirects it
+Esc/c    focus the selected worker; if it is running, Enter interrupts and redirects it
 n        return to new-agent mode
 w        toggle worktree auto/always
 s        stop selected run
@@ -105,8 +106,9 @@ Slash commands are available inside the TUI:
 /exit
 ```
 
-Typing `/` opens a searchable command picker. Use arrows to move and `Tab` to
-complete the selected command.
+Typing `/` opens a searchable command picker. Use arrows to move in the picker.
+Press `Enter` on a partial command such as `/mo` to complete the selected
+command.
 
 `/model` opens a picker for the active backend. Claude options are discovered
 from local Claude Code session history plus the aliases exposed by the installed

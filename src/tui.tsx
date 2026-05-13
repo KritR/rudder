@@ -34,6 +34,8 @@ type WorkItem = {
   tone: "muted" | "info" | "success" | "warning" | "danger";
 };
 
+type FocusPane = "agents" | "worker" | "task";
+
 const BACKENDS: BackendId[] = ["claude", "codex", "acpx"];
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 
@@ -79,6 +81,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [runs, setRuns] = useState<UiRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [targetRunId, setTargetRunId] = useState<string | undefined>();
+  const [focusPane, setFocusPane] = useState<FocusPane>("task");
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(new Set());
   const [transcriptExpanded, setTranscriptExpanded] = useState(false);
   const [input, setInput] = useState("");
@@ -142,7 +145,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
 
   const selectedIndex = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
   const selectedRun = runs[selectedIndex];
-  const targetRun = targetRunId ? runs.find((run) => run.id === targetRunId) : undefined;
+  const targetRun = focusPane === "worker" && selectedRun ? selectedRun : targetRunId ? runs.find((run) => run.id === targetRunId) : undefined;
   const activeCount = runs.filter((run) => isActive(run.status)).length;
   const selectedExpanded = Boolean(selectedRun && expandedRunIds.has(selectedRun.id));
   const modelOptions = useMemo(
@@ -232,6 +235,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         if (run) {
           setTargetRunId(run.id);
           setSelectedRunId(run.id);
+          setFocusPane("worker");
           setNotice(`${isActive(run.status) ? "Esc/Enter will interrupt" : "Typing to"} ${shortId(run.id)}`);
         } else {
           setNotice("No agent selected");
@@ -241,6 +245,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       }
       case "new":
         setTargetRunId(undefined);
+        setFocusPane("task");
         setNotice("Typing starts a new agent");
         setInput("");
         return;
@@ -318,6 +323,21 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       app.exit();
       return;
     }
+    if (key.tab || value === "\t") {
+      const next = nextFocusPane(focusPane);
+      setFocusPane(next);
+      setModelMenuOpen(false);
+      setInput("");
+      if (next === "worker" && selectedRun) {
+        setNotice(`${isActive(selectedRun.status) ? "Worker focus: type redirect, Enter interrupts" : "Worker focus: type follow-up"} ${shortId(selectedRun.id)}`);
+      } else if (next === "agents") {
+        setNotice("Agents focus: j/k or arrows select runs");
+      } else {
+        setTargetRunId(undefined);
+        setNotice("Task focus: type a new task");
+      }
+      return;
+    }
     if (modelMenuOpen) {
       if (key.escape) {
         setModelMenuOpen(false);
@@ -352,10 +372,6 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setCommandMenuIndex((current) => Math.min(commandOptions.length - 1, current + 1));
         return;
       }
-      if (key.tab) {
-        selectCommandOption(commandMenuIndex);
-        return;
-      }
     }
     if (key.escape) {
       if (input) {
@@ -365,21 +381,23 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       } else if (transcriptExpanded) {
         setTranscriptExpanded(false);
       } else if (selectedRun) {
-        setTargetRunId(selectedRun.id);
+        setFocusPane("worker");
         setNotice(`${isActive(selectedRun.status) ? "Type redirect, Enter interrupts" : "Typing to"} ${shortId(selectedRun.id)}`);
       }
       return;
     }
-    if (key.tab || value === "\t") {
-      cycleBackend(backend, setBackend, setModel, setNotice);
-      return;
-    }
     if (key.upArrow || (input.length === 0 && value === "k")) {
       selectRelative(runs, selectedRunId, -1, setSelectedRunId);
+      if (focusPane === "task") {
+        setFocusPane("agents");
+      }
       return;
     }
     if (key.downArrow || (input.length === 0 && value === "j")) {
       selectRelative(runs, selectedRunId, 1, setSelectedRunId);
+      if (focusPane === "task") {
+        setFocusPane("agents");
+      }
       return;
     }
     if (key.pageUp) {
@@ -391,7 +409,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       return;
     }
     if (key.return) {
-      if (commandMenuOpen && input.trim() === "/") {
+      if (commandMenuOpen && shouldSelectCommand(input, commandOptions)) {
         selectCommandOption(commandMenuIndex);
       } else if (input.trim().startsWith("/")) {
         void handleCommand(input);
@@ -436,12 +454,13 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       return;
     }
     if (input.length === 0 && value === "c" && selectedRun) {
-      setTargetRunId(selectedRun.id);
+      setFocusPane("worker");
       setNotice(`${isActive(selectedRun.status) ? "Type redirect, Enter interrupts" : "Typing to"} ${shortId(selectedRun.id)}`);
       return;
     }
     if (input.length === 0 && value === "n") {
       setTargetRunId(undefined);
+      setFocusPane("task");
       setNotice("Typing starts a new agent");
       return;
     }
@@ -469,6 +488,13 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       void mergeReadyRuns(runs, false, setNotice, refresh);
       return;
     }
+    if (focusPane === "agents" && value !== "/") {
+      return;
+    }
+    if (focusPane === "worker" && !selectedRun && value !== "/") {
+      setNotice("No agent selected");
+      return;
+    }
     if (isPrintable(value)) {
       setInput((current) => current + value);
       setCommandMenuIndex(0);
@@ -485,16 +511,16 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     <Box flexDirection="column" width={width} height={height}>
       <Header width={width} repoRoot={repoRoot} branch={branch} backend={backend} model={model ?? modelForBackend(backend, config)} activeCount={activeCount} worktreeMode={worktreeMode} />
       <Box flexGrow={1} minHeight={0}>
-        <RunRail runs={runs} selectedRunId={selectedRun?.id} targetRunId={targetRunId} width={railWidth} expandedRunIds={expandedRunIds} />
+        <RunRail runs={runs} selectedRunId={selectedRun?.id} targetRunId={targetRun?.id} width={railWidth} expandedRunIds={expandedRunIds} focused={focusPane === "agents"} />
         <Box flexDirection="column" flexGrow={1} marginLeft={1}>
-          <DetailPane run={selectedRun} width={detailWidth} height={detailHeight} expanded={selectedExpanded} transcriptExpanded={transcriptExpanded} />
+          <DetailPane run={selectedRun} width={detailWidth} height={detailHeight} expanded={selectedExpanded} transcriptExpanded={transcriptExpanded} focused={focusPane === "worker"} />
         </Box>
       </Box>
       {helpOpen ? <Help /> : null}
       {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} /> : null}
       {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} /> : null}
-      <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} />
-      <Footer />
+      <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} focused={focusPane === "task"} />
+      <Footer focusPane={focusPane} />
     </Box>
   );
 }
@@ -523,12 +549,13 @@ function RunRail(props: {
   targetRunId?: string;
   width: number;
   expandedRunIds: Set<string>;
+  focused: boolean;
 }): React.ReactElement {
   const visible = props.runs.slice(0, 12);
   return (
-    <Box flexDirection="column" width={props.width} borderStyle="single" borderColor="gray" paddingX={1}>
+    <Box flexDirection="column" width={props.width} borderStyle="single" borderColor={props.focused ? "cyan" : "gray"} paddingX={1}>
       <Box justifyContent="space-between">
-        <Text bold>agents</Text>
+        <Text bold color={props.focused ? "cyan" : undefined}>agents</Text>
         <Text color="gray">{props.runs.length} runs</Text>
       </Box>
       {visible.length === 0 ? (
@@ -571,10 +598,11 @@ function DetailPane(props: {
   height: number;
   expanded: boolean;
   transcriptExpanded: boolean;
+  focused: boolean;
 }): React.ReactElement {
   if (!props.run) {
     return (
-      <Box width={props.width} height={props.height} borderStyle="single" borderColor="gray" paddingX={1} flexDirection="column">
+      <Box width={props.width} height={props.height} borderStyle="single" borderColor={props.focused ? "cyan" : "gray"} paddingX={1} flexDirection="column">
         <Text color="gray">No agent selected.</Text>
       </Box>
     );
@@ -584,10 +612,10 @@ function DetailPane(props: {
   const contentWidth = Math.max(10, props.width - 4);
   const progress = completionPercent(props.run);
   return (
-    <Box width={props.width} height={props.height} borderStyle="single" borderColor={statusColor(props.run.status)} paddingX={1} flexDirection="column">
+    <Box width={props.width} height={props.height} borderStyle="single" borderColor={props.focused ? "cyan" : statusColor(props.run.status)} paddingX={1} flexDirection="column">
       <Text> </Text>
       <Text wrap="truncate" color={statusColor(props.run.status)}>
-        {fitLine(`${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
+        {fitLine(`${props.focused ? "focus  " : ""}${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
       </Text>
       <Text wrap="truncate" color="gray">
         {fitLine(props.run.worktree.enabled ? shortenHome(props.run.worktree.path) : "current checkout", contentWidth)}
@@ -622,9 +650,9 @@ function Help(): React.ReactElement {
   return (
     <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
       <Text bold color="yellow">keys</Text>
-      <Text><Text color="cyan">Enter</Text> submit task or slash command   <Text color="cyan">Tab</Text> switch backend   <Text color="cyan">j/k</Text> or arrows select run</Text>
-      <Text><Text color="cyan">Esc/c</Text> type to selected or interrupt running   <Text color="cyan">n</Text> new agent   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
-      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m</Text> merge selected   <Text color="cyan">M</Text> merge all ready</Text>
+      <Text><Text color="cyan">Tab</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">b</Text> switch backend   <Text color="cyan">j/k</Text> select run</Text>
+      <Text><Text color="cyan">worker focus</Text> type to selected agent; running agents are interrupted on Enter   <Text color="cyan">n</Text> new task   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
+      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
       <Text color="gray">Slash: /backend claude|codex|acpx, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
     </Box>
   );
@@ -679,12 +707,13 @@ function PromptDock(props: {
   notice: string;
   submitting: boolean;
   targetRun?: UiRun;
+  focused: boolean;
 }): React.ReactElement {
   const label = props.targetRun ? `${isActive(props.targetRun.status) ? "interrupt" : "agent"} ${shortId(props.targetRun.id)}` : "task";
   return (
-    <Box borderStyle="single" borderColor="cyan" paddingX={1} justifyContent="space-between">
+    <Box borderStyle="single" borderColor={props.focused ? "cyan" : props.targetRun ? "magenta" : "gray"} paddingX={1} justifyContent="space-between">
       <Text>
-        <Text color={props.submitting ? "yellow" : "cyan"}>{props.submitting ? "starting" : label}</Text>
+        <Text color={props.submitting ? "yellow" : props.targetRun ? "magenta" : "cyan"}>{props.submitting ? "starting" : label}</Text>
         <Text>  {props.input}</Text>
         <Text color="cyan">_</Text>
       </Text>
@@ -693,10 +722,10 @@ function PromptDock(props: {
   );
 }
 
-function Footer(): React.ReactElement {
+function Footer(props: { focusPane: FocusPane }): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">Enter submit  Tab backend  o model  Esc/c edit  n new  j/k  m/M merge  ? help  q quit</Text>
+      <Text color="gray">focus:{props.focusPane}  Tab focus  b backend  o model  / commands  n new  c worker  j/k select  m/M merge  ? help</Text>
     </Box>
   );
 }
@@ -893,6 +922,16 @@ function selectRelative(
   setSelectedRunId(runs[next]?.id);
 }
 
+function nextFocusPane(current: FocusPane): FocusPane {
+  if (current === "agents") {
+    return "worker";
+  }
+  if (current === "worker") {
+    return "task";
+  }
+  return "agents";
+}
+
 function cycleBackend(
   current: BackendId,
   setBackend: (backend: BackendId) => void,
@@ -984,6 +1023,15 @@ function filterCommands(input: string): CommandOption[] {
     return COMMANDS;
   }
   return COMMANDS.filter((command) => command.name.includes(query) || command.detail.toLowerCase().includes(query));
+}
+
+function shouldSelectCommand(input: string, options: CommandOption[]): boolean {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("/") || trimmed.includes(" ")) {
+    return false;
+  }
+  const query = trimmed.slice(1);
+  return query.length === 0 || !options.some((option) => option.name === query);
 }
 
 function isBackend(value: string | undefined): value is BackendId {
