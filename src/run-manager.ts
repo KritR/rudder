@@ -141,6 +141,7 @@ export async function startRun(params: {
 export async function continueRun(params: {
   runId: string;
   prompt: string;
+  interrupt?: boolean;
   silent?: boolean;
 }): Promise<RunRecord> {
   const repoRoot = findRepoRoot();
@@ -148,8 +149,12 @@ export async function continueRun(params: {
   if (!run) {
     throw new Error(`Run not found: ${params.runId}`);
   }
-  if (isActiveStatus(run.status) && run.status !== "steering") {
+  if (isActiveStatus(run.status) && run.status !== "steering" && !params.interrupt) {
     throw new Error("That agent is still running. Wait for it to finish before sending another message.");
+  }
+  if (params.interrupt && run.process?.pid && processAlive(run.process.pid)) {
+    process.kill(run.process.pid, "SIGTERM");
+    await delay(350);
   }
   const prompt = params.prompt.trim();
   if (!prompt) {
@@ -166,7 +171,7 @@ export async function continueRun(params: {
     ts,
     runId: run.id,
     type: "run.continued",
-    message: "User continued the agent",
+    message: params.interrupt ? "User interrupted and redirected the agent" : "User continued the agent",
     data: { prompt },
   });
   await writeAgentContext(repoRoot);
@@ -198,6 +203,10 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
       const pass = await runBackendPass(current);
       current = pass.run;
       if (pass.exitCode !== 0) {
+        if (await newerWorkerOwnsRun(repoRoot, current)) {
+          await writeAgentContext(repoRoot);
+          return;
+        }
         current.status = "failed";
         await saveRunRecord(current);
         await emit(current, {
@@ -293,6 +302,10 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
       return;
     }
   } catch (error) {
+    if (await newerWorkerOwnsRun(repoRoot, run)) {
+      await writeAgentContext(repoRoot);
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     run.status = "failed";
     run.process = {
@@ -310,6 +323,17 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
     });
     await writeAgentContext(repoRoot);
   }
+}
+
+async function newerWorkerOwnsRun(repoRoot: string, staleRun: RunRecord): Promise<boolean> {
+  const latest = await loadRunRecord(repoRoot, staleRun.id);
+  return Boolean(
+    latest &&
+      isActiveStatus(latest.status) &&
+      latest.process?.startedAt &&
+      staleRun.process?.startedAt &&
+      latest.process.startedAt !== staleRun.process.startedAt,
+  );
 }
 
 async function runBackendPass(run: RunRecord): Promise<{ run: RunRecord; exitCode: number }> {

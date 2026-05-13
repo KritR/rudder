@@ -77,7 +77,7 @@ Tab      switch backend
 j/k      select agent run
 x        expand or collapse selected run
 l        expand transcript
-c        type a follow-up to the selected agent
+Esc/c    type a follow-up to the selected agent; if it is running, Enter interrupts and redirects it
 n        return to new-agent mode
 w        toggle worktree auto/always
 s        stop selected run
@@ -93,6 +93,7 @@ Slash commands are available inside the TUI:
 /backend claude|codex|acpx
 /model <model>
 /agent [runId]
+/interrupt [runId]
 /new
 /worktree auto|always
 /stop [runId]

@@ -102,17 +102,19 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
     setSubmitting(true);
     if (targetRun) {
-      setNotice(`Sending to ${shortId(targetRun.id)}...`);
+      const interrupt = isActive(targetRun.status);
+      setNotice(`${interrupt ? "Interrupting" : "Sending to"} ${shortId(targetRun.id)}...`);
       try {
         const run = await continueRun({
           runId: targetRun.id,
           prompt: trimmed,
+          interrupt,
           silent: true,
         });
         setInput("");
         setSelectedRunId(run.id);
         setExpandedRunIds((current) => new Set(current).add(run.id));
-        setNotice(`Sent to ${shortId(run.id)}`);
+        setNotice(`${interrupt ? "Interrupted" : "Sent to"} ${shortId(run.id)}`);
         await refresh();
       } catch (error) {
         setNotice(error instanceof Error ? error.message : String(error));
@@ -167,12 +169,13 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setInput("");
         return;
       case "agent":
-      case "continue": {
+      case "continue":
+      case "interrupt": {
         const run = resolveUiRun(runs, args[0] ?? selectedRun?.id);
         if (run) {
           setTargetRunId(run.id);
           setSelectedRunId(run.id);
-          setNotice(`Typing to ${shortId(run.id)}`);
+          setNotice(`${isActive(run.status) ? "Esc/Enter will interrupt" : "Typing to"} ${shortId(run.id)}`);
         } else {
           setNotice("No agent selected");
         }
@@ -229,6 +232,9 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setHelpOpen(false);
       } else if (transcriptExpanded) {
         setTranscriptExpanded(false);
+      } else if (selectedRun) {
+        setTargetRunId(selectedRun.id);
+        setNotice(`${isActive(selectedRun.status) ? "Type redirect, Enter interrupts" : "Typing to"} ${shortId(selectedRun.id)}`);
       }
       return;
     }
@@ -291,7 +297,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
     if (input.length === 0 && value === "c" && selectedRun) {
       setTargetRunId(selectedRun.id);
-      setNotice(`Typing to ${shortId(selectedRun.id)}`);
+      setNotice(`${isActive(selectedRun.status) ? "Type redirect, Enter interrupts" : "Typing to"} ${shortId(selectedRun.id)}`);
       return;
     }
     if (input.length === 0 && value === "n") {
@@ -474,9 +480,9 @@ function Help(): React.ReactElement {
     <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
       <Text bold color="yellow">keys</Text>
       <Text><Text color="cyan">Enter</Text> submit task or slash command   <Text color="cyan">Tab</Text> switch backend   <Text color="cyan">j/k</Text> or arrows select run</Text>
-      <Text><Text color="cyan">x</Text> expand/collapse   <Text color="cyan">l</Text> transcript   <Text color="cyan">c</Text> type to selected   <Text color="cyan">n</Text> new agent</Text>
+      <Text><Text color="cyan">Esc/c</Text> type to selected or interrupt running   <Text color="cyan">n</Text> new agent   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
       <Text><Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m</Text> merge selected   <Text color="cyan">M</Text> merge all ready</Text>
-      <Text color="gray">Slash: /backend claude|codex|acpx, /model &lt;name&gt;, /agent, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
+      <Text color="gray">Slash: /backend claude|codex|acpx, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
     </Box>
   );
 }
@@ -489,7 +495,7 @@ function PromptDock(props: {
   submitting: boolean;
   targetRun?: UiRun;
 }): React.ReactElement {
-  const label = props.targetRun ? `agent ${shortId(props.targetRun.id)}` : "task";
+  const label = props.targetRun ? `${isActive(props.targetRun.status) ? "interrupt" : "agent"} ${shortId(props.targetRun.id)}` : "task";
   return (
     <Box borderStyle="single" borderColor="cyan" paddingX={1} justifyContent="space-between">
       <Text>
@@ -505,7 +511,7 @@ function PromptDock(props: {
 function Footer(): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">Enter submit  Tab backend  c continue  n new  j/k  m/M merge  ? help  q quit</Text>
+      <Text color="gray">Enter submit  Tab backend  Esc/c edit  n new  j/k  m/M merge  ? help  q quit</Text>
     </Box>
   );
 }

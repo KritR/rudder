@@ -23,7 +23,9 @@ function claudeBackend(): BackendAdapter {
         : { ok: false, message: "claude is not on PATH" };
     },
     async run(request, emit) {
-      const sessionId = request.run.session?.nativeSessionId ?? randomUUID();
+      const existingSessionId = request.run.session?.nativeSessionId;
+      const isFollowUp = (request.run.turns?.length ?? 0) > 1;
+      const sessionId = existingSessionId ?? randomUUID();
       request.run.session = {
         ...(request.run.session ?? {}),
         nativeSessionId: sessionId,
@@ -46,8 +48,9 @@ function claudeBackend(): BackendAdapter {
         "--include-partial-messages",
         "--append-system-prompt",
         request.contract,
-        "--session-id",
-        sessionId,
+        ...(isFollowUp && existingSessionId
+          ? ["--resume", existingSessionId, "--fork-session"]
+          : ["--session-id", sessionId]),
       ];
       return await spawnAndStream({
         command: "claude",
@@ -207,7 +210,7 @@ async function spawnAndStream(params: {
   const enqueueBackendLine = (line: string, stderr: boolean) => {
     emitQueue = emitQueue
       .then(async () => {
-        await emitBackendLine(params.request.run.id, line, params.emit, stderr, streamState);
+        await emitBackendLine(params.request.run, line, params.emit, stderr, streamState);
       })
       .catch(async (error: unknown) => {
         await params.emit({
@@ -268,7 +271,7 @@ async function spawnAndStream(params: {
 }
 
 async function emitBackendLine(
-  runId: string,
+  run: RunRequest["run"],
   line: string,
   emit: (event: RudderEvent) => Promise<void>,
   stderr: boolean,
@@ -283,13 +286,25 @@ async function emitBackendLine(
   if (isStreamingTextEvent(parsed)) {
     streamState.sawStreamingText = true;
   }
+  const sessionId = sessionIdFromBackendData(parsed);
+  if (sessionId && run.session?.nativeSessionId !== sessionId) {
+    run.session = {
+      ...(run.session ?? {}),
+      nativeSessionId: sessionId,
+    };
+    await saveRunRecord(run);
+  }
   await emit({
     ts: nowIso(),
-    runId,
+    runId: run.id,
     type: stderr ? "backend.error" : "backend.output",
     message: message || undefined,
     data: parsed ?? trimmed,
   });
+}
+
+function sessionIdFromBackendData(data: unknown): string | undefined {
+  return isRecord(data) && typeof data.session_id === "string" ? data.session_id : undefined;
 }
 
 function textFromBackendData(data: unknown, sawStreamingText: boolean): string {
