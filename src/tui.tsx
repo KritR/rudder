@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
-import { currentBranch, findRepoRoot } from "./git.js";
+import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import {
   eventsPath,
@@ -11,7 +11,7 @@ import {
   loadConfig,
   outputPath,
 } from "./state.js";
-import { continueRun, mergeRun, startRun, stopRun } from "./run-manager.js";
+import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
 import type { BackendId, RunRecord, RudderConfig, RudderEvent, RunStatus } from "./types.js";
 import { pathExists, shortenHome } from "./util.js";
 
@@ -36,6 +36,11 @@ type WorkItem = {
 
 type FocusPane = "agents" | "worker" | "task";
 
+type DeletePrompt = {
+  runId: string;
+  canMerge: boolean;
+};
+
 const INTERACTIVE_BACKENDS: BackendId[] = ["claude", "codex"];
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 
@@ -53,6 +58,8 @@ const COMMANDS: CommandOption[] = [
   { name: "new", detail: "return to new-agent mode", insert: "/new" },
   { name: "worktree", detail: "toggle worktree policy", insert: "/worktree " },
   { name: "stop", detail: "stop the selected run", insert: "/stop" },
+  { name: "delete", detail: "delete selected run, offering merge first when relevant", insert: "/delete" },
+  { name: "copy", detail: "copy selected worker transcript", insert: "/copy" },
   { name: "merge", detail: "merge the selected completed worktree", insert: "/merge" },
   { name: "merge-all", detail: "merge all completed worktrees", insert: "/merge-all" },
   { name: "clear", detail: "collapse all run cards", insert: "/clear" },
@@ -91,6 +98,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [modelMenuIndex, setModelMenuIndex] = useState(0);
   const [commandMenuIndex, setCommandMenuIndex] = useState(0);
   const [discoveredModels, setDiscoveredModels] = useState<ModelOption[]>([]);
+  const [deletePrompt, setDeletePrompt] = useState<DeletePrompt | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
   const notifiedFinishedRuns = useRef<Set<string> | null>(null);
@@ -206,6 +214,52 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
   }, [backend, model, refresh, submitting, targetRun, worktreeMode]);
 
+  const requestDeleteSelectedRun = useCallback(async (runOverride?: UiRun) => {
+    const run = runOverride ?? selectedRun;
+    if (!run) {
+      setNotice("No agent selected");
+      return;
+    }
+    const changed = run.worktree.enabled && await hasChanges(run.worktree.path).catch(() => false);
+    const mergeable = changed && run.status === "completed";
+    setDeletePrompt({ runId: run.id, canMerge: mergeable });
+    setNotice(mergeable
+      ? `Delete ${shortId(run.id)}? press m to merge first, d to discard, Esc to cancel`
+      : `Delete ${shortId(run.id)}? press d to confirm, Esc to cancel`);
+  }, [selectedRun]);
+
+  const confirmDelete = useCallback(async (mergeFirst: boolean) => {
+    if (!deletePrompt) {
+      return;
+    }
+    const runId = deletePrompt.runId;
+    try {
+      await deleteRun(runId, { mergeFirst, force: true, silent: true });
+      setDeletePrompt(null);
+      setSelectedRunId(undefined);
+      setTargetRunId(undefined);
+      setNotice(`${mergeFirst ? "Merged and deleted" : "Deleted"} ${shortId(runId)}`);
+      await refresh();
+    } catch (error) {
+      setDeletePrompt(null);
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }, [deletePrompt, refresh]);
+
+  const copySelectedTranscript = useCallback(async (runOverride?: UiRun) => {
+    const run = runOverride ?? selectedRun;
+    if (!run) {
+      setNotice("No agent selected");
+      return;
+    }
+    try {
+      await copyToClipboard(run.output);
+      setNotice(`Copied transcript ${shortId(run.id)}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }, [selectedRun]);
+
   const handleCommand = useCallback(async (line: string) => {
     const [command = "", ...args] = line.slice(1).trim().split(/\s+/).filter(Boolean);
     switch (command) {
@@ -270,6 +324,14 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         await runAction(args[0] ?? selectedRun?.id, async (id) => stopRun(id, { silent: true }), "Stopped", setNotice, refresh);
         setInput("");
         return;
+      case "delete":
+        await requestDeleteSelectedRun(resolveUiRun(runs, args[0] ?? selectedRun?.id));
+        setInput("");
+        return;
+      case "copy":
+        await copySelectedTranscript(resolveUiRun(runs, args[0] ?? selectedRun?.id));
+        setInput("");
+        return;
       case "merge":
         await runAction(args[0] ?? selectedRun?.id, async (id) => mergeRun(id, args.includes("--allow-dirty"), { silent: true }), "Merged", setNotice, refresh);
         setInput("");
@@ -287,7 +349,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setNotice(`Unknown command: /${command}`);
         setInput("");
     }
-  }, [app, backend, refresh, runs, selectedRun?.id]);
+  }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, runs, selectedRun?.id]);
 
   const selectModelOption = useCallback((index: number) => {
     const option = modelOptions[index];
@@ -335,6 +397,22 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       } else {
         setTargetRunId(undefined);
         setNotice("Task focus: type a new task");
+      }
+      return;
+    }
+    if (deletePrompt) {
+      if (key.escape) {
+        setDeletePrompt(null);
+        setNotice("Delete cancelled");
+        return;
+      }
+      if (value === "m" && deletePrompt.canMerge) {
+        void confirmDelete(true);
+        return;
+      }
+      if (value === "d" || key.delete || key.backspace) {
+        void confirmDelete(false);
+        return;
       }
       return;
     }
@@ -386,14 +464,14 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       }
       return;
     }
-    if (key.upArrow || (input.length === 0 && value === "k")) {
+    if (key.upArrow || (focusPane === "agents" && input.length === 0 && value === "k")) {
       selectRelative(runs, selectedRunId, -1, setSelectedRunId);
       if (focusPane === "task") {
         setFocusPane("agents");
       }
       return;
     }
-    if (key.downArrow || (input.length === 0 && value === "j")) {
+    if (key.downArrow || (focusPane === "agents" && input.length === 0 && value === "j")) {
       selectRelative(runs, selectedRunId, 1, setSelectedRunId);
       if (focusPane === "task") {
         setFocusPane("agents");
@@ -418,7 +496,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       }
       return;
     }
-    if ((key.meta && (key.backspace || key.delete)) || value === "\u001b\u007f" || value === "\u001b\b") {
+    if ((key.meta && (key.backspace || key.delete)) || value === "\u0015" || (key.ctrl && value === "u")) {
+      setInput("");
+      return;
+    }
+    if (value === "\u001b\u007f" || value === "\u001b\b") {
       setInput((current) => deletePreviousWord(current));
       return;
     }
@@ -428,6 +510,14 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
     if (key.backspace || key.delete || value === "\u007f" || value === "\b") {
       setInput((current) => current.slice(0, -1));
+      return;
+    }
+    if (focusPane !== "agents" && !input.startsWith("/")) {
+      const text = normalizeInputText(value);
+      if (text) {
+        setInput((current) => current + text);
+        setCommandMenuIndex(0);
+      }
       return;
     }
     if (input.length === 0 && value === "q") {
@@ -484,6 +574,14 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       void mergeReadyRuns(runs, false, setNotice, refresh);
       return;
     }
+    if (input.length === 0 && value === "d") {
+      void requestDeleteSelectedRun();
+      return;
+    }
+    if (input.length === 0 && value === "y") {
+      void copySelectedTranscript();
+      return;
+    }
     if (focusPane === "agents" && value !== "/") {
       return;
     }
@@ -491,8 +589,9 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       setNotice("No agent selected");
       return;
     }
-    if (isPrintable(value)) {
-      setInput((current) => current + value);
+    const text = normalizeInputText(value);
+    if (text) {
+      setInput((current) => current + text);
       setCommandMenuIndex(0);
     }
   });
@@ -515,6 +614,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       {helpOpen ? <Help /> : null}
       {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} width={width} /> : null}
       {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} width={width} /> : null}
+      {deletePrompt ? <DeletePromptBox prompt={deletePrompt} width={width} /> : null}
       <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} focused={focusPane === "task"} />
       <Footer focusPane={focusPane} />
     </Box>
@@ -553,7 +653,7 @@ function RunRail(props: {
       <Box justifyContent="space-between">
         <Box>
           {props.focused ? <FocusPill label="focus" /> : null}
-          <Text bold color={props.focused ? "cyan" : undefined}> agents</Text>
+        <Text bold color={props.focused ? "cyan" : undefined}> agents</Text>
         </Box>
         <Text color="gray">{props.runs.length} runs</Text>
       </Box>
@@ -579,14 +679,14 @@ function RunCard(props: { run: UiRun; selected: boolean; targeted: boolean; expa
   const label = props.selected ? (props.targeted ? ">>" : "> ") : "  ";
   const task = truncate(props.run.task, Math.max(12, props.width - 14));
   const progress = completionPercent(props.run);
-  const summary = truncate(runSummary(props.run), Math.max(12, props.width - 8));
+  const summary = truncate(agentRailSummary(props.run), Math.max(12, props.width - 7));
   const meta = `${progressBar(progress)} ${progress}%`;
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text wrap="truncate" color={props.selected ? "white" : "gray"} bold={props.selected}>
         {label} {meta} {statusGlyph(props.run.status)} {props.run.backend} {task}
       </Text>
-      <Text wrap="truncate" color={tone}>  {props.run.worktree.enabled ? "wt" : "co"} {props.targeted ? "typing " : ""}{summary}</Text>
+      <Text wrap="truncate" color={tone}>  {statusWord(props.run.status)} {props.targeted ? "editing " : ""}{summary}</Text>
     </Box>
   );
 }
@@ -617,7 +717,7 @@ function DetailPane(props: {
           {props.focused ? <FocusPill label="focus" /> : null}
           <Text bold color={props.focused ? "cyan" : undefined}> worker</Text>
         </Box>
-        <Text color="gray">{props.focused ? "typing modifies selected agent" : "view"}</Text>
+        <Text color="gray">{props.focused ? "type here: Enter sends, running agents are interrupted" : "view"}</Text>
       </Box>
       <Text wrap="truncate" color={statusColor(props.run.status)}>
         {fitLine(`${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
@@ -630,13 +730,13 @@ function DetailPane(props: {
       </Text>
       {!props.transcriptExpanded ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text bold>work</Text>
+          <Text bold>activity</Text>
           {props.run.work.slice(-workLimit).map((item, index) => (
             <Text key={`${item.label}-${index}`} color={toneColor(item.tone)} wrap="truncate">
               {formatWorkLine(item, contentWidth)}
             </Text>
           ))}
-          {props.run.work.length === 0 ? <Text color="gray">No worker events yet.</Text> : null}
+          {props.run.work.length === 0 ? <Text color="gray">No meaningful activity yet.</Text> : null}
         </Box>
       ) : null}
       <Box flexDirection="column" marginTop={1} minHeight={0}>
@@ -657,8 +757,8 @@ function Help(): React.ReactElement {
       <Text bold color="yellow">keys</Text>
       <Text><Text color="cyan">Tab</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">j/k</Text> select run</Text>
       <Text><Text color="cyan">worker focus</Text> type to selected agent; running agents are interrupted on Enter   <Text color="cyan">n</Text> new task   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
-      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
-      <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
+      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">d</Text> delete   <Text color="cyan">y</Text> copy transcript   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
+      <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit</Text>
     </Box>
   );
 }
@@ -689,7 +789,8 @@ function ModelMenu(props: {
         const index = start + localIndex;
         const selected = index === props.selectedIndex;
         const active = option.value === props.currentModel || (!option.value && !props.currentModel);
-        const line = `${selected ? "> " : "  "}${index + 1}. ${option.label}${active ? "  current" : ""}  ${option.detail}`;
+        const marker = active ? "* " : "";
+        const line = `${selected ? "> " : "  "}${index + 1}. ${marker}${option.label}${option.detail ? `  ${option.detail}` : ""}`;
         return (
           <Text key={`${option.label}-${index}`} color={selected ? "white" : "gray"} bold={selected} wrap="truncate">
             {fitLine(line, contentWidth)}
@@ -724,6 +825,18 @@ function CommandMenu(props: { options: CommandOption[]; selectedIndex: number; w
   );
 }
 
+function DeletePromptBox(props: { prompt: DeletePrompt; width: number }): React.ReactElement {
+  const contentWidth = Math.max(24, props.width - 4);
+  const action = props.prompt.canMerge
+    ? "m merge first, d discard run, Esc cancel"
+    : "d delete run, Esc cancel";
+  return (
+    <Box width={props.width} borderStyle="double" borderColor="yellow" paddingX={1}>
+      <Text color="yellow" bold>{fitLine(`delete ${shortId(props.prompt.runId)}?  ${action}`, contentWidth)}</Text>
+    </Box>
+  );
+}
+
 function PromptDock(props: {
   input: string;
   backend: BackendId;
@@ -734,11 +847,14 @@ function PromptDock(props: {
   focused: boolean;
 }): React.ReactElement {
   const label = props.targetRun ? `${isActive(props.targetRun.status) ? "interrupt" : "agent"} ${shortId(props.targetRun.id)}` : "task";
+  const showTextLabel = !props.focused || Boolean(props.targetRun);
   return (
     <Box borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : props.targetRun ? "magenta" : "gray"} paddingX={1} justifyContent="space-between">
       <Text>
         {props.focused ? <FocusPill label="task" /> : null}
-        <Text color={props.submitting ? "yellow" : props.targetRun ? "magenta" : "cyan"}>{props.focused ? " " : ""}{props.submitting ? "starting" : label}</Text>
+        {showTextLabel ? (
+          <Text color={props.submitting ? "yellow" : props.targetRun ? "magenta" : "cyan"}>{props.focused ? " " : ""}{props.submitting ? "starting" : label}</Text>
+        ) : null}
         <Text>  {props.input}</Text>
         <Text color="cyan">_</Text>
       </Text>
@@ -750,7 +866,7 @@ function PromptDock(props: {
 function Footer(props: { focusPane: FocusPane }): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">focus:{props.focusPane}  Tab focus  o model  / commands  n new  c worker  j/k select  m/M merge  ? help</Text>
+      <Text color="gray">focus:{props.focusPane}  Tab focus  / commands  o model  n new  c worker  d delete  y copy  m/M merge  ? help</Text>
     </Box>
   );
 }
@@ -799,7 +915,6 @@ function buildWork(events: RudderEvent[], run: RunRecord): WorkItem[] {
   const items: WorkItem[] = [];
   for (const event of events) {
     if (event.type === "run.created") {
-      items.push({ label: run.worktree.enabled ? "worktree prepared" : "checkout claimed", detail: event.message, tone: "info" });
       continue;
     }
     if (event.type === "run.continued") {
@@ -815,11 +930,9 @@ function buildWork(events: RudderEvent[], run: RunRecord): WorkItem[] {
       continue;
     }
     if (event.type === "planner.spec") {
-      items.push({ label: "planner contract", detail: "acceptance criteria generated", tone: "info" });
       continue;
     }
     if (event.type === "run.started") {
-      items.push({ label: "worker started", detail: objectField(event.data, "command") ?? run.backend, tone: "info" });
       continue;
     }
     if (event.type === "backend.output") {
@@ -1065,10 +1178,6 @@ function toInteractiveBackend(value: BackendId | undefined): BackendId {
   return value === "codex" ? "codex" : "claude";
 }
 
-function isPrintable(value: string): boolean {
-  return value.length > 0 && !/[\u0000-\u001f\u007f]/.test(value);
-}
-
 function isActive(status: RunStatus): boolean {
   return status === "created" || status === "running" || status === "steering" || status === "verifying";
 }
@@ -1199,8 +1308,73 @@ function runSummary(run: UiRun): string {
   return run.status;
 }
 
+function agentRailSummary(run: UiRun): string {
+  const output = summarizeOutput(run.output);
+  if (output) {
+    return output;
+  }
+  const latestWork = run.work.at(-1);
+  if (latestWork) {
+    return `${latestWork.label}${latestWork.detail ? `: ${latestWork.detail}` : ""}`;
+  }
+  return run.currentPrompt && run.currentPrompt !== run.task ? run.currentPrompt : run.task;
+}
+
+function summarizeOutput(output: string): string {
+  const normalized = output.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  const sentence = normalized.match(/^.{24,180}?[.!?](?:\s|$)/)?.[0]?.trim();
+  return sentence || normalized.slice(0, 180);
+}
+
+function statusWord(status: RunStatus): string {
+  if (status === "completed" || status === "merged") {
+    return "done:";
+  }
+  if (status === "failed" || status === "merge-conflict") {
+    return "failed:";
+  }
+  if (status === "cancelled") {
+    return "stopped:";
+  }
+  if (status === "steering" || status === "verifying") {
+    return "checking:";
+  }
+  return "running:";
+}
+
 function deletePreviousWord(value: string): string {
   return value.replace(/\s+$/, "").replace(/\S+$/, "");
+}
+
+function normalizeInputText(value: string): string {
+  return value
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/\r?\n/g, " ")
+    .replace(/\t/g, " ")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+}
+
+async function copyToClipboard(text: string): Promise<void> {
+  if (!text.trim()) {
+    throw new Error("No transcript to copy");
+  }
+  const command = process.platform === "darwin" ? "pbcopy" : "xclip";
+  const args = process.platform === "darwin" ? [] : ["-selection", "clipboard"];
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["pipe", "ignore", "ignore"] });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Clipboard command exited with ${code}`));
+      }
+    });
+    child.stdin.end(text);
+  });
 }
 
 function missingCount(data: unknown): number {
@@ -1208,10 +1382,6 @@ function missingCount(data: unknown): number {
     return 0;
   }
   return data.missing.length;
-}
-
-function objectField(data: unknown, key: string): string | undefined {
-  return isRecord(data) && typeof data[key] === "string" ? data[key] : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

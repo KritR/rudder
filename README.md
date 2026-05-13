@@ -87,14 +87,21 @@ focus badge so it is clear where input goes.
 | `x` | Expand/collapse selected run |
 | `l` | Expand/collapse transcript |
 | `s` | Stop selected run |
+| `d` | Delete selected run, with an offer to merge completed work first |
+| `y` | Copy the selected worker transcript to the clipboard |
 | `m` | Merge selected completed worktree run |
 | `M` | Merge all completed worktree runs |
+| `Cmd+Backspace` / `Ctrl+U` | Clear the input line |
 | `?` | Help |
 | `q` | Quit |
 
 Worker focus is intentionally direct: typing into it sends a follow-up to the
 selected agent. If that agent is still running, `Enter` interrupts and redirects
 it.
+
+Paste works directly in the task and worker input. For long pasted prompts,
+Rudder normalizes line breaks into spaces so the prompt stays inside the input
+box.
 
 Slash commands:
 
@@ -107,6 +114,8 @@ Slash commands:
 /new
 /worktree auto|always
 /stop [runId]
+/delete [runId]
+/copy [runId]
 /merge [runId] [--allow-dirty]
 /merge-all [--allow-dirty]
 /clear
@@ -118,10 +127,16 @@ or complete the selected command.
 
 ## Models
 
-`/model` opens a bounded picker for the active backend.
+`/model` opens a bounded picker for the active backend. Rudder passes the
+selected value straight through to the underlying CLI: Claude uses
+`claude --model <value>`, and Codex uses `codex exec --model <value>`.
 
-- Claude and Codex model lists are fetched from `https://models.dev/api.json`,
-  the same public model registry used by opencode.
+- Claude is alias-first like Claude Code itself: `sonnet`, `sonnet[1m]`,
+  `opus`, `opus[1m]`, and `haiku` appear before explicit model IDs.
+- Codex shows Codex-relevant OpenAI model IDs.
+- Explicit Claude and Codex model IDs are fetched from
+  `https://models.dev/api.json`, the same public model registry used by
+  opencode.
 - The fetched registry is cached in `~/.rudder/models-dev.json`.
 - If the network is unavailable, Rudder falls back to local Claude session
   history and Codex's `~/.codex/models_cache.json`.
@@ -172,6 +187,7 @@ rudder runs
 rudder watch <runId>
 rudder logs <runId> --follow
 rudder stop <runId>
+rudder delete <runId>
 rudder merge <runId>
 rudder cleanup
 ```

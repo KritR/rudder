@@ -600,6 +600,32 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
   }
 }
 
+export async function deleteRun(runId: string, options?: { mergeFirst?: boolean; force?: boolean; silent?: boolean }): Promise<void> {
+  const repoRoot = findRepoRoot();
+  const run = await loadRunRecord(repoRoot, runId);
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+  if (options?.mergeFirst) {
+    await mergeRun(runId, false, { silent: true });
+  }
+  const latest = await loadRunRecord(repoRoot, runId) ?? run;
+  if (options?.mergeFirst && latest.merge?.status === "conflict") {
+    throw new Error(`Merge conflict for ${runId}; resolve it before deleting the run.`);
+  }
+  if (latest.process?.pid && processAlive(latest.process.pid)) {
+    process.kill(latest.process.pid, "SIGTERM");
+  }
+  if (latest.worktree.enabled) {
+    await removeWorktree(repoRoot, latest.worktree.path, options?.force ?? true).catch(() => undefined);
+  }
+  await fsp.rm(runDir(repoRoot, runId), { recursive: true, force: true });
+  await writeAgentContext(repoRoot);
+  if (!options?.silent) {
+    console.log(`Deleted ${runId}`);
+  }
+}
+
 export async function cleanupRuns(force = false): Promise<void> {
   const repoRoot = findRepoRoot();
   const runs = await listRuns(repoRoot);

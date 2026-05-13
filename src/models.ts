@@ -6,6 +6,7 @@ import type { BackendId } from "./types.js";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MODEL_PICKER_LIMIT = 12;
 
 export type ModelOption = {
   label: string;
@@ -51,15 +52,19 @@ export async function discoverModelOptions(
   backend: BackendId,
   configuredDefault?: string,
 ): Promise<ModelOption[]> {
-  const defaultDetail = configuredDefault ? `configured default: ${configuredDefault}` : "use the backend's default";
+  const defaultDetail = configuredDefault ? `uses ${configuredDefault}` : "CLI default";
   const options: ModelOption[] = [{ label: "Default", value: undefined, detail: defaultDetail }];
-  const discovered = backend === "claude" ? await discoverClaudeModelsDev() : await discoverCodexModelsDev();
   if (backend === "claude") {
-    pushUnique(options, { label: "Sonnet latest", value: "sonnet", detail: "Claude Code alias" });
-    pushUnique(options, { label: "Opus latest", value: "opus", detail: "Claude Code alias" });
+    for (const option of claudeCodeAliasOptions()) {
+      pushUnique(options, option);
+    }
   }
+  const discovered = backend === "claude" ? await discoverClaudeModelsDev() : await discoverCodexModelsDev();
   for (const option of discovered) {
     pushUnique(options, option);
+    if (options.length >= MODEL_PICKER_LIMIT) {
+      break;
+    }
   }
   if (options.length <= 1) {
     const fallback = backend === "claude" ? await discoverClaudeModelsLocal() : await discoverCodexModelsLocal();
@@ -71,17 +76,17 @@ export async function discoverModelOptions(
 }
 
 export function fallbackModelOptions(backend: BackendId, configuredDefault?: string): ModelOption[] {
-  const defaultDetail = configuredDefault ? `configured default: ${configuredDefault}` : "use the backend's default";
+  const defaultDetail = configuredDefault ? `uses ${configuredDefault}` : "CLI default";
   if (backend === "claude") {
     return [
       { label: "Default", value: undefined, detail: defaultDetail },
-      { label: "Sonnet latest", value: "sonnet", detail: "Claude Code alias from local CLI help" },
-      { label: "Opus latest", value: "opus", detail: "Claude Code alias from local CLI help" },
+      ...claudeCodeAliasOptions(),
     ];
   }
   return [
     { label: "Default", value: undefined, detail: defaultDetail },
-    { label: "GPT-5.5", value: "gpt-5.5", detail: "Codex fallback model" },
+    { label: "gpt-5.5", value: "gpt-5.5", detail: "Codex model" },
+    { label: "gpt-5.4-codex", value: "gpt-5.4-codex", detail: "Codex model" },
   ];
 }
 
@@ -89,12 +94,12 @@ async function discoverCodexModelsDev(): Promise<ModelOption[]> {
   const data = await readModelsDev();
   const provider = data.openai;
   const entries = Object.entries(provider?.models ?? {})
-    .filter(([id, model]) => isUsableTextModel(id, model))
+    .filter(([id, model]) => isUsableTextModel(id, model) && isCodexRelevantModel(id))
     .sort(compareModelEntries("codex"));
   return entries.map(([id, model]) => ({
-    label: model.name || id,
+    label: id,
     value: id,
-    detail: formatModelsDevDetail("OpenAI", model),
+    detail: shortModelDetail(model),
   }));
 }
 
@@ -102,12 +107,12 @@ async function discoverClaudeModelsDev(): Promise<ModelOption[]> {
   const data = await readModelsDev();
   const provider = data.anthropic;
   const entries = Object.entries(provider?.models ?? {})
-    .filter(([id, model]) => id.startsWith("claude-") && isUsableTextModel(id, model))
+    .filter(([id, model]) => id.startsWith("claude-") && isUsableTextModel(id, model) && isClaudePickerModel(id))
     .sort(compareModelEntries("claude"));
   return entries.map(([id, model]) => ({
-    label: model.name || prettyClaudeModel(id),
+    label: id,
     value: id,
-    detail: formatModelsDevDetail("Anthropic", model),
+    detail: model.name || prettyClaudeModel(id),
   }));
 }
 
@@ -121,9 +126,9 @@ async function discoverCodexModelsLocal(): Promise<ModelOption[]> {
   return (parsed.models ?? [])
     .filter((model) => model.slug && model.slug !== "codex-auto-review")
     .map((model) => ({
-      label: model.display_name || model.slug || "model",
+      label: model.slug || model.display_name || "model",
       value: model.slug,
-      detail: model.description || "from local Codex model cache",
+      detail: model.display_name || model.description || "local Codex cache",
     }));
 }
 
@@ -134,14 +139,11 @@ async function discoverClaudeModelsLocal(): Promise<ModelOption[]> {
     .filter(([model]) => model !== "<synthetic>")
     .sort((a, b) => b[1] - a[1])
     .map(([model]) => ({
-      label: prettyClaudeModel(model),
+      label: model,
       value: model,
-      detail: "seen in local Claude Code sessions",
+      detail: prettyClaudeModel(model),
     }));
-  const options: ModelOption[] = [
-    { label: "Sonnet latest", value: "sonnet", detail: "Claude Code alias from local CLI help" },
-    { label: "Opus latest", value: "opus", detail: "Claude Code alias from local CLI help" },
-  ];
+  const options: ModelOption[] = claudeCodeAliasOptions();
   for (const option of recent) {
     pushUnique(options, option);
   }
@@ -212,6 +214,30 @@ function isUsableTextModel(id: string, model: ModelsDevModel): boolean {
   return !output || output.includes("text");
 }
 
+function claudeCodeAliasOptions(): ModelOption[] {
+  return [
+    { label: "sonnet", value: "sonnet", detail: "Claude Code alias" },
+    { label: "sonnet[1m]", value: "sonnet[1m]", detail: "Claude Code alias" },
+    { label: "opus", value: "opus", detail: "Claude Code alias" },
+    { label: "opus[1m]", value: "opus[1m]", detail: "Claude Code alias" },
+    { label: "haiku", value: "haiku", detail: "Claude Code alias" },
+  ];
+}
+
+function isClaudePickerModel(id: string): boolean {
+  if (id.includes("3-")) {
+    return false;
+  }
+  return /\b(sonnet|opus|haiku)\b/.test(id);
+}
+
+function isCodexRelevantModel(id: string): boolean {
+  if (id.includes("deep-research") || id.includes("chat-latest") || id.includes("pro")) {
+    return false;
+  }
+  return id.includes("codex") || /^gpt-5(\.|-|$)/.test(id);
+}
+
 function compareModelEntries(backend: "claude" | "codex") {
   return (a: [string, ModelsDevModel], b: [string, ModelsDevModel]) => {
     const score = backend === "claude" ? scoreClaudeModel : scoreCodexModel;
@@ -255,18 +281,15 @@ function recencyScore(model: ModelsDevModel): number {
   return Math.min(30, Math.max(0, Math.round((timestamp - Date.parse("2024-01-01")) / (30 * 24 * 60 * 60 * 1000))));
 }
 
-function formatModelsDevDetail(provider: string, model: ModelsDevModel): string {
-  const parts = [`${provider} via models.dev`];
+function shortModelDetail(model: ModelsDevModel): string {
+  const parts: string[] = [];
+  if (model.name) {
+    parts.push(model.name);
+  }
   if (model.limit?.context) {
-    parts.push(`${formatNumber(model.limit.context)} ctx`);
+    parts.push(formatNumber(model.limit.context));
   }
-  if (model.reasoning) {
-    parts.push("reasoning");
-  }
-  if (model.release_date) {
-    parts.push(model.release_date);
-  }
-  return parts.join(" | ");
+  return parts.join("  ");
 }
 
 function formatNumber(value: number): string {

@@ -1,6 +1,10 @@
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import {
   cleanupRuns,
+  deleteRun,
   listProjectRuns,
   mergeRun,
   printLogs,
@@ -35,11 +39,16 @@ type Parsed = {
     repo?: string;
     run?: string;
     help?: boolean;
+    version?: boolean;
   };
 };
 
 export async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
+  if (parsed.flags.version || parsed.command === "version") {
+    console.log(await packageVersion());
+    return;
+  }
   if (parsed.flags.cwd) {
     process.chdir(parsed.flags.cwd);
   }
@@ -195,6 +204,14 @@ export async function main(): Promise<void> {
       await stopRun(run);
       return;
     }
+    case "delete": {
+      const run = parsed.args[0];
+      if (!run) {
+        throw new Error("Missing run id.");
+      }
+      await deleteRun(run, { force: Boolean(parsed.flags.force) });
+      return;
+    }
     case "merge": {
       const run = parsed.args[0];
       if (!run) {
@@ -232,6 +249,10 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg === "--help" || arg === "-h") {
       parsed.flags.help = true;
+      continue;
+    }
+    if (arg === "--version" || arg === "-v") {
+      parsed.flags.version = true;
       continue;
     }
     if (arg === "--json") {
@@ -353,6 +374,16 @@ async function maybeOnboard(): Promise<void> {
   await runOnboard();
 }
 
+async function packageVersion(): Promise<string> {
+  const packageFile = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+  const raw = await fsp.readFile(packageFile, "utf8").catch(() => "");
+  if (!raw) {
+    return "unknown";
+  }
+  const parsed = JSON.parse(raw) as { version?: string };
+  return parsed.version ?? "unknown";
+}
+
 function printHelp(): void {
   console.log(`rudder
 
@@ -370,6 +401,7 @@ Run management:
   rudder status [--json]          Show active runs for this repo
   rudder runs [--json]            List runs for this repo
   rudder stop <run>               Cancel a run
+  rudder delete <run>             Delete a run and its worktree
   rudder merge <run>              Merge a worktree run into current branch
   rudder cleanup [--force]        Remove merged worktrees
 
@@ -385,6 +417,7 @@ Options:
   -b, --backend <backend>         claude or codex
   -C, --cwd <dir>                 Run from another directory
       --json                      Machine-readable output
+  -v, --version                   Print version
       --allow-dirty               Allow merge into dirty target branch
 `);
 }
