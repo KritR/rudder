@@ -1,0 +1,155 @@
+import fsp from "node:fs/promises";
+import path from "node:path";
+import type { RunRecord, SpecContract, VerificationResult } from "./types.js";
+import { currentBranch, currentCommit, gitDiff, gitStatus, hasChanges } from "./git.js";
+import { pathExists, readJson, runCommand, writeJson } from "./util.js";
+import { specPath, verifierPath } from "./state.js";
+
+const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "README.md"];
+
+export async function createSpec(run: RunRecord): Promise<SpecContract> {
+  const workspace = run.worktree.path;
+  const instructionsFiles = [];
+  for (const name of INSTRUCTION_FILES) {
+    const filePath = path.join(workspace, name);
+    if (!(await pathExists(filePath))) {
+      continue;
+    }
+    const content = await fsp.readFile(filePath, "utf8");
+    instructionsFiles.push({
+      path: name,
+      content: content.slice(0, 12_000),
+    });
+  }
+
+  const spec: SpecContract = {
+    runId: run.id,
+    task: run.task,
+    createdAt: new Date().toISOString(),
+    repo: {
+      root: workspace,
+      branch: await currentBranch(workspace),
+      baseCommit: (await currentCommit(workspace)) || run.baseCommit,
+      status: await gitStatus(workspace),
+    },
+    instructionsFiles,
+    acceptanceCriteria: buildAcceptanceCriteria(run.task),
+    suggestedTests: await suggestTests(workspace),
+  };
+  await writeJson(specPath(run.repoRoot, run.id), spec);
+  return spec;
+}
+
+export function renderContract(spec: SpecContract): string {
+  const instructions = spec.instructionsFiles
+    .map((file) => `### ${file.path}\n${file.content}`)
+    .join("\n\n");
+  return [
+    "RUDDER CONTRACT",
+    "",
+    `Task: ${spec.task}`,
+    "",
+    "Acceptance criteria:",
+    ...spec.acceptanceCriteria.map((item) => `- ${item}`),
+    "",
+    spec.suggestedTests.length > 0
+      ? ["Suggested verification:", ...spec.suggestedTests.map((item) => `- ${item}`)].join("\n")
+      : "Suggested verification: choose the smallest relevant checks for this repo.",
+    "",
+    "Working rules:",
+    "- Keep changes focused on the task.",
+    "- Preserve unrelated user changes.",
+    "- Run relevant checks when practical and report any checks that could not be run.",
+    "- Do not mark the task complete unless the acceptance criteria are handled.",
+    "",
+    instructions ? `Repository instructions:\n\n${instructions}` : "",
+    "END RUDDER CONTRACT",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export async function verifyRun(run: RunRecord): Promise<VerificationResult> {
+  const diff = await gitDiff(run.worktree.path);
+  const changed = await hasChanges(run.worktree.path);
+  const outputPath = path.join(run.repoRoot, ".rudder", "runs", run.id, "output.txt");
+  const transcript = await fsp.readFile(outputPath, "utf8").catch(() => "");
+  const spec = await readJson<SpecContract>(specPath(run.repoRoot, run.id));
+
+  const missing: string[] = [];
+  const satisfied: string[] = [];
+  if (!changed) {
+    if (expectsCodeChanges(run.task)) {
+      missing.push("No file changes were detected.");
+    } else {
+      satisfied.push("No file changes were needed for this prompt.");
+    }
+  } else {
+    satisfied.push(diff.trim() ? "The run produced a git diff." : "The run produced git status changes.");
+  }
+  if (/test|spec|check|lint|typecheck|verify/i.test(transcript)) {
+    satisfied.push("The transcript mentions verification or tests.");
+  } else if ((changed || expectsCodeChanges(run.task)) && spec?.suggestedTests.length) {
+    missing.push("No explicit verification/test run was detected in the transcript.");
+  }
+
+  const result: VerificationResult = {
+    satisfied,
+    missing,
+    notes: changed
+      ? "Local verifier checked for produced changes and evidence of verification."
+      : expectsCodeChanges(run.task)
+        ? "Local verifier found no changes. The worker may have only analyzed the task."
+        : "Local verifier accepted a no-change response for a non-edit prompt.",
+    shouldContinue: missing.some((item) => item.startsWith("No file changes")),
+  };
+  await writeJson(verifierPath(run.repoRoot, run.id), result);
+  return result;
+}
+
+function expectsCodeChanges(task: string): boolean {
+  if (/\b(do not|don't|without|no)\s+(edit|change|modify|write|touch)\b/i.test(task)) {
+    return false;
+  }
+  return /\b(add|build|change|create|delete|edit|fix|implement|modify|patch|refactor|remove|rename|repair|replace|rewrite|ship|update|write)\b/i.test(
+    task,
+  );
+}
+
+function buildAcceptanceCriteria(task: string): string[] {
+  const criteria = ["Address the user's requested task directly.", "Keep the change scoped and reviewable."];
+  if (/test|fail|bug|fix/i.test(task)) {
+    criteria.push("Run or explain the relevant failing test/check.");
+  }
+  if (/refactor/i.test(task)) {
+    criteria.push("Preserve existing behavior while improving structure.");
+  }
+  return criteria;
+}
+
+async function suggestTests(workspace: string): Promise<string[]> {
+  const suggestions: string[] = [];
+  const packageJson = await readJson<{ scripts?: Record<string, string> }>(
+    path.join(workspace, "package.json"),
+  );
+  if (packageJson?.scripts) {
+    for (const script of ["test", "check", "typecheck", "lint"]) {
+      if (packageJson.scripts[script]) {
+        suggestions.push(`npm run ${script}`);
+      }
+    }
+  }
+  if (await pathExists(path.join(workspace, "Cargo.toml"))) {
+    suggestions.push("cargo test");
+  }
+  if (await pathExists(path.join(workspace, "pyproject.toml"))) {
+    suggestions.push("pytest");
+  }
+  if (suggestions.length === 0) {
+    const result = await runCommand("git", ["ls-files"], { cwd: workspace, allowFailure: true });
+    if (result.stdout.includes("Makefile")) {
+      suggestions.push("make test");
+    }
+  }
+  return suggestions;
+}

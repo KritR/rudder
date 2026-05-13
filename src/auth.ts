@@ -1,0 +1,440 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type {
+  AuthProfileCredential,
+  AuthProfileStore,
+  OAuthCredential,
+  RudderConfig,
+  TokenCredential,
+} from "./types.js";
+import {
+  commandExists,
+  expandHome,
+  pathExists,
+  promptConfirm,
+  promptSelect,
+  promptText,
+  readJson,
+  runCommand,
+  runCommandSync,
+  shortenHome,
+} from "./util.js";
+import { authStorePath, loadAuthStore, loadConfig, saveAuthStore, saveConfig } from "./state.js";
+
+const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
+const CODEX_KEYCHAIN_SERVICE = "Codex Auth";
+
+type Detection = {
+  claudeCommand: boolean;
+  codexCommand: boolean;
+  acpxCommand: boolean;
+  acpxVersion?: string;
+  npmAcpxLatest?: string;
+  anthropicEnv?: boolean;
+  openaiEnv?: boolean;
+  claudeCredential?: AuthProfileCredential;
+  claudeCredentialSource?: string;
+  codexCredential?: OAuthCredential;
+  codexCredentialSource?: string;
+};
+
+export async function detectEnvironment(): Promise<Detection> {
+  const claudeCommand = commandExists("claude");
+  const codexCommand = commandExists("codex");
+  const acpxCommand = commandExists("acpx");
+  const acpxVersion = acpxCommand
+    ? (
+        await runCommand("acpx", ["--version"], {
+          allowFailure: true,
+        })
+      ).stdout.trim()
+    : undefined;
+  const npmAcpxLatest = (
+    await runCommand("npm", ["view", "acpx", "version"], {
+      allowFailure: true,
+    })
+  ).stdout.trim();
+
+  const claude = await readClaudeCliCredential();
+  const codex = await readCodexCliCredential();
+  return {
+    claudeCommand,
+    codexCommand,
+    acpxCommand,
+    acpxVersion,
+    npmAcpxLatest,
+    anthropicEnv: Boolean(process.env.ANTHROPIC_API_KEY?.trim()),
+    openaiEnv: Boolean(process.env.OPENAI_API_KEY?.trim()),
+    claudeCredential: claude?.credential,
+    claudeCredentialSource: claude?.source,
+    codexCredential: codex?.credential,
+    codexCredentialSource: codex?.source,
+  };
+}
+
+export async function syncExternalCredentials(): Promise<AuthProfileStore> {
+  const store = await loadAuthStore();
+  const claude = await readClaudeCliCredential();
+  if (claude?.credential) {
+    store.profiles["anthropic:claude-code"] = claude.credential;
+  }
+  const codex = await readCodexCliCredential();
+  if (codex?.credential) {
+    store.profiles["openai-codex:default"] = codex.credential;
+  }
+  if (process.env.ANTHROPIC_API_KEY?.trim()) {
+    store.profiles["anthropic:env"] = {
+      type: "api_key",
+      provider: "anthropic",
+      key: process.env.ANTHROPIC_API_KEY.trim(),
+    };
+  }
+  if (process.env.OPENAI_API_KEY?.trim()) {
+    store.profiles["openai:env"] = {
+      type: "api_key",
+      provider: "openai",
+      key: process.env.OPENAI_API_KEY.trim(),
+    };
+  }
+  await saveAuthStore(store);
+  return store;
+}
+
+export async function runDoctor(options?: { json?: boolean }): Promise<void> {
+  const detection = await detectEnvironment();
+  const store = await syncExternalCredentials();
+  const config = await loadConfig();
+  const payload = {
+    commands: {
+      claude: detection.claudeCommand,
+      codex: detection.codexCommand,
+      acpx: detection.acpxCommand,
+      acpxVersion: detection.acpxVersion || null,
+      acpxLatest: detection.npmAcpxLatest || null,
+    },
+    auth: {
+      storePath: authStorePath(),
+      profiles: Object.keys(store.profiles).sort(),
+      claudeCredentialSource: detection.claudeCredentialSource || null,
+      codexCredentialSource: detection.codexCredentialSource || null,
+    },
+    config,
+  };
+  if (options?.json) {
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+
+  console.log("Rudder doctor");
+  console.log(`  claude: ${status(detection.claudeCommand)}`);
+  console.log(`  codex:  ${status(detection.codexCommand)}`);
+  console.log(
+    `  acpx:   ${status(detection.acpxCommand)}${
+      detection.acpxVersion ? ` (${detection.acpxVersion})` : ""
+    }${detection.npmAcpxLatest ? ` latest=${detection.npmAcpxLatest}` : ""}`,
+  );
+  console.log(`  auth:   ${shortenHome(authStorePath())}`);
+  for (const [profileId, credential] of Object.entries(store.profiles).sort()) {
+    console.log(`    - ${profileId} (${credential.provider}/${credential.type})`);
+  }
+  if (!detection.acpxCommand) {
+    console.log("  fix:    run `npm install -g acpx@latest` or `rudder onboard`");
+  }
+}
+
+export async function runOnboard(options?: { nonInteractive?: boolean; json?: boolean }): Promise<void> {
+  const config = await loadConfig();
+  let store = await syncExternalCredentials();
+  const detection = await detectEnvironment();
+
+  if (!options?.nonInteractive && process.stdin.isTTY) {
+    const acpxBehind =
+      detection.acpxCommand &&
+      detection.acpxVersion &&
+      detection.npmAcpxLatest &&
+      detection.acpxVersion !== detection.npmAcpxLatest;
+    if (!detection.acpxCommand || acpxBehind) {
+      const install = await promptConfirm(
+        detection.acpxCommand
+          ? `Update acpx ${detection.acpxVersion} to latest ${detection.npmAcpxLatest}?`
+          : "Install acpx globally with npm install -g acpx@latest?",
+        true,
+      );
+      if (install) {
+        await runCommand("npm", ["install", "-g", "acpx@latest"]);
+      }
+    }
+    store = await configureAnthropic(store, config);
+    store = await configureOpenAI(store, config);
+  }
+
+  await saveAuthStore(store);
+  await saveConfig(config);
+
+  if (options?.json) {
+    console.log(
+      JSON.stringify(
+        {
+          config,
+          authStore: authStorePath(),
+          profiles: Object.keys(store.profiles).sort(),
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  console.log("Rudder configured");
+  console.log(`  auth: ${shortenHome(authStorePath())}`);
+  console.log(`  profiles: ${Object.keys(store.profiles).sort().join(", ") || "(none)"}`);
+  console.log('  try: rudder "fix the failing tests"');
+}
+
+async function configureAnthropic(
+  store: AuthProfileStore,
+  config: RudderConfig,
+): Promise<AuthProfileStore> {
+  if (store.profiles["anthropic:claude-code"] || store.profiles["anthropic:env"]) {
+    config.backends.claude = {
+      ...(config.backends.claude ?? {}),
+      profileId: store.profiles["anthropic:claude-code"] ? "anthropic:claude-code" : "anthropic:env",
+      model: config.backends.claude?.model ?? "opus",
+      effort: "xhigh",
+    };
+    return store;
+  }
+  const choice = await promptSelect(
+    "Anthropic / Claude Code auth",
+    [
+      {
+        value: "setup-token",
+        label: "Paste setup-token",
+        hint: "Run `claude setup-token`, then paste the generated token",
+      },
+      { value: "api-key", label: "Anthropic API key", hint: "Direct API key" },
+      { value: "skip", label: "Skip Anthropic for now" },
+    ],
+    "setup-token",
+  );
+  if (choice === "setup-token") {
+    const token = await promptText("Paste Anthropic setup-token");
+    store.profiles["anthropic:default"] = {
+      type: "token",
+      provider: "anthropic",
+      token,
+    };
+    config.backends.claude = { ...(config.backends.claude ?? {}), profileId: "anthropic:default" };
+  }
+  if (choice === "api-key") {
+    const key = await promptText("Paste Anthropic API key");
+    store.profiles["anthropic:default"] = {
+      type: "api_key",
+      provider: "anthropic",
+      key,
+    };
+    config.backends.claude = { ...(config.backends.claude ?? {}), profileId: "anthropic:default" };
+  }
+  return store;
+}
+
+async function configureOpenAI(
+  store: AuthProfileStore,
+  config: RudderConfig,
+): Promise<AuthProfileStore> {
+  if (store.profiles["openai-codex:default"] || store.profiles["openai:env"]) {
+    config.backends.codex = {
+      ...(config.backends.codex ?? {}),
+      profileId: store.profiles["openai-codex:default"] ? "openai-codex:default" : "openai:env",
+      model: config.backends.codex?.model ?? "gpt-5.4-codex",
+      reasoningEffort: "xhigh",
+    };
+    return store;
+  }
+  const choice = await promptSelect(
+    "OpenAI / Codex auth",
+    [
+      { value: "codex-login", label: "Run Codex login", hint: "Uses official Codex CLI auth" },
+      { value: "api-key", label: "OpenAI API key", hint: "Direct API key" },
+      { value: "skip", label: "Skip OpenAI for now" },
+    ],
+    "codex-login",
+  );
+  if (choice === "codex-login") {
+    await runCommand("codex", ["login"]);
+    const codex = await readCodexCliCredential();
+    if (codex?.credential) {
+      store.profiles["openai-codex:default"] = codex.credential;
+      config.backends.codex = { ...(config.backends.codex ?? {}), profileId: "openai-codex:default" };
+    }
+  }
+  if (choice === "api-key") {
+    const key = await promptText("Paste OpenAI API key");
+    store.profiles["openai:default"] = {
+      type: "api_key",
+      provider: "openai",
+      key,
+    };
+    config.backends.codex = { ...(config.backends.codex ?? {}), profileId: "openai:default" };
+  }
+  return store;
+}
+
+export async function readClaudeCliCredential(): Promise<
+  { credential: AuthProfileCredential; source: string } | null
+> {
+  const keychain = readClaudeKeychainCredential();
+  if (keychain) {
+    return { credential: keychain, source: "macOS Keychain Claude Code-credentials" };
+  }
+  const filePath = expandHome("~/.claude/.credentials.json");
+  const raw = await readJson<Record<string, unknown>>(filePath);
+  const parsed = parseClaudeOauth(raw?.claudeAiOauth);
+  return parsed ? { credential: parsed, source: shortenHome(filePath) } : null;
+}
+
+function readClaudeKeychainCredential(): AuthProfileCredential | null {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+  const result = runCommandSync("security", ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"], {
+    allowFailure: true,
+  });
+  if (result.code !== 0 || !result.stdout.trim()) {
+    return null;
+  }
+  try {
+    const raw = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    return parseClaudeOauth(raw.claudeAiOauth);
+  } catch {
+    return null;
+  }
+}
+
+function parseClaudeOauth(raw: unknown): AuthProfileCredential | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const entry = raw as Record<string, unknown>;
+  const access = entry.accessToken;
+  const refresh = entry.refreshToken;
+  const expires = entry.expiresAt;
+  if (typeof access !== "string" || !access || typeof expires !== "number") {
+    return null;
+  }
+  if (typeof refresh === "string" && refresh) {
+    return {
+      type: "oauth",
+      provider: "anthropic",
+      access,
+      refresh,
+      expires,
+    };
+  }
+  return {
+    type: "token",
+    provider: "anthropic",
+    token: access,
+    expires,
+  } satisfies TokenCredential;
+}
+
+export async function readCodexCliCredential(): Promise<
+  { credential: OAuthCredential; source: string } | null
+> {
+  const keychain = readCodexKeychainCredential();
+  if (keychain) {
+    return { credential: keychain, source: "macOS Keychain Codex Auth" };
+  }
+  const filePath = codexAuthPath();
+  const raw = await readJson<Record<string, unknown>>(filePath);
+  const parsed = parseCodexAuth(raw, filePath);
+  return parsed ? { credential: parsed, source: shortenHome(filePath) } : null;
+}
+
+function readCodexKeychainCredential(): OAuthCredential | null {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+  const account = computeCodexKeychainAccount();
+  const result = runCommandSync(
+    "security",
+    ["find-generic-password", "-s", CODEX_KEYCHAIN_SERVICE, "-a", account, "-w"],
+    { allowFailure: true },
+  );
+  if (result.code !== 0 || !result.stdout.trim()) {
+    return null;
+  }
+  try {
+    return parseCodexAuth(JSON.parse(result.stdout.trim()) as Record<string, unknown>, codexAuthPath());
+  } catch {
+    return null;
+  }
+}
+
+function parseCodexAuth(raw: unknown, authPathForExpiry: string): OAuthCredential | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const data = raw as Record<string, unknown>;
+  const tokens = data.tokens;
+  if (!tokens || typeof tokens !== "object") {
+    return null;
+  }
+  const tokenRecord = tokens as Record<string, unknown>;
+  const access = tokenRecord.access_token;
+  const refresh = tokenRecord.refresh_token;
+  if (typeof access !== "string" || !access || typeof refresh !== "string" || !refresh) {
+    return null;
+  }
+  const lastRefresh = data.last_refresh;
+  const lastRefreshMs =
+    typeof lastRefresh === "string" || typeof lastRefresh === "number"
+      ? new Date(lastRefresh).getTime()
+      : Number.NaN;
+  let expires = Number.isFinite(lastRefreshMs) ? lastRefreshMs + 60 * 60 * 1000 : Date.now() + 60 * 60 * 1000;
+  try {
+    if (Number.isNaN(lastRefreshMs)) {
+      expires = fs.statSync(authPathForExpiry).mtimeMs + 60 * 60 * 1000;
+    }
+  } catch {
+    // Keep fallback expiry.
+  }
+  return {
+    type: "oauth",
+    provider: "openai-codex",
+    access,
+    refresh,
+    expires,
+    ...(typeof tokenRecord.account_id === "string" ? { accountId: tokenRecord.account_id } : {}),
+  };
+}
+
+function codexHome(): string {
+  const configured = process.env.CODEX_HOME?.trim();
+  const home = configured ? expandHome(configured) : expandHome("~/.codex");
+  try {
+    return fs.realpathSync.native(home);
+  } catch {
+    return home;
+  }
+}
+
+function codexAuthPath(): string {
+  return path.join(codexHome(), "auth.json");
+}
+
+function computeCodexKeychainAccount(): string {
+  const hash = createHash("sha256").update(codexHome()).digest("hex");
+  return `cli|${hash.slice(0, 16)}`;
+}
+
+function status(ok: boolean): string {
+  return ok ? "ok" : "missing";
+}
+
+export async function authStoreExists(): Promise<boolean> {
+  return await pathExists(authStorePath());
+}
