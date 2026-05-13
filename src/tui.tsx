@@ -36,7 +36,7 @@ type WorkItem = {
 
 type FocusPane = "agents" | "worker" | "task";
 
-const BACKENDS: BackendId[] = ["claude", "codex", "acpx"];
+const INTERACTIVE_BACKENDS: BackendId[] = ["claude", "codex"];
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 
 type CommandOption = {
@@ -46,7 +46,7 @@ type CommandOption = {
 };
 
 const COMMANDS: CommandOption[] = [
-  { name: "backend", detail: "switch backend: claude, codex, acpx", insert: "/backend " },
+  { name: "backend", detail: "switch backend: claude or codex", insert: "/backend " },
   { name: "model", detail: "open model picker or set a custom model id", insert: "/model" },
   { name: "agent", detail: "send your next input to the selected agent", insert: "/agent" },
   { name: "interrupt", detail: "interrupt and redirect the selected running agent", insert: "/interrupt" },
@@ -75,7 +75,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [branch, setBranch] = useState("HEAD");
   const [config, setConfig] = useState<RudderConfig | null>(null);
-  const [backend, setBackend] = useState<BackendId>(defaults.backend ?? "claude");
+  const [backend, setBackend] = useState<BackendId>(toInteractiveBackend(defaults.backend ?? "claude"));
   const [model, setModel] = useState<string | undefined>(defaults.model);
   const [worktreeMode, setWorktreeMode] = useState<"auto" | "always">(defaults.worktree === false ? "auto" : "always");
   const [runs, setRuns] = useState<UiRun[]>([]);
@@ -108,7 +108,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     notifyFinishedRuns(nextRuns, notifiedFinishedRuns);
     setRuns(nextRuns);
     if (!preferencesLoaded) {
-      setBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
+      setBackend(toInteractiveBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend));
       setModel(defaults.model);
       setPreferencesLoaded(true);
     }
@@ -221,10 +221,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         app.exit();
         return;
       case "backend":
-        if (isBackend(args[0])) {
+        if (isInteractiveBackend(args[0])) {
           chooseBackend(args[0], setBackend, setModel, setNotice);
         } else {
-          setNotice("Usage: /backend claude|codex|acpx");
+          setNotice("Usage: /backend claude|codex");
         }
         setInput("");
         return;
@@ -443,10 +443,6 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       setNotice("Refreshed");
       return;
     }
-    if (input.length === 0 && value === "b") {
-      cycleBackend(backend, setBackend, setModel, setNotice);
-      return;
-    }
     if (input.length === 0 && value === "o") {
       setModelMenuOpen(true);
       setModelMenuIndex(0);
@@ -517,8 +513,8 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         </Box>
       </Box>
       {helpOpen ? <Help /> : null}
-      {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} /> : null}
-      {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} /> : null}
+      {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} width={width} /> : null}
+      {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} width={width} /> : null}
       <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} focused={focusPane === "task"} />
       <Footer focusPane={focusPane} />
     </Box>
@@ -659,10 +655,10 @@ function Help(): React.ReactElement {
   return (
     <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
       <Text bold color="yellow">keys</Text>
-      <Text><Text color="cyan">Tab</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">b</Text> switch backend   <Text color="cyan">j/k</Text> select run</Text>
+      <Text><Text color="cyan">Tab</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">j/k</Text> select run</Text>
       <Text><Text color="cyan">worker focus</Text> type to selected agent; running agents are interrupted on Enter   <Text color="cyan">n</Text> new task   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
       <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
-      <Text color="gray">Slash: /backend claude|codex|acpx, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
+      <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
     </Box>
   );
 }
@@ -678,39 +674,52 @@ function ModelMenu(props: {
   options: ModelOption[];
   selectedIndex: number;
   currentModel?: string;
+  width: number;
 }): React.ReactElement {
+  const contentWidth = Math.max(24, props.width - 4);
+  const start = visibleWindowStart(props.selectedIndex, props.options.length, 8);
+  const visible = props.options.slice(start, start + 8);
+  const hiddenBefore = start > 0;
+  const hiddenAfter = start + visible.length < props.options.length;
   return (
-    <Box borderStyle="single" borderColor="magenta" paddingX={1} flexDirection="column">
-      <Text bold color="magenta">model: {props.backend}</Text>
-      {props.options.map((option, index) => {
+    <Box width={props.width} borderStyle="single" borderColor="magenta" paddingX={1} flexDirection="column">
+      <Text bold color="magenta">{fitLine(`model: ${props.backend}`, contentWidth)}</Text>
+      {hiddenBefore ? <Text color="gray">{fitLine("  ...", contentWidth)}</Text> : null}
+      {visible.map((option, localIndex) => {
+        const index = start + localIndex;
         const selected = index === props.selectedIndex;
         const active = option.value === props.currentModel || (!option.value && !props.currentModel);
-        const label = `${index + 1}. ${option.label}${active ? "  current" : ""}`;
+        const line = `${selected ? "> " : "  "}${index + 1}. ${option.label}${active ? "  current" : ""}  ${option.detail}`;
         return (
           <Text key={`${option.label}-${index}`} color={selected ? "white" : "gray"} bold={selected} wrap="truncate">
-            {selected ? "> " : "  "}{label.padEnd(28, " ")} {option.detail}
+            {fitLine(line, contentWidth)}
           </Text>
         );
       })}
-      <Text color="gray">Enter selects, Esc cancels, j/k or arrows move. Type /model &lt;id&gt; for a custom model.</Text>
+      {hiddenAfter ? <Text color="gray">{fitLine("  ...", contentWidth)}</Text> : null}
+      <Text color="gray">{fitLine("Enter selects, Esc cancels, j/k or arrows move. Type /model <id> for custom.", contentWidth)}</Text>
     </Box>
   );
 }
 
-function CommandMenu(props: { options: CommandOption[]; selectedIndex: number }): React.ReactElement {
-  const visible = props.options.slice(0, 8);
+function CommandMenu(props: { options: CommandOption[]; selectedIndex: number; width: number }): React.ReactElement {
+  const contentWidth = Math.max(24, props.width - 4);
+  const start = visibleWindowStart(props.selectedIndex, props.options.length, 8);
+  const visible = props.options.slice(start, start + 8);
   return (
-    <Box borderStyle="single" borderColor="blue" paddingX={1} flexDirection="column">
-      <Text bold color="blue">commands</Text>
-      {visible.map((option, index) => {
+    <Box width={props.width} borderStyle="single" borderColor="blue" paddingX={1} flexDirection="column">
+      <Text bold color="blue">{fitLine("commands", contentWidth)}</Text>
+      {visible.map((option, localIndex) => {
+        const index = start + localIndex;
         const selected = index === props.selectedIndex;
+        const line = `${selected ? "> " : "  "}/${option.name.padEnd(12, " ")} ${option.detail}`;
         return (
           <Text key={option.name} color={selected ? "white" : "gray"} bold={selected} wrap="truncate">
-            {selected ? "> " : "  "}/{option.name.padEnd(12, " ")} {option.detail}
+            {fitLine(line, contentWidth)}
           </Text>
         );
       })}
-      <Text color="gray">Tab completes, Enter runs exact commands, arrows move.</Text>
+      <Text color="gray">{fitLine("Enter completes/runs selected command, arrows move, Tab changes pane focus.", contentWidth)}</Text>
     </Box>
   );
 }
@@ -741,7 +750,7 @@ function PromptDock(props: {
 function Footer(props: { focusPane: FocusPane }): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">focus:{props.focusPane}  Tab focus  b backend  o model  / commands  n new  c worker  j/k select  m/M merge  ? help</Text>
+      <Text color="gray">focus:{props.focusPane}  Tab focus  o model  / commands  n new  c worker  j/k select  m/M merge  ? help</Text>
     </Box>
   );
 }
@@ -948,16 +957,6 @@ function nextFocusPane(current: FocusPane): FocusPane {
   return "agents";
 }
 
-function cycleBackend(
-  current: BackendId,
-  setBackend: (backend: BackendId) => void,
-  setModel: (model: string | undefined) => void,
-  setNotice: (notice: string) => void,
-): void {
-  const index = BACKENDS.indexOf(current);
-  chooseBackend(BACKENDS[(index + 1) % BACKENDS.length] ?? "claude", setBackend, setModel, setNotice);
-}
-
 function chooseBackend(
   backend: BackendId,
   setBackend: (backend: BackendId) => void,
@@ -967,6 +966,14 @@ function chooseBackend(
   setBackend(backend);
   setModel(undefined);
   setNotice(`Backend ${backend}`);
+}
+
+function visibleWindowStart(selectedIndex: number, total: number, windowSize: number): number {
+  if (total <= windowSize) {
+    return 0;
+  }
+  const half = Math.floor(windowSize / 2);
+  return Math.max(0, Math.min(total - windowSize, selectedIndex - half));
 }
 
 function toggleSet(current: Set<string>, value: string): Set<string> {
@@ -1050,8 +1057,12 @@ function shouldSelectCommand(input: string, options: CommandOption[]): boolean {
   return query.length === 0 || !options.some((option) => option.name === query);
 }
 
-function isBackend(value: string | undefined): value is BackendId {
-  return value === "claude" || value === "codex" || value === "acpx";
+function isInteractiveBackend(value: string | undefined): value is BackendId {
+  return value === "claude" || value === "codex";
+}
+
+function toInteractiveBackend(value: BackendId | undefined): BackendId {
+  return value === "codex" ? "codex" : "claude";
 }
 
 function isPrintable(value: string): boolean {

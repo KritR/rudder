@@ -1,101 +1,107 @@
 # rudder
 
-Rudder is a Claude Code-style terminal app for running Claude Code, Codex, and
-`acpx` agents. It keeps the existing tools underneath, then adds OpenClaw-style
-onboarding, a full-screen agent console, background runs, saved transcripts, and
-git worktree isolation so multiple prompts do not fight over the same checkout.
+[![npm version](https://img.shields.io/npm/v/@viraatdas/rudder.svg)](https://www.npmjs.com/package/@viraatdas/rudder)
+[![npm downloads](https://img.shields.io/npm/dm/@viraatdas/rudder.svg)](https://www.npmjs.com/package/@viraatdas/rudder)
+[![Node >=20](https://img.shields.io/badge/node-%3E%3D20-43853d.svg)](https://nodejs.org/)
+[![CLI](https://img.shields.io/badge/interface-terminal-111827.svg)](#run)
 
-## Install
+Rudder is a Claude Code-style terminal app for running coding agents without
+letting parallel tasks fight over the same checkout. It gives you a focused TUI,
+OpenClaw-style credential detection, background runs, saved transcripts,
+worktree isolation, model picking, agent steering, and one-command merging.
 
-From npm:
-
-```bash
-npm install -g @viraatdas/rudder
-```
-
-Or run without a global install:
+## Quick Start
 
 ```bash
-npx @viraatdas/rudder@latest --help
+npm install -g @viraatdas/rudder@latest
+rudder onboard
+rudder
 ```
 
-Verify the installed CLI:
+Then type a task and press `Enter`:
 
-```bash
-rudder --help
-rudder doctor
+```text
+fix the failing tests
 ```
 
-Upgrade an existing install:
+Upgrade later with:
 
 ```bash
 npm install -g @viraatdas/rudder@latest
 ```
 
-Local development:
+Run without installing globally:
 
 ```bash
-npm install
-npm run build
-npm link
+npx @viraatdas/rudder@latest --help
 ```
 
-## Setup
+## Requirements
+
+- Node.js 20 or newer
+- Git, for run tracking and worktree isolation
+- Claude Code and/or Codex installed and logged in
+
+Check your setup:
 
 ```bash
-rudder onboard
 rudder doctor
 ```
 
-Rudder stores config in `~/.rudder/config.json` and OpenClaw-shaped auth
-profiles in `~/.rudder/auth-profiles.json`.
+## Onboarding
 
-It detects and can mirror:
+```bash
+rudder onboard
+```
+
+Rudder detects existing agent auth and mirrors what it can into
+`~/.rudder/auth-profiles.json`. It also writes normal config to
+`~/.rudder/config.json`.
+
+Detected auth sources:
 
 - Claude Code auth from macOS Keychain or `~/.claude/.credentials.json`
-- Codex auth from macOS Keychain or `~/.codex/auth.json`
+- Codex auth from `~/.codex/auth.json`
 - `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`
-
-It also offers setup-token/API-key fallback paths during onboarding.
 
 ## Run
 
-Open the full-screen terminal UI:
+Open the full-screen UI:
 
 ```bash
 rudder
 ```
 
-Type a task in the prompt dock and press `Enter`. Rudder starts the agent in the
-background, keeps its transcript visible, and tracks planner/verifier work in
-the agent pane. TUI runs default to isolated worktrees so parallel agents do not
-touch the same checkout. The focused pane uses a double cyan border and a focus
-badge so it is clear where keyboard input goes.
+The UI has three focus panes. The focused pane has a double cyan border and a
+focus badge so it is clear where input goes.
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch focus between agents, worker, and task panes |
+| `Enter` | Submit the current input |
+| `j` / `k` or arrows | Select an agent run |
+| `c` or `Esc` | Focus the selected worker |
+| `n` | Return to new-task mode |
+| `o` or `/model` | Open the model picker |
+| `/` | Open searchable slash commands |
+| `x` | Expand/collapse selected run |
+| `l` | Expand/collapse transcript |
+| `s` | Stop selected run |
+| `m` | Merge selected completed worktree run |
+| `M` | Merge all completed worktree runs |
+| `?` | Help |
+| `q` | Quit |
+
+Worker focus is intentionally direct: typing into it sends a follow-up to the
+selected agent. If that agent is still running, `Enter` interrupts and redirects
+it.
+
+Slash commands:
 
 ```text
-Enter    submit task or slash command
-Tab      switch focus between agents, worker, and task panes
-b        switch backend
-o        open the model picker
-j/k      select agent run
-x        expand or collapse selected run
-l        expand transcript
-Esc/c    focus the selected worker; if it is running, Enter interrupts and redirects it
-n        return to new-agent mode
-w        toggle worktree auto/always
-s        stop selected run
-m        merge selected worktree run
-M        merge all completed worktree runs
-?        help
-q        quit
-```
-
-Slash commands are available inside the TUI:
-
-```text
-/backend claude|codex|acpx
+/backend claude|codex
 /model
-/model <model>
+/model <model-id>
 /agent [runId]
 /interrupt [runId]
 /new
@@ -107,29 +113,47 @@ Slash commands are available inside the TUI:
 /exit
 ```
 
-Typing `/` opens a searchable command picker. Use arrows to move in the picker.
-Press `Enter` on a partial command such as `/mo` to complete the selected
-command.
+Typing `/` opens command search. Use arrows to move, then press `Enter` to run
+or complete the selected command.
 
-`/model` opens a picker for the active backend. Claude options are discovered
-from local Claude Code session history plus the aliases exposed by the installed
-Claude CLI. Codex options are read from `~/.codex/models_cache.json`. `/model
-<id>` still accepts any custom model id.
+## Models
 
-After an agent finishes, Rudder waits 10 seconds for user input and then sends
-an automatic steering prompt asking what remains, whether the work looks good,
-and whether the relevant checks were run. Each run also updates
-`.rudder/agent-context.md`; that generated file is injected into new agent
-prompts so agents can see what other agents are working on. The full-screen UI
-plays a short completion sound when a run finishes while Rudder is open.
+`/model` opens a bounded picker for the active backend.
 
-Codex runs use `codex exec` with `danger-full-access`, bypassed approvals,
-`approval_policy="never"`, xhigh reasoning effort, detailed reasoning
-summaries, and the experimental `goals` feature enabled. Claude runs use
-Claude Code's print mode with `bypassPermissions`, `--dangerously-skip-permissions`,
-xhigh effort, verbose stream JSON, and session resume/fork support.
+- Claude models are discovered from local Claude Code session history plus the
+  aliases exposed by the installed Claude CLI.
+- Codex models are read from `~/.codex/models_cache.json`.
+- `/model <model-id>` still accepts any custom model id.
 
-Direct one-shot commands still work:
+## Worktrees And Merging
+
+Rudder enforces one active agent per checkout. If you start another task in the
+same repo, Rudder creates a separate git worktree and runs the agent there.
+
+```bash
+rudder run --worktree "try the alternate implementation"
+rudder merge <runId>
+rudder cleanup
+```
+
+`rudder merge` uses normal git merge semantics. Clean merges become merge
+commits. Conflicts are left in the standard git conflict state for you to
+resolve.
+
+## Agent Steering
+
+Each run gets a lightweight Rudder contract with:
+
+- repository instructions from `AGENTS.md`, `CLAUDE.md`, and `README.md`
+- active-agent context from `.rudder/agent-context.md`
+- acceptance criteria for the task
+- suggested verification commands
+
+After an agent finishes, Rudder verifies basic completion signals. If there are
+clear gaps, it can send a follow-up steering prompt. It does not auto-steer
+simple no-op greetings.
+
+## One-Shot Commands
 
 ```bash
 rudder "fix the failing tests"
@@ -138,13 +162,7 @@ rudder codex --model gpt-5.5 "refactor the parser"
 rudder run -d "rewrite this module"
 ```
 
-For the old line-oriented shell:
-
-```bash
-rudder legacy-shell
-```
-
-## Manage Runs
+## Run Management
 
 ```bash
 rudder status
@@ -152,20 +170,29 @@ rudder runs
 rudder watch <runId>
 rudder logs <runId> --follow
 rudder stop <runId>
-```
-
-## Worktrees
-
-Rudder enforces one active agent per checkout. If you start a second task in the
-same repo while one is already running, Rudder creates a git worktree on a
-`rudder/<run>` branch and runs the agent there.
-
-```bash
-rudder run --worktree "try the alternate implementation"
 rudder merge <runId>
 rudder cleanup
 ```
 
-`rudder merge` uses normal git merge semantics. Clean merges are committed as a
-merge commit; conflicts are left in the standard git conflict state for you to
-resolve.
+## Troubleshooting
+
+```bash
+rudder doctor
+rudder onboard
+npm install -g @viraatdas/rudder@latest
+```
+
+If Codex models look stale, open Codex once or refresh its login, then reopen
+Rudder. If Claude models look stale, run a Claude Code session once; Rudder reads
+local Claude session history to populate explicit Claude model ids.
+
+## Development
+
+```bash
+git clone https://github.com/viraatdas/rudder.git
+cd rudder
+npm install
+npm run check
+npm run build
+npm link
+```

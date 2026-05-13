@@ -363,7 +363,6 @@ Usage:
   rudder run [options] "task"
   rudder claude [options] "task"
   rudder codex [options] "task"
-  rudder acpx codex [options] "task"
 
 Run management:
   rudder watch [run]              Attach to live output
@@ -383,7 +382,7 @@ Options:
       --worktree                  Always isolate in a git worktree
       --queue                     Queue mode (reserved)
   -m, --model <model>             Backend model
-  -b, --backend <backend>         claude, codex, or acpx
+  -b, --backend <backend>         claude or codex
   -C, --cwd <dir>                 Run from another directory
       --json                      Machine-readable output
       --allow-dirty               Allow merge into dirty target branch
