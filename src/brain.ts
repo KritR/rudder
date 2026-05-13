@@ -3,7 +3,7 @@ import path from "node:path";
 import type { RunRecord, SpecContract, VerificationResult } from "./types.js";
 import { currentBranch, currentCommit, gitDiff, gitStatus, hasChanges } from "./git.js";
 import { pathExists, readJson, runCommand, writeJson } from "./util.js";
-import { specPath, verifierPath } from "./state.js";
+import { agentContextPath, specPath, verifierPath } from "./state.js";
 
 const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "README.md"];
 
@@ -21,10 +21,19 @@ export async function createSpec(run: RunRecord): Promise<SpecContract> {
       content: content.slice(0, 12_000),
     });
   }
+  const contextFile = agentContextPath(run.repoRoot);
+  if (await pathExists(contextFile)) {
+    const content = await fsp.readFile(contextFile, "utf8");
+    instructionsFiles.push({
+      path: ".rudder/agent-context.md",
+      content: content.slice(0, 12_000),
+    });
+  }
 
+  const task = run.currentPrompt ?? run.task;
   const spec: SpecContract = {
     runId: run.id,
-    task: run.task,
+    task,
     createdAt: new Date().toISOString(),
     repo: {
       root: workspace,
@@ -33,7 +42,7 @@ export async function createSpec(run: RunRecord): Promise<SpecContract> {
       status: await gitStatus(workspace),
     },
     instructionsFiles,
-    acceptanceCriteria: buildAcceptanceCriteria(run.task),
+    acceptanceCriteria: buildAcceptanceCriteria(task),
     suggestedTests: await suggestTests(workspace),
   };
   await writeJson(specPath(run.repoRoot, run.id), spec);

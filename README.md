@@ -68,7 +68,8 @@ rudder
 
 Type a task in the prompt dock and press `Enter`. Rudder starts the agent in the
 background, keeps its transcript visible, and tracks planner/verifier work in
-the agent pane.
+the agent pane. TUI runs default to isolated worktrees so parallel agents do not
+touch the same checkout.
 
 ```text
 Enter    submit task or slash command
@@ -76,9 +77,12 @@ Tab      switch backend
 j/k      select agent run
 x        expand or collapse selected run
 l        expand transcript
+c        type a follow-up to the selected agent
+n        return to new-agent mode
 w        toggle worktree auto/always
 s        stop selected run
 m        merge selected worktree run
+M        merge all completed worktree runs
 ?        help
 q        quit
 ```
@@ -88,12 +92,21 @@ Slash commands are available inside the TUI:
 ```text
 /backend claude|codex|acpx
 /model <model>
+/agent [runId]
+/new
 /worktree auto|always
 /stop [runId]
 /merge [runId] [--allow-dirty]
+/merge-all [--allow-dirty]
 /clear
 /exit
 ```
+
+After an agent finishes, Rudder waits 10 seconds for user input and then sends
+an automatic steering prompt asking what remains, whether the work looks good,
+and whether the relevant checks were run. Each run also updates
+`.rudder/agent-context.md`; that generated file is injected into new agent
+prompts so agents can see what other agents are working on.
 
 Direct one-shot commands still work:
 

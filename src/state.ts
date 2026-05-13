@@ -44,6 +44,10 @@ export function outputPath(repoRoot: string, runId: string): string {
   return path.join(runDir(repoRoot, runId), "output.txt");
 }
 
+export function agentContextPath(repoRoot: string): string {
+  return path.join(projectStateDir(repoRoot), "agent-context.md");
+}
+
 export function specPath(repoRoot: string, runId: string): string {
   return path.join(runDir(repoRoot, runId), "spec.json");
 }
@@ -191,6 +195,10 @@ export async function createRunRecord(params: {
       path: params.worktreePath ?? params.repoRoot,
       branch: params.worktreeBranch,
     },
+    currentPrompt: params.task,
+    turns: [{ ts: createdAt, prompt: params.task, source: "user" }],
+    lastUserInputAt: createdAt,
+    autoSteer: { count: 0, max: 2 },
   };
   await ensureDir(runDir(params.repoRoot, id));
   await saveRunRecord(record);

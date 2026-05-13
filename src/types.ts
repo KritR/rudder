@@ -95,6 +95,7 @@ export type BackendConfig = {
 export type RunStatus =
   | "created"
   | "running"
+  | "steering"
   | "verifying"
   | "completed"
   | "failed"
@@ -125,6 +126,18 @@ export type RunRecord = {
     exitCode?: number | null;
     signal?: NodeJS.Signals | null;
   };
+  currentPrompt?: string;
+  turns?: Array<{
+    ts: string;
+    prompt: string;
+    source: "user" | "steerer";
+  }>;
+  lastUserInputAt?: string;
+  autoSteer?: {
+    count: number;
+    max: number;
+    waitingSince?: string;
+  };
   session?: {
     nativeSessionId?: string;
     acpxSessionId?: string;
@@ -148,7 +161,10 @@ export type RudderEvent = {
   type:
     | "run.created"
     | "run.started"
+    | "run.continued"
     | "run.detached"
+    | "steerer.waiting"
+    | "steerer.prompt"
     | "planner.spec"
     | "backend.output"
     | "backend.error"

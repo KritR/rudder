@@ -8,7 +8,7 @@ import {
   loadConfig,
   outputPath,
 } from "./state.js";
-import { mergeRun, startRun, stopRun } from "./run-manager.js";
+import { continueRun, mergeRun, startRun, stopRun } from "./run-manager.js";
 import type { BackendId, RunRecord, RudderConfig, RudderEvent, RunStatus } from "./types.js";
 import { pathExists, shortenHome } from "./util.js";
 
@@ -37,7 +37,7 @@ export async function runInteractiveTui(defaults?: TuiDefaults): Promise<void> {
   const instance = render(<RudderTui defaults={defaults ?? {}} />, {
     alternateScreen: true,
     exitOnCtrlC: false,
-    maxFps: 12,
+    maxFps: 60,
   });
   await instance.waitUntilExit();
 }
@@ -50,9 +50,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [config, setConfig] = useState<RudderConfig | null>(null);
   const [backend, setBackend] = useState<BackendId>(defaults.backend ?? "claude");
   const [model, setModel] = useState<string | undefined>(defaults.model);
-  const [worktreeMode, setWorktreeMode] = useState<"auto" | "always">(defaults.worktree ? "always" : "auto");
+  const [worktreeMode, setWorktreeMode] = useState<"auto" | "always">(defaults.worktree === false ? "auto" : "always");
   const [runs, setRuns] = useState<UiRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
+  const [targetRunId, setTargetRunId] = useState<string | undefined>();
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(new Set());
   const [transcriptExpanded, setTranscriptExpanded] = useState(false);
   const [input, setInput] = useState("");
@@ -84,12 +85,13 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     void refresh();
     const timer = setInterval(() => {
       void refresh();
-    }, 800);
+    }, input ? 1500 : 900);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [input, refresh]);
 
   const selectedIndex = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
   const selectedRun = runs[selectedIndex];
+  const targetRun = targetRunId ? runs.find((run) => run.id === targetRunId) : undefined;
   const activeCount = runs.filter((run) => isActive(run.status)).length;
   const selectedExpanded = Boolean(selectedRun && expandedRunIds.has(selectedRun.id));
 
@@ -99,6 +101,26 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       return;
     }
     setSubmitting(true);
+    if (targetRun) {
+      setNotice(`Sending to ${shortId(targetRun.id)}...`);
+      try {
+        const run = await continueRun({
+          runId: targetRun.id,
+          prompt: trimmed,
+          silent: true,
+        });
+        setInput("");
+        setSelectedRunId(run.id);
+        setExpandedRunIds((current) => new Set(current).add(run.id));
+        setNotice(`Sent to ${shortId(run.id)}`);
+        await refresh();
+      } catch (error) {
+        setNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     setNotice(`Starting ${backend}...`);
     try {
       const run = await startRun({
@@ -120,7 +142,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     } finally {
       setSubmitting(false);
     }
-  }, [backend, model, refresh, submitting, worktreeMode]);
+  }, [backend, model, refresh, submitting, targetRun, worktreeMode]);
 
   const handleCommand = useCallback(async (line: string) => {
     const [command = "", ...args] = line.slice(1).trim().split(/\s+/).filter(Boolean);
@@ -138,12 +160,28 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         return;
       case "backend":
         if (isBackend(args[0])) {
-          setBackend(args[0]);
-          setModel(undefined);
-          setNotice(`Backend ${args[0]}`);
+          chooseBackend(args[0], setBackend, setModel, setNotice);
         } else {
           setNotice("Usage: /backend claude|codex|acpx");
         }
+        setInput("");
+        return;
+      case "agent":
+      case "continue": {
+        const run = resolveUiRun(runs, args[0] ?? selectedRun?.id);
+        if (run) {
+          setTargetRunId(run.id);
+          setSelectedRunId(run.id);
+          setNotice(`Typing to ${shortId(run.id)}`);
+        } else {
+          setNotice("No agent selected");
+        }
+        setInput("");
+        return;
+      }
+      case "new":
+        setTargetRunId(undefined);
+        setNotice("Typing starts a new agent");
         setInput("");
         return;
       case "model":
@@ -164,6 +202,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         await runAction(args[0] ?? selectedRun?.id, async (id) => mergeRun(id, args.includes("--allow-dirty"), { silent: true }), "Merged", setNotice, refresh);
         setInput("");
         return;
+      case "merge-all":
+        await mergeReadyRuns(runs, args.includes("--allow-dirty"), setNotice, refresh);
+        setInput("");
+        return;
       case "clear":
         setExpandedRunIds(new Set());
         setNotice("Collapsed all runs");
@@ -173,7 +215,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setNotice(`Unknown command: /${command}`);
         setInput("");
     }
-  }, [app, refresh, selectedRun?.id]);
+  }, [app, refresh, runs, selectedRun?.id]);
 
   useInput((value, key) => {
     if (key.ctrl && value === "c") {
@@ -190,9 +232,8 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       }
       return;
     }
-    if (key.tab) {
-      cycleBackend(backend, setBackend);
-      setModel(undefined);
+    if (key.tab || value === "\t") {
+      cycleBackend(backend, setBackend, setModel, setNotice);
       return;
     }
     if (key.upArrow || (input.length === 0 && value === "k")) {
@@ -219,7 +260,15 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       }
       return;
     }
-    if (key.backspace || key.delete) {
+    if ((key.meta && (key.backspace || key.delete)) || value === "\u001b\u007f" || value === "\u001b\b") {
+      setInput((current) => deletePreviousWord(current));
+      return;
+    }
+    if (key.ctrl && value === "w") {
+      setInput((current) => deletePreviousWord(current));
+      return;
+    }
+    if (key.backspace || key.delete || value === "\u007f" || value === "\b") {
       setInput((current) => current.slice(0, -1));
       return;
     }
@@ -237,8 +286,17 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       return;
     }
     if (input.length === 0 && value === "b") {
-      cycleBackend(backend, setBackend);
-      setModel(undefined);
+      cycleBackend(backend, setBackend, setModel, setNotice);
+      return;
+    }
+    if (input.length === 0 && value === "c" && selectedRun) {
+      setTargetRunId(selectedRun.id);
+      setNotice(`Typing to ${shortId(selectedRun.id)}`);
+      return;
+    }
+    if (input.length === 0 && value === "n") {
+      setTargetRunId(undefined);
+      setNotice("Typing starts a new agent");
       return;
     }
     if (input.length === 0 && value === "w") {
@@ -261,6 +319,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       void runAction(selectedRun.id, async (id) => mergeRun(id, false, { silent: true }), "Merged", setNotice, refresh);
       return;
     }
+    if (input.length === 0 && value === "M") {
+      void mergeReadyRuns(runs, false, setNotice, refresh);
+      return;
+    }
     if (isPrintable(value)) {
       setInput((current) => current + value);
     }
@@ -274,21 +336,22 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
 
   return (
     <Box flexDirection="column" width={width} height={height}>
-      <Header repoRoot={repoRoot} branch={branch} backend={backend} model={model ?? modelForBackend(backend, config)} activeCount={activeCount} worktreeMode={worktreeMode} />
+      <Header width={width} repoRoot={repoRoot} branch={branch} backend={backend} model={model ?? modelForBackend(backend, config)} activeCount={activeCount} worktreeMode={worktreeMode} />
       <Box flexGrow={1} minHeight={0}>
-        <RunRail runs={runs} selectedRunId={selectedRun?.id} width={railWidth} expandedRunIds={expandedRunIds} />
+        <RunRail runs={runs} selectedRunId={selectedRun?.id} targetRunId={targetRunId} width={railWidth} expandedRunIds={expandedRunIds} />
         <Box flexDirection="column" flexGrow={1} marginLeft={1}>
           <DetailPane run={selectedRun} width={detailWidth} height={detailHeight} expanded={selectedExpanded} transcriptExpanded={transcriptExpanded} />
         </Box>
       </Box>
       {helpOpen ? <Help /> : null}
-      <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} />
+      <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} />
       <Footer />
     </Box>
   );
 }
 
 function Header(props: {
+  width: number;
   repoRoot: string;
   branch: string;
   backend: BackendId;
@@ -296,19 +359,11 @@ function Header(props: {
   activeCount: number;
   worktreeMode: "auto" | "always";
 }): React.ReactElement {
+  const contentWidth = Math.max(10, props.width - 4);
+  const label = `rudder  ${shortenHome(props.repoRoot)} ${props.branch}  |  ${props.backend}${props.model ? ` ${props.model}` : ""}  |  worktree:${props.worktreeMode}  active:${props.activeCount}`;
   return (
-    <Box borderStyle="single" borderColor="cyan" paddingX={1} justifyContent="space-between">
-      <Box>
-        <Text bold color="cyan">rudder</Text>
-        <Text color="gray">  {shortenHome(props.repoRoot)} </Text>
-        <Text color="gray">{props.branch}</Text>
-      </Box>
-      <Box>
-        <Text color="green">{props.backend}</Text>
-        <Text color="gray">{props.model ? ` ${props.model}` : ""}</Text>
-        <Text color="gray">  worktree:{props.worktreeMode}</Text>
-        <Text color={props.activeCount > 0 ? "yellow" : "gray"}>  active:{props.activeCount}</Text>
-      </Box>
+    <Box borderStyle="single" borderColor="cyan" paddingX={1}>
+      <Text bold color="cyan">{fitLine(label, contentWidth)}</Text>
     </Box>
   );
 }
@@ -316,6 +371,7 @@ function Header(props: {
 function RunRail(props: {
   runs: UiRun[];
   selectedRunId?: string;
+  targetRunId?: string;
   width: number;
   expandedRunIds: Set<string>;
 }): React.ReactElement {
@@ -334,6 +390,7 @@ function RunRail(props: {
           key={run.id}
           run={run}
           selected={run.id === props.selectedRunId}
+          targeted={run.id === props.targetRunId}
           expanded={props.expandedRunIds.has(run.id)}
           width={props.width - 4}
         />
@@ -342,17 +399,19 @@ function RunRail(props: {
   );
 }
 
-function RunCard(props: { run: UiRun; selected: boolean; expanded: boolean; width: number }): React.ReactElement {
+function RunCard(props: { run: UiRun; selected: boolean; targeted: boolean; expanded: boolean; width: number }): React.ReactElement {
   const tone = statusColor(props.run.status);
   const label = props.selected ? ">" : " ";
   const task = truncate(props.run.task, Math.max(12, props.width - 14));
-  const meta = `${props.run.worktree.enabled ? "wt" : "co"} ${props.expanded ? "open" : "closed"}`;
+  const progress = completionPercent(props.run);
+  const summary = truncate(runSummary(props.run), Math.max(12, props.width - 8));
+  const meta = `${progressBar(progress)} ${progress}%`;
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text wrap="truncate" color={props.selected ? "white" : "gray"} bold={props.selected}>
-        {label} {statusGlyph(props.run.status)} {props.run.backend} {task}
+        {label} {meta} {statusGlyph(props.run.status)} {props.run.backend} {task}
       </Text>
-      <Text wrap="truncate" color={tone}>{props.run.status}  <Text color="gray">{meta}</Text></Text>
+      <Text wrap="truncate" color={tone}>  {props.run.worktree.enabled ? "wt" : "co"} {props.targeted ? "typing " : ""}{summary}</Text>
     </Box>
   );
 }
@@ -374,13 +433,19 @@ function DetailPane(props: {
   const workLimit = props.expanded ? 10 : 5;
   const outputHeight = props.transcriptExpanded ? Math.max(8, props.height - 7) : Math.max(5, Math.floor(props.height * 0.45));
   const contentWidth = Math.max(10, props.width - 4);
+  const progress = completionPercent(props.run);
   return (
     <Box width={props.width} height={props.height} borderStyle="single" borderColor={statusColor(props.run.status)} paddingX={1} flexDirection="column">
       <Text> </Text>
       <Text wrap="truncate" color={statusColor(props.run.status)}>
-        {props.run.status}  {props.run.backend} {shortId(props.run.id)}  {props.run.task}
+        {fitLine(`${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
       </Text>
-      <Text wrap="truncate" color="gray">{props.run.worktree.enabled ? shortenHome(props.run.worktree.path) : "current checkout"}</Text>
+      <Text wrap="truncate" color="gray">
+        {fitLine(props.run.worktree.enabled ? shortenHome(props.run.worktree.path) : "current checkout", contentWidth)}
+      </Text>
+      <Text wrap="truncate" color={canMerge(props.run) ? "green" : "gray"}>
+        {fitLine(canMerge(props.run) ? "[m] merge this  [M] merge all ready" : runSummary(props.run), contentWidth)}
+      </Text>
       {!props.transcriptExpanded ? (
         <Box flexDirection="column" marginTop={1}>
           <Text bold>work</Text>
@@ -409,9 +474,9 @@ function Help(): React.ReactElement {
     <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
       <Text bold color="yellow">keys</Text>
       <Text><Text color="cyan">Enter</Text> submit task or slash command   <Text color="cyan">Tab</Text> switch backend   <Text color="cyan">j/k</Text> or arrows select run</Text>
-      <Text><Text color="cyan">x</Text> expand/collapse run   <Text color="cyan">l</Text> expand transcript   <Text color="cyan">w</Text> worktree auto/always</Text>
-      <Text><Text color="cyan">s</Text> stop selected   <Text color="cyan">m</Text> merge selected   <Text color="cyan">r</Text> refresh   <Text color="cyan">q</Text> quit</Text>
-      <Text color="gray">Slash: /backend claude|codex|acpx, /model &lt;name&gt;, /worktree auto|always, /stop, /merge, /exit</Text>
+      <Text><Text color="cyan">x</Text> expand/collapse   <Text color="cyan">l</Text> transcript   <Text color="cyan">c</Text> type to selected   <Text color="cyan">n</Text> new agent</Text>
+      <Text><Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m</Text> merge selected   <Text color="cyan">M</Text> merge all ready</Text>
+      <Text color="gray">Slash: /backend claude|codex|acpx, /model &lt;name&gt;, /agent, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
     </Box>
   );
 }
@@ -422,27 +487,25 @@ function PromptDock(props: {
   model?: string;
   notice: string;
   submitting: boolean;
+  targetRun?: UiRun;
 }): React.ReactElement {
+  const label = props.targetRun ? `agent ${shortId(props.targetRun.id)}` : "task";
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="cyan" paddingX={1}>
-      <Box justifyContent="space-between">
-        <Text color="gray">{props.notice}</Text>
-        <Text color="gray">{props.backend}{props.model ? ` ${props.model}` : ""}</Text>
-      </Box>
+    <Box borderStyle="single" borderColor="cyan" paddingX={1} justifyContent="space-between">
       <Text>
-        <Text color={props.submitting ? "yellow" : "cyan"}>{props.submitting ? "starting" : "task"}</Text>
+        <Text color={props.submitting ? "yellow" : "cyan"}>{props.submitting ? "starting" : label}</Text>
         <Text>  {props.input}</Text>
         <Text color="cyan">_</Text>
       </Text>
+      <Text color="gray">{props.notice}  {props.backend}{props.model ? ` ${props.model}` : ""}</Text>
     </Box>
   );
 }
 
 function Footer(): React.ReactElement {
   return (
-    <Box justifyContent="space-between">
-      <Text color="gray">Enter submit  Tab backend  j/k select  x expand  l log  w wt</Text>
-      <Text color="gray">? help  q quit</Text>
+    <Box>
+      <Text color="gray">Enter submit  Tab backend  c continue  n new  j/k  m/M merge  ? help  q quit</Text>
     </Box>
   );
 }
@@ -492,6 +555,18 @@ function buildWork(events: RudderEvent[], run: RunRecord): WorkItem[] {
   for (const event of events) {
     if (event.type === "run.created") {
       items.push({ label: run.worktree.enabled ? "worktree prepared" : "checkout claimed", detail: event.message, tone: "info" });
+      continue;
+    }
+    if (event.type === "run.continued") {
+      items.push({ label: "user follow-up", detail: event.message, tone: "info" });
+      continue;
+    }
+    if (event.type === "steerer.waiting") {
+      items.push({ label: "auto-steering wait", detail: "10s grace period", tone: "warning" });
+      continue;
+    }
+    if (event.type === "steerer.prompt") {
+      items.push({ label: "auto-steering", detail: "review prompt sent", tone: "info" });
       continue;
     }
     if (event.type === "planner.spec") {
@@ -565,7 +640,11 @@ function compactWork(items: WorkItem[]): WorkItem[] {
 
 function formatWorkLine(item: WorkItem, width: number): string {
   const raw = `${workGlyph(item.tone)} ${item.label}${item.detail ? `  ${item.detail}` : ""}`;
-  return truncate(raw, width).padEnd(width, " ");
+  return fitLine(raw, width);
+}
+
+function fitLine(value: string, width: number): string {
+  return truncate(value, width).padEnd(width, " ");
 }
 
 async function runAction(
@@ -588,6 +667,27 @@ async function runAction(
   }
 }
 
+async function mergeReadyRuns(
+  runs: UiRun[],
+  allowDirty: boolean,
+  setNotice: (notice: string) => void,
+  refresh: () => Promise<void>,
+): Promise<void> {
+  const ready = runs.filter(canMerge);
+  if (ready.length === 0) {
+    setNotice("No completed worktree runs ready to merge");
+    return;
+  }
+  setNotice(`Merging ${ready.length} run${ready.length === 1 ? "" : "s"}...`);
+  let merged = 0;
+  for (const run of ready) {
+    await mergeRun(run.id, allowDirty, { silent: true });
+    merged += 1;
+  }
+  setNotice(`Merged ${merged} run${merged === 1 ? "" : "s"}`);
+  await refresh();
+}
+
 function selectRelative(
   runs: UiRun[],
   selectedRunId: string | undefined,
@@ -602,9 +702,25 @@ function selectRelative(
   setSelectedRunId(runs[next]?.id);
 }
 
-function cycleBackend(current: BackendId, setBackend: (backend: BackendId) => void): void {
+function cycleBackend(
+  current: BackendId,
+  setBackend: (backend: BackendId) => void,
+  setModel: (model: string | undefined) => void,
+  setNotice: (notice: string) => void,
+): void {
   const index = BACKENDS.indexOf(current);
-  setBackend(BACKENDS[(index + 1) % BACKENDS.length] ?? "claude");
+  chooseBackend(BACKENDS[(index + 1) % BACKENDS.length] ?? "claude", setBackend, setModel, setNotice);
+}
+
+function chooseBackend(
+  backend: BackendId,
+  setBackend: (backend: BackendId) => void,
+  setModel: (model: string | undefined) => void,
+  setNotice: (notice: string) => void,
+): void {
+  setBackend(backend);
+  setModel(undefined);
+  setNotice(`Backend ${backend}`);
 }
 
 function toggleSet(current: Set<string>, value: string): Set<string> {
@@ -630,6 +746,13 @@ function modelForBackend(backend: BackendId, config: RudderConfig | null): strin
   return config.backends.acpx?.model;
 }
 
+function resolveUiRun(runs: UiRun[], runId: string | undefined): UiRun | undefined {
+  if (!runId) {
+    return undefined;
+  }
+  return runs.find((run) => run.id === runId || run.id.startsWith(runId));
+}
+
 function isBackend(value: string | undefined): value is BackendId {
   return value === "claude" || value === "codex" || value === "acpx";
 }
@@ -639,7 +762,7 @@ function isPrintable(value: string): boolean {
 }
 
 function isActive(status: RunStatus): boolean {
-  return status === "created" || status === "running" || status === "verifying";
+  return status === "created" || status === "running" || status === "steering" || status === "verifying";
 }
 
 function statusGlyph(status: RunStatus): string {
@@ -665,7 +788,7 @@ function statusColor(status: RunStatus): string {
   if (status === "cancelled") {
     return "yellow";
   }
-  if (status === "verifying") {
+  if (status === "verifying" || status === "steering") {
     return "magenta";
   }
   return "cyan";
@@ -701,6 +824,71 @@ function workGlyph(tone: WorkItem["tone"]): string {
     return "->";
   }
   return "--";
+}
+
+function completionPercent(run: UiRun): number {
+  if (run.status === "merged") {
+    return 100;
+  }
+  if (run.status === "completed") {
+    return 95;
+  }
+  if (run.status === "merge-conflict") {
+    return 85;
+  }
+  if (run.status === "failed" || run.status === "cancelled") {
+    return 50;
+  }
+  if (run.status === "steering") {
+    return 88;
+  }
+  if (run.status === "verifying") {
+    return 82;
+  }
+  const labels = new Set(run.work.map((item) => item.label));
+  let value = 8;
+  if (labels.has("worktree prepared") || labels.has("checkout claimed")) {
+    value = 18;
+  }
+  if (labels.has("planner contract")) {
+    value = 28;
+  }
+  if (labels.has("worker started")) {
+    value = 45;
+  }
+  if (run.output.trim()) {
+    value = Math.max(value, 60);
+  }
+  return value;
+}
+
+function progressBar(percent: number): string {
+  const width = 6;
+  const filled = Math.max(0, Math.min(width, Math.round((percent / 100) * width)));
+  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+}
+
+function canMerge(run: UiRun): boolean {
+  return run.status === "completed" && run.worktree.enabled;
+}
+
+function runSummary(run: UiRun): string {
+  const latestWork = run.work.at(-1);
+  if (run.status === "steering") {
+    return "auto-steering after completion";
+  }
+  if (latestWork) {
+    return `${latestWork.label}${latestWork.detail ? `: ${latestWork.detail}` : ""}`;
+  }
+  const latestLine = tailLines(run.output, 1)[0];
+  if (latestLine && latestLine !== "No transcript yet.") {
+    return latestLine;
+  }
+  return run.status;
+}
+
+function deletePreviousWord(value: string): string {
+  return value.replace(/\s+$/, "").replace(/\S+$/, "");
 }
 
 function missingCount(data: unknown): number {
