@@ -120,9 +120,11 @@ or complete the selected command.
 
 `/model` opens a bounded picker for the active backend.
 
-- Claude models are discovered from local Claude Code session history plus the
-  aliases exposed by the installed Claude CLI.
-- Codex models are read from `~/.codex/models_cache.json`.
+- Claude and Codex model lists are fetched from `https://models.dev/api.json`,
+  the same public model registry used by opencode.
+- The fetched registry is cached in `~/.rudder/models-dev.json`.
+- If the network is unavailable, Rudder falls back to local Claude session
+  history and Codex's `~/.codex/models_cache.json`.
 - `/model <model-id>` still accepts any custom model id.
 
 ## Worktrees And Merging
