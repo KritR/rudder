@@ -95,9 +95,11 @@ focus badge so it is clear where input goes.
 | `?` | Help |
 | `q` | Quit |
 
-Worker focus is intentionally direct: typing into it sends a follow-up to the
-selected agent. If that agent is still running, `Enter` interrupts and redirects
-it.
+Worker focus is intentionally direct: the input moves into the selected worker
+pane, so a completed run feels like a resumable standalone session. Type there
+and press `Enter` to continue that agent. If the agent is still running, `Enter`
+interrupts and redirects it. Press `Esc` from an empty worker input to return to
+new-task mode.
 
 Paste works directly in the task and worker input. For long pasted prompts,
 Rudder normalizes line breaks into spaces so the prompt stays inside the input

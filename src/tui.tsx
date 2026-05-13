@@ -458,6 +458,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setHelpOpen(false);
       } else if (transcriptExpanded) {
         setTranscriptExpanded(false);
+      } else if (focusPane === "worker") {
+        setTargetRunId(undefined);
+        setFocusPane("task");
+        setNotice("Task focus: type a new task");
       } else if (selectedRun) {
         setFocusPane("worker");
         setNotice(`${isActive(selectedRun.status) ? "Type redirect, Enter interrupts" : "Typing to"} ${shortId(selectedRun.id)}`);
@@ -608,14 +612,25 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       <Box flexGrow={1} minHeight={0}>
         <RunRail runs={runs} selectedRunId={selectedRun?.id} targetRunId={targetRun?.id} width={railWidth} expandedRunIds={expandedRunIds} focused={focusPane === "agents"} />
         <Box flexDirection="column" flexGrow={1} marginLeft={1}>
-          <DetailPane run={selectedRun} width={detailWidth} height={detailHeight} expanded={selectedExpanded} transcriptExpanded={transcriptExpanded} focused={focusPane === "worker"} />
+          <DetailPane
+            run={selectedRun}
+            width={detailWidth}
+            height={detailHeight}
+            expanded={selectedExpanded}
+            transcriptExpanded={transcriptExpanded}
+            focused={focusPane === "worker"}
+            input={focusPane === "worker" ? input : ""}
+            submitting={submitting}
+          />
         </Box>
       </Box>
       {helpOpen ? <Help /> : null}
       {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} width={width} /> : null}
       {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} width={width} /> : null}
       {deletePrompt ? <DeletePromptBox prompt={deletePrompt} width={width} /> : null}
-      <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} focused={focusPane === "task"} />
+      {focusPane === "worker"
+        ? <StatusDock notice={notice} />
+        : <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} focused={focusPane === "task"} />}
       <Footer focusPane={focusPane} />
     </Box>
   );
@@ -698,6 +713,8 @@ function DetailPane(props: {
   expanded: boolean;
   transcriptExpanded: boolean;
   focused: boolean;
+  input: string;
+  submitting: boolean;
 }): React.ReactElement {
   if (!props.run) {
     return (
@@ -706,10 +723,9 @@ function DetailPane(props: {
       </Box>
     );
   }
-  const workLimit = props.expanded ? 10 : 5;
-  const outputHeight = props.transcriptExpanded ? Math.max(8, props.height - 7) : Math.max(5, Math.floor(props.height * 0.45));
+  const composerHeight = props.focused ? 3 : 0;
+  const outputHeight = Math.max(5, props.height - 6 - composerHeight);
   const contentWidth = Math.max(10, props.width - 4);
-  const progress = completionPercent(props.run);
   return (
     <Box width={props.width} height={props.height} borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : statusColor(props.run.status)} paddingX={1} flexDirection="column">
       <Box justifyContent="space-between">
@@ -717,36 +733,38 @@ function DetailPane(props: {
           {props.focused ? <FocusPill label="focus" /> : null}
           <Text bold color={props.focused ? "cyan" : undefined}> worker</Text>
         </Box>
-        <Text color="gray">{props.focused ? "type here: Enter sends, running agents are interrupted" : "view"}</Text>
+        <Text color={statusColor(props.run.status)}>{workerStateLabel(props.run)}</Text>
       </Box>
-      <Text wrap="truncate" color={statusColor(props.run.status)}>
-        {fitLine(`${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
-      </Text>
-      <Text wrap="truncate" color="gray">
-        {fitLine(props.run.worktree.enabled ? shortenHome(props.run.worktree.path) : "current checkout", contentWidth)}
-      </Text>
-      <Text wrap="truncate" color={canMerge(props.run) ? "green" : "gray"}>
-        {fitLine(canMerge(props.run) ? "[m] merge this  [M] merge all ready" : runSummary(props.run), contentWidth)}
-      </Text>
-      {!props.transcriptExpanded ? (
-        <Box flexDirection="column" marginTop={1}>
-          <Text bold>activity</Text>
-          {props.run.work.slice(-workLimit).map((item, index) => (
-            <Text key={`${item.label}-${index}`} color={toneColor(item.tone)} wrap="truncate">
-              {formatWorkLine(item, contentWidth)}
-            </Text>
-          ))}
-          {props.run.work.length === 0 ? <Text color="gray">No meaningful activity yet.</Text> : null}
-        </Box>
-      ) : null}
+      <Text wrap="truncate" color="gray">{fitLine(props.run.task, contentWidth)}</Text>
       <Box flexDirection="column" marginTop={1} minHeight={0}>
-        <Text bold>transcript</Text>
         <Box height={outputHeight} overflow="hidden" flexDirection="column">
           {tailLines(props.run.output, outputHeight).map((line, index) => (
             <Text key={index} wrap="truncate">{line || " "}</Text>
           ))}
         </Box>
       </Box>
+      {props.focused ? <WorkerComposer run={props.run} input={props.input} submitting={props.submitting} width={contentWidth} /> : null}
+    </Box>
+  );
+}
+
+function WorkerComposer(props: { run: UiRun; input: string; submitting: boolean; width: number }): React.ReactElement {
+  const active = isActive(props.run.status);
+  const label = active ? "interrupt" : "agent";
+  const helper = active ? "Enter interrupts and redirects this run" : "Enter continues this completed session";
+  const value = props.input || (active ? "type a redirect..." : "type a follow-up...");
+  return (
+    <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor="cyan" paddingX={1}>
+      <Box justifyContent="space-between">
+        <Text>
+          <FocusPill label={label} />
+          <Text color={props.submitting ? "yellow" : "cyan"}> {props.submitting ? "sending" : shortId(props.run.id)}</Text>
+          <Text>  {truncate(value, Math.max(8, props.width - 28))}</Text>
+          <Text color="cyan">_</Text>
+        </Text>
+        <Text color="gray">{active ? "running" : "resumable"}</Text>
+      </Box>
+      <Text color="gray">{fitLine(`${helper}. Tab changes pane, Esc returns to task.`, props.width)}</Text>
     </Box>
   );
 }
@@ -859,6 +877,15 @@ function PromptDock(props: {
         <Text color="cyan">_</Text>
       </Text>
       <Text color="gray">{props.notice}  {props.backend}{props.model ? ` ${props.model}` : ""}</Text>
+    </Box>
+  );
+}
+
+function StatusDock(props: { notice: string }): React.ReactElement {
+  return (
+    <Box borderStyle="single" borderColor="gray" paddingX={1} justifyContent="space-between">
+      <Text color="gray">worker input is active inside the selected agent pane</Text>
+      <Text color="gray">{props.notice}</Text>
     </Box>
   );
 }
@@ -1306,6 +1333,25 @@ function runSummary(run: UiRun): string {
     return latestLine;
   }
   return run.status;
+}
+
+function workerStateLabel(run: UiRun): string {
+  if (run.status === "completed") {
+    return canMerge(run) ? "done  m merge" : "done";
+  }
+  if (run.status === "merged") {
+    return "merged";
+  }
+  if (run.status === "failed" || run.status === "merge-conflict") {
+    return "failed";
+  }
+  if (run.status === "cancelled") {
+    return "stopped";
+  }
+  if (run.status === "verifying" || run.status === "steering") {
+    return "checking";
+  }
+  return "running";
 }
 
 function agentRailSummary(run: UiRun): string {
