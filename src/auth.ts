@@ -201,7 +201,7 @@ async function configureAnthropic(
     config.backends.claude = {
       ...(config.backends.claude ?? {}),
       profileId: store.profiles["anthropic:claude-code"] ? "anthropic:claude-code" : "anthropic:env",
-      model: config.backends.claude?.model ?? "opus",
+      model: config.backends.claude?.model ?? "sonnet",
       effort: "xhigh",
     };
     return store;

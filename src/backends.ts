@@ -36,7 +36,7 @@ function claudeBackend(): BackendAdapter {
         "-p",
         request.prompt,
         "--model",
-        request.run.model || "opus",
+        request.run.model || "sonnet",
         "--effort",
         "xhigh",
         "--permission-mode",

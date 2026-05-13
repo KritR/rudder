@@ -26,6 +26,7 @@ import {
   currentBranch,
   currentCommit,
   findRepoRoot,
+  hasChanges,
   mergeRunIntoCurrentBranch,
   processAlive,
   removeWorktree,
@@ -54,7 +55,7 @@ export async function startRun(params: {
   const model =
     params.model ??
     (backend === "claude"
-      ? config.backends.claude?.model
+      ? normalizeClaudeDefault(config.backends.claude?.model)
       : backend === "codex"
         ? config.backends.codex?.model
         : config.backends.acpx?.model);
@@ -382,7 +383,10 @@ async function shouldAutoSteer(run: RunRecord, verification: VerificationResult)
   if (verification.shouldContinue || verification.missing.length > 0) {
     return true;
   }
-  return count === 0;
+  if (count > 0) {
+    return false;
+  }
+  return await hasChanges(run.worktree.path);
 }
 
 function buildSteeringPrompt(verification: VerificationResult): string {
@@ -433,6 +437,10 @@ function formatAgentContextRun(run: RunRecord): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeClaudeDefault(model: string | undefined): string | undefined {
+  return model === "opus" ? "sonnet" : model;
 }
 
 export async function statusRuns(options?: { json?: boolean }): Promise<void> {

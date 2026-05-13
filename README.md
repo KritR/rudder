@@ -105,10 +105,13 @@ Slash commands are available inside the TUI:
 /exit
 ```
 
-`/model` opens a picker for the active backend. Claude options include the
-latest aliases plus pinned Opus/Sonnet and large-context variants when your
-Claude Code account supports them. Codex options include the current GPT/Codex
-models Rudder knows about, and `/model <id>` still accepts any custom model id.
+Typing `/` opens a searchable command picker. Use arrows to move and `Tab` to
+complete the selected command.
+
+`/model` opens a picker for the active backend. Claude options are discovered
+from local Claude Code session history plus the aliases exposed by the installed
+Claude CLI. Codex options are read from `~/.codex/models_cache.json`. `/model
+<id>` still accepts any custom model id.
 
 After an agent finishes, Rudder waits 10 seconds for user input and then sends
 an automatic steering prompt asking what remains, whether the work looks good,

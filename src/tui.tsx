@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
 import { currentBranch, findRepoRoot } from "./git.js";
+import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import {
   eventsPath,
   listRuns,
@@ -36,11 +37,26 @@ type WorkItem = {
 const BACKENDS: BackendId[] = ["claude", "codex", "acpx"];
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 
-type ModelOption = {
-  label: string;
-  value?: string;
+type CommandOption = {
+  name: string;
   detail: string;
+  insert: string;
 };
+
+const COMMANDS: CommandOption[] = [
+  { name: "backend", detail: "switch backend: claude, codex, acpx", insert: "/backend " },
+  { name: "model", detail: "open model picker or set a custom model id", insert: "/model" },
+  { name: "agent", detail: "send your next input to the selected agent", insert: "/agent" },
+  { name: "interrupt", detail: "interrupt and redirect the selected running agent", insert: "/interrupt" },
+  { name: "new", detail: "return to new-agent mode", insert: "/new" },
+  { name: "worktree", detail: "toggle worktree policy", insert: "/worktree " },
+  { name: "stop", detail: "stop the selected run", insert: "/stop" },
+  { name: "merge", detail: "merge the selected completed worktree", insert: "/merge" },
+  { name: "merge-all", detail: "merge all completed worktrees", insert: "/merge-all" },
+  { name: "clear", detail: "collapse all run cards", insert: "/clear" },
+  { name: "help", detail: "show key and slash command help", insert: "/help" },
+  { name: "exit", detail: "quit Rudder", insert: "/exit" },
+];
 
 export async function runInteractiveTui(defaults?: TuiDefaults): Promise<void> {
   const instance = render(<RudderTui defaults={defaults ?? {}} />, {
@@ -70,6 +86,8 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [helpOpen, setHelpOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelMenuIndex, setModelMenuIndex] = useState(0);
+  const [commandMenuIndex, setCommandMenuIndex] = useState(0);
+  const [discoveredModels, setDiscoveredModels] = useState<ModelOption[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
   const notifiedFinishedRuns = useRef<Set<string> | null>(null);
@@ -102,12 +120,37 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     return () => clearInterval(timer);
   }, [input, refresh]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const configuredDefault = modelForBackend(backend, config);
+    void discoverModelOptions(backend, configuredDefault)
+      .then((options) => {
+        if (!cancelled) {
+          setDiscoveredModels(options);
+          setModelMenuIndex(0);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDiscoveredModels(fallbackModelOptions(backend, configuredDefault));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [backend, config]);
+
   const selectedIndex = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
   const selectedRun = runs[selectedIndex];
   const targetRun = targetRunId ? runs.find((run) => run.id === targetRunId) : undefined;
   const activeCount = runs.filter((run) => isActive(run.status)).length;
   const selectedExpanded = Boolean(selectedRun && expandedRunIds.has(selectedRun.id));
-  const modelOptions = useMemo(() => modelOptionsForBackend(backend, config), [backend, config]);
+  const modelOptions = useMemo(
+    () => discoveredModels.length ? discoveredModels : fallbackModelOptions(backend, modelForBackend(backend, config)),
+    [backend, config, discoveredModels],
+  );
+  const commandOptions = useMemo(() => filterCommands(input), [input]);
+  const commandMenuOpen = input.startsWith("/") && !modelMenuOpen && commandOptions.length > 0;
 
   const submitTask = useCallback(async (task: string) => {
     const trimmed = task.trim();
@@ -252,6 +295,24 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     setNotice(option.value ? `Model ${option.value}` : "Using backend default model");
   }, [modelOptions]);
 
+  const selectCommandOption = useCallback((index: number) => {
+    const option = commandOptions[index];
+    if (!option) {
+      return;
+    }
+    setInput(option.insert.endsWith(" ") ? option.insert : option.insert);
+    setCommandMenuIndex(index);
+    if (!option.insert.endsWith(" ") && option.insert !== "/model") {
+      setNotice(`Press Enter to run ${option.insert}`);
+    }
+    if (option.insert === "/model") {
+      setInput("");
+      setModelMenuOpen(true);
+      setModelMenuIndex(0);
+      setNotice(`Pick a ${backend} model`);
+    }
+  }, [backend, commandOptions]);
+
   useInput((value, key) => {
     if (key.ctrl && value === "c") {
       app.exit();
@@ -281,6 +342,20 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         return;
       }
       return;
+    }
+    if (commandMenuOpen && input.startsWith("/")) {
+      if (key.upArrow || value === "\u001b[A") {
+        setCommandMenuIndex((current) => Math.max(0, current - 1));
+        return;
+      }
+      if (key.downArrow || value === "\u001b[B") {
+        setCommandMenuIndex((current) => Math.min(commandOptions.length - 1, current + 1));
+        return;
+      }
+      if (key.tab) {
+        selectCommandOption(commandMenuIndex);
+        return;
+      }
     }
     if (key.escape) {
       if (input) {
@@ -316,7 +391,9 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       return;
     }
     if (key.return) {
-      if (input.trim().startsWith("/")) {
+      if (commandMenuOpen && input.trim() === "/") {
+        selectCommandOption(commandMenuIndex);
+      } else if (input.trim().startsWith("/")) {
         void handleCommand(input);
       } else {
         void submitTask(input);
@@ -394,6 +471,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
     if (isPrintable(value)) {
       setInput((current) => current + value);
+      setCommandMenuIndex(0);
     }
   });
 
@@ -414,6 +492,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       </Box>
       {helpOpen ? <Help /> : null}
       {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} /> : null}
+      {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} /> : null}
       <PromptDock input={input} backend={backend} model={model ?? modelForBackend(backend, config)} notice={notice} submitting={submitting} targetRun={targetRun} />
       <Footer />
     </Box>
@@ -571,6 +650,24 @@ function ModelMenu(props: {
         );
       })}
       <Text color="gray">Enter selects, Esc cancels, j/k or arrows move. Type /model &lt;id&gt; for a custom model.</Text>
+    </Box>
+  );
+}
+
+function CommandMenu(props: { options: CommandOption[]; selectedIndex: number }): React.ReactElement {
+  const visible = props.options.slice(0, 8);
+  return (
+    <Box borderStyle="single" borderColor="blue" paddingX={1} flexDirection="column">
+      <Text bold color="blue">commands</Text>
+      {visible.map((option, index) => {
+        const selected = index === props.selectedIndex;
+        return (
+          <Text key={option.name} color={selected ? "white" : "gray"} bold={selected} wrap="truncate">
+            {selected ? "> " : "  "}/{option.name.padEnd(12, " ")} {option.detail}
+          </Text>
+        );
+      })}
+      <Text color="gray">Tab completes, Enter runs exact commands, arrows move.</Text>
     </Box>
   );
 }
@@ -832,39 +929,12 @@ function modelForBackend(backend: BackendId, config: RudderConfig | null): strin
     return undefined;
   }
   if (backend === "claude") {
-    return config.backends.claude?.model;
+    return config.backends.claude?.model === "opus" ? "sonnet" : config.backends.claude?.model;
   }
   if (backend === "codex") {
     return config.backends.codex?.model;
   }
   return config.backends.acpx?.model;
-}
-
-function modelOptionsForBackend(backend: BackendId, config: RudderConfig | null): ModelOption[] {
-  const configuredDefault = modelForBackend(backend, config);
-  const defaultDetail = configuredDefault ? `configured default: ${configuredDefault}` : "use the backend's default";
-  if (backend === "claude") {
-    return [
-      { label: "Default", value: undefined, detail: defaultDetail },
-      { label: "Opus latest", value: "opus", detail: "Claude Code latest Opus alias" },
-      { label: "Opus latest 1M", value: "opus[1m]", detail: "large-context Opus alias when your account supports it" },
-      { label: "Opus 4.7", value: "claude-opus-4-7", detail: "pin Opus 4.7" },
-      { label: "Opus 4.7 1M", value: "claude-opus-4-7[1m]", detail: "pin Opus 4.7 with 1M context when available" },
-      { label: "Sonnet latest", value: "sonnet", detail: "Claude Code latest Sonnet alias" },
-      { label: "Sonnet latest 1M", value: "sonnet[1m]", detail: "large-context Sonnet alias when available" },
-      { label: "Sonnet 4.6", value: "claude-sonnet-4-6", detail: "stable explicit Sonnet id" },
-      { label: "Haiku latest", value: "haiku", detail: "fast lightweight Claude alias" },
-    ];
-  }
-  return [
-    { label: "Default", value: undefined, detail: defaultDetail },
-    { label: "GPT-5.5", value: "gpt-5.5", detail: "frontier Codex coding model" },
-    { label: "GPT-5.4 Codex", value: "gpt-5.4-codex", detail: "Codex-tuned model" },
-    { label: "GPT-5.4", value: "gpt-5.4", detail: "general coding model" },
-    { label: "GPT-5.4 Mini", value: "gpt-5.4-mini", detail: "faster lower-cost option" },
-    { label: "GPT-5.3 Codex", value: "gpt-5.3-codex", detail: "older Codex-tuned model" },
-    { label: "GPT-5.3 Codex Spark", value: "gpt-5.3-codex-spark", detail: "fast Codex variant" },
-  ];
 }
 
 function notifyFinishedRuns(runs: UiRun[], ref: React.MutableRefObject<Set<string> | null>): void {
@@ -903,6 +973,17 @@ function resolveUiRun(runs: UiRun[], runId: string | undefined): UiRun | undefin
     return undefined;
   }
   return runs.find((run) => run.id === runId || run.id.startsWith(runId));
+}
+
+function filterCommands(input: string): CommandOption[] {
+  if (!input.startsWith("/")) {
+    return [];
+  }
+  const query = input.slice(1).trim().toLowerCase();
+  if (!query) {
+    return COMMANDS;
+  }
+  return COMMANDS.filter((command) => command.name.includes(query) || command.detail.toLowerCase().includes(query));
 }
 
 function isBackend(value: string | undefined): value is BackendId {
