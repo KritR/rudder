@@ -1,6 +1,6 @@
 {
   "name": "@viraatdas/rudder",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "A coding-agent harness for Claude Code, Codex, and acpx with worktree-isolated runs.",
   "type": "module",
   "bin": {

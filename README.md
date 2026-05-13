@@ -69,7 +69,8 @@ rudder
 Type a task in the prompt dock and press `Enter`. Rudder starts the agent in the
 background, keeps its transcript visible, and tracks planner/verifier work in
 the agent pane. TUI runs default to isolated worktrees so parallel agents do not
-touch the same checkout.
+touch the same checkout. The focused pane uses a double cyan border and a focus
+badge so it is clear where keyboard input goes.
 
 ```text
 Enter    submit task or slash command

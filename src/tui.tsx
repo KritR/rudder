@@ -553,9 +553,12 @@ function RunRail(props: {
 }): React.ReactElement {
   const visible = props.runs.slice(0, 12);
   return (
-    <Box flexDirection="column" width={props.width} borderStyle="single" borderColor={props.focused ? "cyan" : "gray"} paddingX={1}>
+    <Box flexDirection="column" width={props.width} borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : "gray"} paddingX={1}>
       <Box justifyContent="space-between">
-        <Text bold color={props.focused ? "cyan" : undefined}>agents</Text>
+        <Box>
+          {props.focused ? <FocusPill label="focus" /> : null}
+          <Text bold color={props.focused ? "cyan" : undefined}> agents</Text>
+        </Box>
         <Text color="gray">{props.runs.length} runs</Text>
       </Box>
       {visible.length === 0 ? (
@@ -577,7 +580,7 @@ function RunRail(props: {
 
 function RunCard(props: { run: UiRun; selected: boolean; targeted: boolean; expanded: boolean; width: number }): React.ReactElement {
   const tone = statusColor(props.run.status);
-  const label = props.selected ? ">" : " ";
+  const label = props.selected ? (props.targeted ? ">>" : "> ") : "  ";
   const task = truncate(props.run.task, Math.max(12, props.width - 14));
   const progress = completionPercent(props.run);
   const summary = truncate(runSummary(props.run), Math.max(12, props.width - 8));
@@ -602,7 +605,7 @@ function DetailPane(props: {
 }): React.ReactElement {
   if (!props.run) {
     return (
-      <Box width={props.width} height={props.height} borderStyle="single" borderColor={props.focused ? "cyan" : "gray"} paddingX={1} flexDirection="column">
+      <Box width={props.width} height={props.height} borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : "gray"} paddingX={1} flexDirection="column">
         <Text color="gray">No agent selected.</Text>
       </Box>
     );
@@ -612,10 +615,16 @@ function DetailPane(props: {
   const contentWidth = Math.max(10, props.width - 4);
   const progress = completionPercent(props.run);
   return (
-    <Box width={props.width} height={props.height} borderStyle="single" borderColor={props.focused ? "cyan" : statusColor(props.run.status)} paddingX={1} flexDirection="column">
-      <Text> </Text>
+    <Box width={props.width} height={props.height} borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : statusColor(props.run.status)} paddingX={1} flexDirection="column">
+      <Box justifyContent="space-between">
+        <Box>
+          {props.focused ? <FocusPill label="focus" /> : null}
+          <Text bold color={props.focused ? "cyan" : undefined}> worker</Text>
+        </Box>
+        <Text color="gray">{props.focused ? "typing modifies selected agent" : "view"}</Text>
+      </Box>
       <Text wrap="truncate" color={statusColor(props.run.status)}>
-        {fitLine(`${props.focused ? "focus  " : ""}${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
+        {fitLine(`${props.run.status}  ${progress}%  ${props.run.backend} ${shortId(props.run.id)}  ${props.run.task}`, contentWidth)}
       </Text>
       <Text wrap="truncate" color="gray">
         {fitLine(props.run.worktree.enabled ? shortenHome(props.run.worktree.path) : "current checkout", contentWidth)}
@@ -655,6 +664,12 @@ function Help(): React.ReactElement {
       <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">w</Text> worktree auto/always   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
       <Text color="gray">Slash: /backend claude|codex|acpx, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /merge, /merge-all, /exit</Text>
     </Box>
+  );
+}
+
+function FocusPill(props: { label: string }): React.ReactElement {
+  return (
+    <Text backgroundColor="cyan" color="black" bold> {props.label.toUpperCase()} </Text>
   );
 }
 
@@ -711,9 +726,10 @@ function PromptDock(props: {
 }): React.ReactElement {
   const label = props.targetRun ? `${isActive(props.targetRun.status) ? "interrupt" : "agent"} ${shortId(props.targetRun.id)}` : "task";
   return (
-    <Box borderStyle="single" borderColor={props.focused ? "cyan" : props.targetRun ? "magenta" : "gray"} paddingX={1} justifyContent="space-between">
+    <Box borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : props.targetRun ? "magenta" : "gray"} paddingX={1} justifyContent="space-between">
       <Text>
-        <Text color={props.submitting ? "yellow" : props.targetRun ? "magenta" : "cyan"}>{props.submitting ? "starting" : label}</Text>
+        {props.focused ? <FocusPill label="task" /> : null}
+        <Text color={props.submitting ? "yellow" : props.targetRun ? "magenta" : "cyan"}>{props.focused ? " " : ""}{props.submitting ? "starting" : label}</Text>
         <Text>  {props.input}</Text>
         <Text color="cyan">_</Text>
       </Text>
