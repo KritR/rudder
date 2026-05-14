@@ -86,26 +86,8 @@ export async function ensureTmuxDashboardSession(params: {
       params.workerCommand,
     ])
   ).stdout.trim();
-  const verticalGapPaneId = await createGapPane({
-    sessionName: params.sessionName,
-    targetPaneId: workerPaneId,
-    before: true,
-    horizontal: true,
-    size: 3,
-    cwd: params.repoRoot,
-  });
-  const horizontalGapPaneId = await createGapPane({
-    sessionName: params.sessionName,
-    targetPaneId: taskPaneId,
-    before: true,
-    horizontal: false,
-    size: 1,
-    cwd: params.repoRoot,
-  });
   const agentWidth = Math.max(28, Math.min(44, Math.floor(await windowWidth(params.sessionName) * 0.22)));
   await runTmux(["resize-pane", "-t", agentPaneId, "-x", String(agentWidth)], true);
-  await runTmux(["resize-pane", "-t", verticalGapPaneId, "-x", "3"], true);
-  await runTmux(["resize-pane", "-t", horizontalGapPaneId, "-y", "1"], true);
   await runTmux(["resize-pane", "-t", taskPaneId, "-y", "3"], true);
   await runTmux(["select-pane", "-t", workerPaneId, "-T", "worker"], true);
   await runTmux(["set-option", "-p", "-t", workerPaneId, "remain-on-exit", "on"], true);
@@ -116,7 +98,6 @@ export async function ensureTmuxDashboardSession(params: {
     agentPaneId,
     workerPaneId,
     taskPaneId,
-    gapPaneIds: [verticalGapPaneId, horizontalGapPaneId],
     backend: params.backend,
     model: params.model,
     effort: params.effort,
@@ -132,17 +113,6 @@ export async function normalizeTmuxDashboardLayout(repoRoot: string, sessionName
   const width = await windowWidth(sessionName);
   const agentWidth = Math.max(30, Math.min(46, Math.floor(width * 0.22)));
   await runTmux(["resize-pane", "-t", state.agentPaneId, "-x", String(agentWidth)], true);
-  for (const gapPaneId of state.gapPaneIds ?? []) {
-    await runTmux(["select-pane", "-t", gapPaneId, "-T", " "], true);
-    await runTmux(["set-option", "-p", "-t", gapPaneId, "@rudder-gap", "1"], true);
-  }
-  const [verticalGapPaneId, horizontalGapPaneId] = state.gapPaneIds ?? [];
-  if (verticalGapPaneId) {
-    await runTmux(["resize-pane", "-t", verticalGapPaneId, "-x", "3"], true);
-  }
-  if (horizontalGapPaneId) {
-    await runTmux(["resize-pane", "-t", horizontalGapPaneId, "-y", "1"], true);
-  }
   await runTmux(["resize-pane", "-t", state.taskPaneId, "-y", "3"], true);
 }
 
@@ -159,22 +129,8 @@ export async function configureRudderSession(sessionName: string): Promise<void>
   ], true);
   await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=brightred,bold"], true);
   await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour245"], true);
-  await runTmux([
-    "bind-key",
-    "-T",
-    "root",
-    "Tab",
-    "run-shell",
-    "tmux select-pane -t :.+; while [ \"$(tmux display-message -p '#{@rudder-gap}')\" = 1 ]; do tmux select-pane -t :.+; done",
-  ], true);
-  await runTmux([
-    "bind-key",
-    "-T",
-    "root",
-    "BTab",
-    "run-shell",
-    "tmux select-pane -t :.-; while [ \"$(tmux display-message -p '#{@rudder-gap}')\" = 1 ]; do tmux select-pane -t :.-; done",
-  ], true);
+  await runTmux(["bind-key", "-T", "root", "Tab", "select-pane", "-t", ":.+"], true);
+  await runTmux(["bind-key", "-T", "root", "BTab", "select-pane", "-t", ":.-"], true);
 }
 
 export async function attachTmuxSession(sessionName: string): Promise<number> {
@@ -218,39 +174,6 @@ export async function createAgentPane(params: {
     await selectPane(paneId);
   }
   return paneId;
-}
-
-async function createGapPane(params: {
-  sessionName: string;
-  targetPaneId: string;
-  before: boolean;
-  horizontal: boolean;
-  size: number;
-  cwd: string;
-}): Promise<string> {
-  const args = [
-    "split-window",
-    params.horizontal ? "-h" : "-v",
-    ...(params.before ? ["-b"] : []),
-    "-t",
-    params.targetPaneId,
-    "-l",
-    String(params.size),
-    "-c",
-    params.cwd,
-    "-P",
-    "-F",
-    "#{pane_id}",
-    gapCommand(),
-  ];
-  const paneId = (await runTmux(args)).stdout.trim();
-  await runTmux(["select-pane", "-t", paneId, "-T", " "], true);
-  await runTmux(["set-option", "-p", "-t", paneId, "@rudder-gap", "1"], true);
-  return paneId;
-}
-
-function gapCommand(): string {
-  return shellCommand("sh", ["-c", "printf '\\033[?25l'; while :; do sleep 3600; done"]);
 }
 
 export async function respawnPane(params: {
