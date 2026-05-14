@@ -100,7 +100,7 @@ terminal UI continue to work normally.
 | `j` / `k` or arrows | Move through agents when the agents pane is focused |
 | `/model` | Open the provider-first model picker |
 | `/help` | Show the short command hint |
-| `v` | Toggle the selected agent's diff view |
+| `v` | Open the selected agent's Hunk review view |
 | `m` | Merge the selected completed worktree |
 | `M` | Merge all completed worktrees |
 | `d` | Delete the selected agent; if its worktree has changes, Rudder asks you to merge or confirm discard |
@@ -175,11 +175,20 @@ After a worker appears to finish, Rudder can wait briefly and send a focused
 follow-up asking the same agent to verify what remains. When an agent finishes
 or fails, Rudder plays the bundled completion sound.
 
-## Diff Review
+## Review
 
-Press `v` on an agent to show the current worktree diff against `HEAD`. Scroll
-with the keyboard or trackpad, then press `v` or `Esc` to return to the live
-worker pane.
+Press `v` on an agent to open Hunk against that agent's worktree:
+
+```bash
+hunk diff --watch
+```
+
+Hunk provides the multi-file review UI, sidebar navigation, mouse support,
+watch mode, and untracked-file handling. If `hunk` is not installed, Rudder
+installs it with `npm install -g hunkdiff@latest` before opening the review.
+
+While focused in the review pane, keys go to Hunk. Press `Ctrl-G`, then `v`, to
+return to the live Claude Code or Codex worker.
 
 ## One-Shot Commands
 

@@ -150,7 +150,6 @@ struct App {
     notice: Option<String>,
     delete_pending: Option<String>,
     picker_index: usize,
-    diff_scroll: usize,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
@@ -168,6 +167,9 @@ struct AgentRun {
     worktree_path: Option<PathBuf>,
     terminal: Option<TerminalPane>,
     terminal_size: Option<TerminalSize>,
+    review_terminal: Option<TerminalPane>,
+    review_size: Option<TerminalSize>,
+    review_error: Option<String>,
     last_output_at: Instant,
     completed_at: Option<Instant>,
     autosteered: bool,
@@ -216,7 +218,6 @@ impl App {
             notice: None,
             delete_pending: None,
             picker_index: 0,
-            diff_scroll: 0,
             agents_area: None,
             worker_area: None,
             task_area: None,
@@ -227,7 +228,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
-                "nav mode: 1 agents  2 worker  3 task  v diff  Esc exits".to_string()
+                "nav mode: 1 agents  2 worker  3 task  v review  Esc exits".to_string()
             } else {
                 "worker input restored".to_string()
             });
@@ -339,15 +340,21 @@ impl App {
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
         if self.worker_view == WorkerView::Diff {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('v') => self.worker_view = WorkerView::Terminal,
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_diff(-3),
-                KeyCode::Down | KeyCode::Char('j') => self.scroll_diff(3),
-                KeyCode::PageUp => self.scroll_diff(-20),
-                KeyCode::PageDown => self.scroll_diff(20),
-                KeyCode::Home => self.diff_scroll = 0,
-                KeyCode::Char('m') => self.merge_selected_agent(),
-                _ => {}
+            if self.selected_review_terminal_mut().is_none() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('v') => self.worker_view = WorkerView::Terminal,
+                    KeyCode::Char('m') => self.merge_selected_agent(),
+                    _ => {}
+                }
+                return false;
+            }
+
+            if let Some(bytes) = terminal_bytes_for_key(key) {
+                if let Some(review) = self.selected_review_terminal_mut() {
+                    if let Err(error) = review.write_input(&bytes) {
+                        self.set_selected_review_error(error.to_string());
+                    }
+                }
             }
             return false;
         }
@@ -370,21 +377,21 @@ impl App {
 
     fn select_previous_agent(&mut self) {
         self.selected_agent = self.selected_agent.saturating_sub(1);
-        self.diff_scroll = 0;
     }
 
     fn select_next_agent(&mut self) {
         let last = self.agents.len().saturating_sub(1);
         self.selected_agent = (self.selected_agent + 1).min(last);
-        self.diff_scroll = 0;
     }
 
     fn toggle_worker_view(&mut self) {
         self.worker_view = match self.worker_view {
-            WorkerView::Terminal => WorkerView::Diff,
+            WorkerView::Terminal => {
+                self.ensure_hunk_review();
+                WorkerView::Diff
+            }
             WorkerView::Diff => WorkerView::Terminal,
         };
-        self.diff_scroll = 0;
         self.focus = FocusPane::Worker;
     }
 
@@ -557,7 +564,13 @@ impl App {
     fn handle_paste(&mut self, text: String) {
         match self.focus {
             FocusPane::Worker => {
-                if let Some(terminal) = self.selected_terminal_mut() {
+                if self.worker_view == WorkerView::Diff {
+                    if let Some(terminal) = self.selected_review_terminal_mut() {
+                        if let Err(error) = terminal.write_input(text.as_bytes()) {
+                            self.set_selected_review_error(error.to_string());
+                        }
+                    }
+                } else if let Some(terminal) = self.selected_terminal_mut() {
                     if let Err(error) = terminal.write_input(text.as_bytes()) {
                         self.set_selected_error(error.to_string());
                     }
@@ -597,22 +610,20 @@ impl App {
         {
             self.focus = FocusPane::Worker;
             match self.worker_view {
-                WorkerView::Diff => self.scroll_diff(delta),
+                WorkerView::Diff => self.scroll_review(delta),
                 WorkerView::Terminal => self.scroll_worker(delta),
             }
         }
     }
 
-    fn scroll_diff(&mut self, delta: isize) {
-        self.diff_scroll = if delta.is_negative() {
-            self.diff_scroll.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.diff_scroll.saturating_add(delta as usize)
-        };
-    }
-
     fn scroll_worker(&mut self, delta: isize) {
         if let Some(terminal) = self.selected_terminal_mut() {
+            terminal.scrollback_by(-delta);
+        }
+    }
+
+    fn scroll_review(&mut self, delta: isize) {
+        if let Some(terminal) = self.selected_review_terminal_mut() {
             terminal.scrollback_by(-delta);
         }
     }
@@ -662,6 +673,9 @@ impl App {
             worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
             terminal: None,
             terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
@@ -756,10 +770,57 @@ impl App {
             .and_then(|run| run.terminal.as_mut())
     }
 
+    fn selected_review_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
+        self.agents
+            .get_mut(self.selected_agent)
+            .and_then(|run| run.review_terminal.as_mut())
+    }
+
     fn set_selected_error(&mut self, message: String) {
         if let Some(run) = self.agents.get_mut(self.selected_agent) {
             run.status = AgentStatus::Failed;
             run.last_error = Some(message);
+        }
+    }
+
+    fn set_selected_review_error(&mut self, message: String) {
+        if let Some(run) = self.agents.get_mut(self.selected_agent) {
+            run.review_error = Some(message);
+        }
+    }
+
+    fn ensure_hunk_review(&mut self) {
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            return;
+        };
+        if run.review_terminal.is_some() {
+            return;
+        }
+
+        let command = TerminalCommand::with_args(
+            "sh",
+            [
+                "-lc",
+                "if ! command -v hunk >/dev/null 2>&1; then npm install -g hunkdiff@latest; fi; exec hunk diff --watch",
+            ],
+        );
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(run.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.review_terminal = Some(terminal);
+                run.review_error = None;
+                self.notice = Some("opened Hunk review".to_string());
+            }
+            Err(error) => {
+                run.review_error = Some(error.to_string());
+                self.notice = Some(format!("failed to open Hunk: {error}"));
+            }
         }
     }
 
@@ -1038,24 +1099,6 @@ mod app_tests {
         assert_eq!(editable, "fix the login bug");
         assert_eq!(cursor, 13);
     }
-
-    #[test]
-    fn command_hint_wraps_to_available_width() {
-        let lines = wrap_command_hint(
-            &["j/k move", "Enter focus", "v diff", "m merge", "d delete"],
-            22,
-        );
-
-        assert_eq!(
-            lines,
-            vec![
-                "j/k move  Enter focus".to_string(),
-                "v diff  m merge".to_string(),
-                "d delete".to_string(),
-            ]
-        );
-        assert!(lines.iter().all(|line| line.len() <= 22));
-    }
 }
 
 fn main() -> Result<()> {
@@ -1196,6 +1239,14 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ListItem::new(Line::default()),
     ];
 
+    for hint in ["j/k move", "Enter focus", "v review", "m merge", "d delete"] {
+        lines.push(ListItem::new(Line::from(Span::styled(
+            hint,
+            muted_style(focused),
+        ))));
+    }
+    lines.push(ListItem::new(Line::default()));
+
     for (index, agent) in app.agents.iter().enumerate() {
         let selected = index == app.selected_agent;
         let marker = if selected { "> " } else { "  " };
@@ -1236,17 +1287,6 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))));
     }
 
-    lines.push(ListItem::new(Line::default()));
-    for hint in wrap_command_hint(
-        &["j/k move", "Enter focus", "v diff", "m merge", "d delete"],
-        block_inner(area).width,
-    ) {
-        lines.push(ListItem::new(Line::from(Span::styled(
-            hint,
-            muted_style(focused),
-        ))));
-    }
-
     frame.render_widget(
         List::new(lines).block(pane_block("agents", focused, app.nav_mode)),
         area,
@@ -1260,10 +1300,17 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     if let Some(size) = terminal_size {
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
-            if run.terminal_size != Some(size) {
+            if app.worker_view == WorkerView::Terminal && run.terminal_size != Some(size) {
                 if let Some(terminal) = run.terminal.as_mut() {
                     if terminal.resize(size).is_ok() {
                         run.terminal_size = Some(size);
+                    }
+                }
+            }
+            if app.worker_view == WorkerView::Diff && run.review_size != Some(size) {
+                if let Some(review) = run.review_terminal.as_mut() {
+                    if review.resize(size).is_ok() {
+                        run.review_size = Some(size);
                     }
                 }
             }
@@ -1272,13 +1319,13 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let lines = match app.worker_view {
         WorkerView::Terminal => worker_lines(app, inner.height as usize),
-        WorkerView::Diff => diff_lines(app, inner.height as usize),
+        WorkerView::Diff => review_lines(app, inner.height as usize),
     };
     let paragraph = Paragraph::new(lines)
         .block(pane_block(
             match app.worker_view {
                 WorkerView::Terminal => "worker",
-                WorkerView::Diff => "diff",
+                WorkerView::Diff => "review",
             },
             focused,
             app.nav_mode,
@@ -1287,8 +1334,11 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     frame.render_widget(paragraph, area);
 
-    if focused && app.worker_view == WorkerView::Terminal {
-        set_worker_cursor(frame, inner, app);
+    if focused {
+        match app.worker_view {
+            WorkerView::Terminal => set_worker_cursor(frame, inner, app),
+            WorkerView::Diff => set_review_cursor(frame, inner, app),
+        }
     }
 }
 
@@ -1304,6 +1354,20 @@ fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
         return;
     }
     if !cursor.visible && backend != Backend::Claude {
+        return;
+    }
+    frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
+}
+
+fn set_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
+    let Some(cursor) = app.agents.get(app.selected_agent).and_then(|run| {
+        run.review_terminal
+            .as_ref()
+            .map(|terminal| terminal.cursor())
+    }) else {
+        return;
+    };
+    if cursor.row >= inner.height || cursor.col >= inner.width || !cursor.visible {
         return;
     }
     frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
@@ -1350,63 +1414,49 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn diff_lines(app: &App, height: usize) -> Vec<Line<'static>> {
-    let Some(run) = app.agents.get(app.selected_agent) else {
+fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
+    let Some(run) = app.agents.get_mut(app.selected_agent) else {
         return vec![Line::from(Span::styled(
             "No agent selected.",
             Style::default().fg(Color::Gray),
         ))];
     };
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("diff ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(short_task(&run.task), Style::default().fg(Color::Gray)),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "v/Esc worker  j/k scroll  m merge",
-        Style::default().fg(Color::Gray),
-    )));
-    lines.push(Line::default());
-
-    match git_diff_text(&run.cwd) {
-        Ok(diff) if diff.trim().is_empty() => {
-            lines.push(Line::from(Span::styled(
-                "No diff against HEAD.",
+    if let Some(error) = &run.review_error {
+        return vec![
+            Line::from(Span::styled(
+                "Hunk review failed",
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press Ctrl-G then v to return to the worker.",
                 Style::default().fg(Color::Gray),
-            )));
-        }
-        Ok(diff) => {
-            for line in diff.lines() {
-                lines.push(diff_line(line));
-            }
-        }
-        Err(error) => lines.push(Line::from(Span::styled(
-            format!("diff unavailable: {error}"),
-            Style::default().fg(Color::Red),
-        ))),
+            )),
+        ];
     }
 
-    let max_scroll = lines.len().saturating_sub(height);
-    let scroll = app.diff_scroll.min(max_scroll);
-    lines.into_iter().skip(scroll).take(height).collect()
-}
-
-fn diff_line(value: &str) -> Line<'static> {
-    let style = if value.starts_with("+++") || value.starts_with("---") {
-        Style::default().fg(Color::Gray)
-    } else if value.starts_with('+') {
-        Style::default().fg(Color::Green)
-    } else if value.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else if value.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
-    } else if value.starts_with("diff --git") {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
+    let Some(review) = run.review_terminal.as_mut() else {
+        return vec![
+            Line::from(Span::styled(
+                "Opening Hunk review...",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from("If Hunk is not installed, Rudder will run npm install -g hunkdiff@latest."),
+        ];
     };
-    Line::from(Span::styled(value.to_string(), style))
+
+    let mut lines = review
+        .styled_lines()
+        .into_iter()
+        .map(styled_terminal_line)
+        .collect::<Vec<_>>();
+    if lines.len() > height {
+        lines = lines.split_off(lines.len() - height);
+    }
+    lines
 }
 
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1549,34 +1599,6 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
         )))
         .borders(Borders::ALL)
         .border_style(border_style)
-}
-
-fn wrap_command_hint(commands: &[&str], width: u16) -> Vec<String> {
-    let max_width = usize::from(width.max(1));
-    let mut lines = Vec::new();
-    let mut current = String::new();
-
-    for command in commands {
-        if current.is_empty() {
-            current.push_str(command);
-            continue;
-        }
-
-        let next_len = current.len() + 2 + command.len();
-        if next_len <= max_width {
-            current.push_str("  ");
-            current.push_str(command);
-        } else {
-            lines.push(current);
-            current = (*command).to_string();
-        }
-    }
-
-    if !current.is_empty() {
-        lines.push(current);
-    }
-
-    lines
 }
 
 fn pane_text_style(focused: bool) -> Style {
@@ -2462,85 +2484,6 @@ fn diff_short_summary(run: &AgentRun) -> Option<String> {
         "{files} file{} changed",
         if files == 1 { "" } else { "s" }
     ))
-}
-
-fn git_diff_text(cwd: &Path) -> Result<String> {
-    let stat = git_output_args(cwd, &["diff", "--stat", "HEAD"])?;
-    let diff = git_output_args(cwd, &["diff", "--color=never", "HEAD"])?;
-    let untracked = git_untracked_files(cwd)?;
-    let untracked_diff = git_untracked_diff_text(cwd, &untracked);
-
-    if stat.trim().is_empty() && diff.trim().is_empty() && untracked_diff.trim().is_empty() {
-        let status = git_output(cwd, ["status", "--short"])?;
-        if status.trim().is_empty() {
-            return Ok(String::new());
-        }
-        return Ok(format!("Untracked or staged-only changes:\n\n{status}"));
-    }
-
-    Ok(
-        [stat.trim_end(), diff.trim_end(), untracked_diff.trim_end()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    )
-}
-
-fn git_untracked_files(cwd: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .current_dir(cwd)
-        .output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(if message.is_empty() {
-            "git command failed".to_string()
-        } else {
-            message
-        });
-    }
-
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-        .collect())
-}
-
-fn git_untracked_diff_text(cwd: &Path, files: &[String]) -> String {
-    let mut sections = Vec::new();
-    for file in files.iter().take(25) {
-        let output = Command::new("git")
-            .args(["diff", "--no-index", "--color=never", "--", "/dev/null"])
-            .arg(file)
-            .current_dir(cwd)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() || output.status.code() == Some(1) => {
-                let stdout = String::from_utf8_lossy(&output.stdout)
-                    .trim_end()
-                    .to_string();
-                if stdout.is_empty() {
-                    sections.push(format!("untracked file: {file}"));
-                } else {
-                    sections.push(stdout);
-                }
-            }
-            _ => sections.push(format!("untracked file: {file}")),
-        }
-    }
-
-    if files.len() > 25 {
-        sections.push(format!(
-            "... {} more untracked files omitted",
-            files.len() - 25
-        ));
-    }
-
-    sections.join("\n\n")
 }
 
 fn play_completion_sound() {
