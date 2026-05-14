@@ -196,6 +196,9 @@ struct AgentRun {
     id: String,
     created_at: String,
     task: String,
+    current_prompt: String,
+    turns: Vec<AgentTurn>,
+    last_user_input_at: String,
     backend: Backend,
     model: String,
     effort: Option<EffortLevel>,
@@ -214,6 +217,16 @@ struct AgentRun {
     needs_permission: bool,
     permission_notified: bool,
     last_error: Option<String>,
+    worker_input_draft: String,
+    worker_input_cursor: usize,
+    worker_input_is_prompt: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AgentTurn {
+    ts: String,
+    prompt: String,
+    source: String,
 }
 
 #[derive(Clone)]
@@ -485,15 +498,24 @@ impl App {
             _ => {}
         }
 
-        let Some(terminal) = self.selected_terminal_mut() else {
+        let Some(bytes) = terminal_bytes_for_key(key) else {
             return false;
         };
 
-        if let Some(bytes) = terminal_bytes_for_key(key) {
-            terminal.reset_scrollback();
-            if let Err(error) = terminal.write_input(&bytes) {
-                self.set_selected_error(error.to_string());
+        let capture_as_prompt = self.selected_worker_accepts_prompt_input();
+        let result = match self.selected_terminal_mut() {
+            Some(terminal) => {
+                terminal.reset_scrollback();
+                terminal.write_input(&bytes)
             }
+            None => return false,
+        };
+        if let Err(error) = result {
+            self.set_selected_error(error.to_string());
+            return false;
+        }
+        if let Some(prompt) = self.capture_selected_worker_key(key, capture_as_prompt) {
+            self.record_selected_worker_prompt(prompt);
         }
         false
     }
@@ -762,10 +784,22 @@ impl App {
                             self.set_selected_review_error(error.to_string());
                         }
                     }
-                } else if let Some(terminal) = self.selected_terminal_mut() {
-                    terminal.reset_scrollback();
-                    if let Err(error) = terminal.write_input(text.as_bytes()) {
+                } else {
+                    let capture_as_prompt = self.selected_worker_accepts_prompt_input();
+                    let result = match self.selected_terminal_mut() {
+                        Some(terminal) => {
+                            terminal.reset_scrollback();
+                            terminal.write_input(text.as_bytes())
+                        }
+                        None => return,
+                    };
+                    if let Err(error) = result {
                         self.set_selected_error(error.to_string());
+                        return;
+                    }
+                    let prompts = self.capture_selected_worker_paste(&text, capture_as_prompt);
+                    for prompt in prompts {
+                        self.record_selected_worker_prompt(prompt);
                     }
                 }
             }
@@ -776,6 +810,69 @@ impl App {
             }
             FocusPane::Agents => {}
         }
+    }
+
+    fn selected_worker_accepts_prompt_input(&self) -> bool {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            return false;
+        };
+        if run.needs_permission {
+            return false;
+        }
+        if matches!(run.status, AgentStatus::Done | AgentStatus::Stopped) {
+            return true;
+        }
+        run.terminal.as_ref().is_some_and(|terminal| {
+            terminal_looks_ready_for_input_from_lines(
+                run.backend,
+                &terminal.visible_lines_snapshot(),
+            )
+        })
+    }
+
+    fn capture_selected_worker_key(
+        &mut self,
+        key: KeyEvent,
+        capture_as_prompt: bool,
+    ) -> Option<String> {
+        let run = self.agents.get_mut(self.selected_agent)?;
+        update_worker_prompt_draft_for_key(
+            &mut run.worker_input_draft,
+            &mut run.worker_input_cursor,
+            &mut run.worker_input_is_prompt,
+            key,
+            capture_as_prompt,
+        )
+    }
+
+    fn capture_selected_worker_paste(
+        &mut self,
+        text: &str,
+        capture_as_prompt: bool,
+    ) -> Vec<String> {
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            return Vec::new();
+        };
+        update_worker_prompt_draft_for_paste(
+            &mut run.worker_input_draft,
+            &mut run.worker_input_cursor,
+            &mut run.worker_input_is_prompt,
+            text,
+            capture_as_prompt,
+        )
+    }
+
+    fn record_selected_worker_prompt(&mut self, prompt: String) {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        self.remember_task_history(&prompt);
+        if let Some(run) = self.agents.get_mut(self.selected_agent) {
+            record_agent_prompt(run, prompt, "user");
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -987,10 +1084,18 @@ impl App {
             ..TerminalPaneOptions::default()
         };
 
+        let created_at = now_stamp();
         let mut run = AgentRun {
             id: worktree.id.clone(),
-            created_at: now_stamp(),
+            created_at: created_at.clone(),
             task: input.clone(),
+            current_prompt: input.clone(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: input.clone(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
             backend,
             model,
             effort,
@@ -1009,6 +1114,9 @@ impl App {
             needs_permission: false,
             permission_notified: false,
             last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -1191,10 +1299,19 @@ impl App {
             cwd: Some(self.cwd.clone()),
             ..TerminalPaneOptions::default()
         };
+        let created_at = now_stamp();
+        let task = label.to_string();
         let mut run = AgentRun {
             id,
-            created_at: now_stamp(),
-            task: label.to_string(),
+            created_at: created_at.clone(),
+            task: task.clone(),
+            current_prompt: task.clone(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: task.clone(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
             backend: self.backend,
             model: self.model.clone(),
             effort: self.effort,
@@ -1213,6 +1330,9 @@ impl App {
             needs_permission: false,
             permission_notified: false,
             last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -1505,10 +1625,19 @@ impl App {
             ..TerminalPaneOptions::default()
         };
 
+        let created_at = now_stamp();
+        let task = "Resolve merge conflicts".to_string();
         let mut run = AgentRun {
             id,
-            created_at: now_stamp(),
-            task: "Resolve merge conflicts".to_string(),
+            created_at: created_at.clone(),
+            task: task.clone(),
+            current_prompt: prompt.clone(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: prompt.clone(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
             backend: self.backend,
             model: self.model.clone(),
             effort: self.effort,
@@ -1527,6 +1656,9 @@ impl App {
             needs_permission: false,
             permission_notified: false,
             last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -1704,6 +1836,7 @@ impl App {
                     run.needs_permission = false;
                     run.permission_notified = false;
                     run.last_error = None;
+                    record_agent_prompt(run, prompt, "steerer");
                     self.notice = Some(format!("auto-steering {}", short_task(&run.task)));
                     let _ = save_native_run_record(&repo_root, run);
                 }
@@ -2091,6 +2224,133 @@ mod app_tests {
     }
 
     #[test]
+    fn worker_prompt_draft_tracks_line_editing_until_enter() {
+        let mut draft = String::new();
+        let mut cursor = 0;
+        let mut is_prompt = false;
+
+        assert_eq!(
+            update_worker_prompt_draft_for_key(
+                &mut draft,
+                &mut cursor,
+                &mut is_prompt,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::empty()),
+                true,
+            ),
+            None
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            true,
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+            true,
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()),
+            true,
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            true,
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+            true,
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()),
+            true,
+        );
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()),
+            true,
+        );
+
+        assert_eq!(
+            update_worker_prompt_draft_for_key(
+                &mut draft,
+                &mut cursor,
+                &mut is_prompt,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                true,
+            )
+            .as_deref(),
+            Some("fix it")
+        );
+        assert!(draft.is_empty());
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn worker_prompt_draft_records_pasted_lines() {
+        let mut draft = String::new();
+        let mut cursor = 0;
+        let mut is_prompt = false;
+
+        let prompts = update_worker_prompt_draft_for_paste(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            "first follow-up\r\nsecond follow-up",
+            true,
+        );
+
+        assert_eq!(prompts, vec!["first follow-up".to_string()]);
+        assert_eq!(draft, "second follow-up");
+        assert_eq!(cursor, "second follow-up".chars().count());
+    }
+
+    #[test]
+    fn worker_prompt_draft_ignores_non_prompt_input() {
+        let mut draft = String::new();
+        let mut cursor = 0;
+        let mut is_prompt = false;
+
+        update_worker_prompt_draft_for_key(
+            &mut draft,
+            &mut cursor,
+            &mut is_prompt,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            false,
+        );
+
+        assert_eq!(
+            update_worker_prompt_draft_for_key(
+                &mut draft,
+                &mut cursor,
+                &mut is_prompt,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                false,
+            ),
+            None
+        );
+        assert!(draft.is_empty());
+    }
+
+    #[test]
     fn wraps_task_input_and_tracks_cursor_on_wrapped_lines() {
         let input = "abcdef";
 
@@ -2114,8 +2374,15 @@ mod app_tests {
         let mut app = App::new();
         app.agents.push(AgentRun {
             id: "run-1".to_string(),
-            created_at: now_stamp(),
+            created_at: "1".to_string(),
             task: "test task".to_string(),
+            current_prompt: "test task".to_string(),
+            turns: vec![AgentTurn {
+                ts: "1".to_string(),
+                prompt: "test task".to_string(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: "1".to_string(),
             backend: Backend::Claude,
             model: "sonnet".to_string(),
             effort: None,
@@ -2134,6 +2401,9 @@ mod app_tests {
             needs_permission: false,
             permission_notified: false,
             last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
         });
 
         app.delete_selected_agent();
@@ -3887,6 +4157,183 @@ fn short_task(task: &str) -> String {
     }
 }
 
+fn preview_text(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "\\\"");
+    let mut chars = normalized.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn record_agent_prompt(run: &mut AgentRun, prompt: String, source: &str) {
+    let ts = now_stamp();
+    if source == "user" {
+        run.last_user_input_at = ts.clone();
+    }
+    run.current_prompt = prompt.clone();
+    run.turns.push(AgentTurn {
+        ts,
+        prompt,
+        source: source.to_string(),
+    });
+}
+
+fn update_worker_prompt_draft_for_key(
+    draft: &mut String,
+    cursor: &mut usize,
+    is_prompt: &mut bool,
+    key: KeyEvent,
+    capture_as_prompt: bool,
+) -> Option<String> {
+    match key.code {
+        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            return finish_worker_prompt_draft(draft, cursor, is_prompt);
+        }
+        KeyCode::Char('u') | KeyCode::Char('U')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            draft.clear();
+            *cursor = 0;
+            *is_prompt = false;
+            return None;
+        }
+        KeyCode::Char('w') | KeyCode::Char('W')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            delete_previous_word_at(draft, cursor);
+            return None;
+        }
+        KeyCode::Backspace => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            {
+                draft.clear();
+                *cursor = 0;
+                *is_prompt = false;
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                delete_previous_word_at(draft, cursor);
+            } else {
+                delete_char_before_cursor(draft, cursor);
+            }
+        }
+        KeyCode::Delete => delete_char_at_cursor(draft, *cursor),
+        KeyCode::Left => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::META)
+            {
+                *cursor = previous_word_position(draft, *cursor);
+            } else {
+                *cursor = (*cursor).saturating_sub(1);
+            }
+        }
+        KeyCode::Right => {
+            let len = draft.chars().count();
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::META)
+            {
+                *cursor = next_word_position(draft, *cursor);
+            } else {
+                *cursor = (*cursor + 1).min(len);
+            }
+        }
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = draft.chars().count(),
+        KeyCode::Char(ch)
+            if !key.modifiers.intersects(
+                KeyModifiers::ALT
+                    | KeyModifiers::CONTROL
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            if draft.is_empty() {
+                *is_prompt = capture_as_prompt;
+            }
+            insert_char_at_cursor(draft, cursor, ch);
+        }
+        _ => {}
+    }
+
+    None
+}
+
+fn update_worker_prompt_draft_for_paste(
+    draft: &mut String,
+    cursor: &mut usize,
+    is_prompt: &mut bool,
+    text: &str,
+    capture_as_prompt: bool,
+) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let mut previous_was_carriage_return = false;
+
+    for ch in text.chars() {
+        match ch {
+            '\r' => {
+                if let Some(prompt) = finish_worker_prompt_draft(draft, cursor, is_prompt) {
+                    prompts.push(prompt);
+                }
+                previous_was_carriage_return = true;
+            }
+            '\n' if previous_was_carriage_return => {
+                previous_was_carriage_return = false;
+            }
+            '\n' => {
+                if let Some(prompt) = finish_worker_prompt_draft(draft, cursor, is_prompt) {
+                    prompts.push(prompt);
+                }
+                previous_was_carriage_return = false;
+            }
+            '\u{7f}' | '\u{8}' => {
+                delete_char_before_cursor(draft, cursor);
+                previous_was_carriage_return = false;
+            }
+            _ if ch.is_control() => {
+                previous_was_carriage_return = false;
+            }
+            _ => {
+                if draft.is_empty() {
+                    *is_prompt = capture_as_prompt;
+                }
+                insert_char_at_cursor(draft, cursor, ch);
+                previous_was_carriage_return = false;
+            }
+        }
+    }
+
+    prompts
+}
+
+fn finish_worker_prompt_draft(
+    draft: &mut String,
+    cursor: &mut usize,
+    is_prompt: &mut bool,
+) -> Option<String> {
+    let prompt = draft.trim().to_string();
+    let should_record = *is_prompt;
+    draft.clear();
+    *cursor = 0;
+    *is_prompt = false;
+    if prompt.is_empty() || !should_record {
+        None
+    } else {
+        Some(prompt)
+    }
+}
+
 fn previous_task_history_entry(
     history: &[String],
     index: &mut Option<usize>,
@@ -4196,6 +4643,25 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(now_stamp);
+    let turns = turns_from_run_record(&record, &created_at, &task);
+    let current_prompt = record
+        .get("currentPrompt")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| turns.last().map(|turn| turn.prompt.clone()))
+        .unwrap_or_else(|| task.clone());
+    let last_user_input_at = record
+        .get("lastUserInputAt")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            turns
+                .iter()
+                .rev()
+                .find(|turn| turn.source == "user")
+                .map(|turn| turn.ts.clone())
+        })
+        .unwrap_or_else(|| created_at.clone());
     let worktree = record.get("worktree");
     let worktree_enabled = worktree
         .and_then(|value| value.get("enabled"))
@@ -4216,6 +4682,9 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         id,
         created_at,
         task,
+        current_prompt,
+        turns,
+        last_user_input_at,
         backend,
         model,
         effort,
@@ -4234,7 +4703,53 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         needs_permission: false,
         permission_notified: false,
         last_error: None,
+        worker_input_draft: String::new(),
+        worker_input_cursor: 0,
+        worker_input_is_prompt: false,
     })
+}
+
+fn turns_from_run_record(
+    record: &serde_json::Value,
+    created_at: &str,
+    task: &str,
+) -> Vec<AgentTurn> {
+    let mut turns = record
+        .get("turns")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(turn_from_json)
+                .collect::<Vec<AgentTurn>>()
+        })
+        .unwrap_or_default();
+
+    if turns.is_empty() {
+        turns.push(AgentTurn {
+            ts: created_at.to_string(),
+            prompt: task.to_string(),
+            source: "user".to_string(),
+        });
+    }
+
+    turns
+}
+
+fn turn_from_json(value: &serde_json::Value) -> Option<AgentTurn> {
+    let prompt = value.get("prompt")?.as_str()?.to_string();
+    let ts = value
+        .get("ts")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(now_stamp);
+    let source = value
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or("user")
+        .to_string();
+
+    Some(AgentTurn { ts, prompt, source })
 }
 
 fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
@@ -4267,6 +4782,17 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
     let now = now_stamp();
+    let turns = run
+        .turns
+        .iter()
+        .map(|turn| {
+            serde_json::json!({
+                "ts": turn.ts,
+                "prompt": turn.prompt,
+                "source": turn.source,
+            })
+        })
+        .collect::<Vec<_>>();
     let record = serde_json::json!({
         "id": run.id,
         "status": run_record_status(run.status),
@@ -4284,9 +4810,9 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
             "path": run.cwd,
             "branch": run.worktree_branch,
         },
-        "currentPrompt": run.task,
-        "turns": [{ "ts": run.created_at, "prompt": run.task, "source": "user" }],
-        "lastUserInputAt": run.created_at,
+        "currentPrompt": run.current_prompt,
+        "turns": turns,
+        "lastUserInputAt": run.last_user_input_at,
         "autoSteer": { "count": if run.autosteered { 1 } else { 0 }, "max": 2 },
     });
     let temp = record_path.with_extension(format!(
@@ -4538,13 +5064,19 @@ fn write_rudder_context(
         body.push_str("- none\n");
     }
     for agent in agents {
+        let current_prompt = if agent.current_prompt != agent.task {
+            format!(" current=\"{}\"", preview_text(&agent.current_prompt, 140))
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
-            "- {}: {} [{} {}] cwd={}\n",
+            "- {}: {} [{} {}] cwd={}{}\n",
             agent.id,
             agent.task,
             agent.backend.as_str(),
             agent.model,
-            agent.cwd.display()
+            agent.cwd.display(),
+            current_prompt
         ));
     }
     if let Some(worktree) = pending {
