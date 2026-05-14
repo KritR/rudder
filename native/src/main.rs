@@ -173,6 +173,8 @@ struct AgentRun {
     last_output_at: Instant,
     completed_at: Option<Instant>,
     autosteered: bool,
+    needs_permission: bool,
+    permission_notified: bool,
     last_error: Option<String>,
 }
 
@@ -728,6 +730,8 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
+            needs_permission: false,
+            permission_notified: false,
             last_error: None,
         };
 
@@ -1003,6 +1007,16 @@ impl App {
                 }
             }
             if run.status == AgentStatus::Running {
+                let needs_permission = terminal_needs_permission(run.backend, terminal);
+                run.needs_permission = needs_permission;
+                if needs_permission {
+                    if !run.permission_notified {
+                        play_completion_sound();
+                    }
+                    run.permission_notified = true;
+                } else {
+                    run.permission_notified = false;
+                }
                 match terminal.try_wait() {
                     Ok(Some(status)) => {
                         if status.success() {
@@ -1010,6 +1024,8 @@ impl App {
                         } else {
                             run.status = AgentStatus::Failed;
                             run.completed_at = Some(Instant::now());
+                            run.needs_permission = false;
+                            run.permission_notified = false;
                             play_completion_sound();
                         };
                     }
@@ -1024,9 +1040,14 @@ impl App {
                         run.status = AgentStatus::Failed;
                         run.completed_at = Some(Instant::now());
                         run.last_error = Some(error.to_string());
+                        run.needs_permission = false;
+                        run.permission_notified = false;
                         play_completion_sound();
                     }
                 }
+            } else {
+                run.needs_permission = false;
+                run.permission_notified = false;
             }
         }
 
@@ -1058,6 +1079,8 @@ impl App {
                     run.status = AgentStatus::Running;
                     run.autosteered = true;
                     run.completed_at = None;
+                    run.needs_permission = false;
+                    run.permission_notified = false;
                     run.last_error = None;
                     self.notice = Some(format!("auto-steering {}", short_task(&run.task)));
                 }
@@ -1074,11 +1097,17 @@ fn mark_run_done(run: &mut AgentRun) {
     if run.status != AgentStatus::Done {
         run.status = AgentStatus::Done;
         run.completed_at = Some(Instant::now());
+        run.needs_permission = false;
+        run.permission_notified = false;
         play_completion_sound();
     }
 }
 
 fn terminal_looks_ready_for_input(backend: Backend, terminal: &mut TerminalPane) -> bool {
+    if terminal_needs_permission(backend, terminal) {
+        return false;
+    }
+
     let lines = terminal.visible_lines();
     let recent = lines
         .iter()
@@ -1095,6 +1124,92 @@ fn terminal_looks_ready_for_input(backend: Backend, terminal: &mut TerminalPane)
     recent
         .iter()
         .any(|line| looks_like_agent_prompt(backend, line))
+}
+
+fn terminal_needs_permission(_backend: Backend, terminal: &mut TerminalPane) -> bool {
+    let lines = terminal.visible_lines();
+    let recent = lines
+        .iter()
+        .rev()
+        .take(14)
+        .map(|line| normalize_terminal_line(line))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if recent.is_empty() {
+        return false;
+    }
+    let text = recent.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+
+    permission_text_needs_attention(&text)
+}
+
+fn permission_text_needs_attention(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let text = text.as_str();
+
+    let has_permission_word = contains_any_word(
+        &text,
+        &[
+            "permission",
+            "approval",
+            "approve",
+            "allow",
+            "authorize",
+            "authorization",
+            "confirmation",
+            "proceed",
+            "deny",
+        ],
+    );
+    if !has_permission_word {
+        return false;
+    }
+
+    let asks_decision =
+        contains_any_phrase(&text, &["do you want", "would you like", "are you sure"])
+            && contains_any_word(
+                &text,
+                &["allow", "approve", "run", "execute", "continue", "proceed"],
+            );
+    let approves_action = contains_any_word(&text, &["allow", "approve", "authorize"])
+        && contains_any_word(
+            &text,
+            &[
+                "command",
+                "tool",
+                "edit",
+                "write",
+                "file",
+                "access",
+                "execution",
+                "network",
+                "shell",
+                "operation",
+            ],
+        );
+    let approval_request = contains_any_word(
+        &text,
+        &["permission", "approval", "authorization", "confirmation"],
+    ) && contains_any_word(
+        &text,
+        &[
+            "required",
+            "needed",
+            "need",
+            "request",
+            "requested",
+            "requesting",
+            "waiting",
+            "prompt",
+        ],
+    ) && contains_approval_response(&text);
+    let key_prompt = contains_word(&text, "press")
+        && contains_any_word(&text, &["y", "yes", "enter", "return"])
+        && contains_any_word(&text, &["allow", "approve", "continue", "proceed"]);
+    let yes_no_prompt = (contains_word(&text, "yes") || contains_word(&text, "no"))
+        && contains_any_word(&text, &["approve", "deny", "allow"]);
+
+    asks_decision || approves_action || approval_request || key_prompt || yes_no_prompt
 }
 
 fn looks_busy(line: &str) -> bool {
@@ -1125,6 +1240,35 @@ fn looks_like_agent_prompt(backend: Backend, line: &str) -> bool {
     }
 }
 
+fn normalize_terminal_line(line: &str) -> String {
+    line.chars()
+        .filter(|ch| !ch.is_control() || ch.is_whitespace())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn contains_any_phrase(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn contains_any_word(text: &str, words: &[&str]) -> bool {
+    words.iter().any(|word| contains_word(text, word))
+}
+
+fn contains_approval_response(text: &str) -> bool {
+    contains_any_word(
+        text,
+        &["approve", "allow", "deny", "enter", "return", "press"],
+    ) || contains_word(text, "yes")
+        || contains_word(text, "no")
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == word)
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
@@ -1142,6 +1286,28 @@ mod app_tests {
         assert!(looks_busy("Thinking hard about tests"));
         assert!(looks_busy("esc to interrupt"));
         assert!(!looks_busy("All checks passed."));
+    }
+
+    #[test]
+    fn detects_permission_prompts_without_matching_task_text() {
+        assert!(permission_text_needs_attention(
+            "Approval required\nPress enter to approve this command, or no to deny"
+        ));
+        assert!(permission_text_needs_attention(
+            "do you want to allow this shell command to run?"
+        ));
+        assert!(permission_text_needs_attention(
+            "authorization required\npress enter to approve this operation"
+        ));
+        assert!(!permission_text_needs_attention(
+            "it allows need to maeke the sound even if the agent is waiting for permission and it should show that in the agent pane so that it's obvious"
+        ));
+        assert!(!permission_text_needs_attention(
+            "make the sound even if the agent is waiting for permission"
+        ));
+        assert!(!permission_text_needs_attention(
+            "inspect and annotate the live review, then show when waiting for permission"
+        ));
     }
 
     #[test]
@@ -1357,7 +1523,7 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])));
         lines.push(ListItem::new(Line::from(vec![
             Span::raw("  "),
-            Span::styled(agent.status.as_str(), status_style(agent.status)),
+            Span::styled(agent_status_label(agent), agent_status_style(agent)),
             Span::raw("  "),
             Span::styled(agent.backend.as_str(), muted_style(focused)),
             Span::raw("  "),
@@ -1812,6 +1978,24 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
 
 fn status_style(status: AgentStatus) -> Style {
     Style::default().fg(status_color(status))
+}
+
+fn agent_status_label(agent: &AgentRun) -> &'static str {
+    if agent.needs_permission {
+        "needs permission"
+    } else {
+        agent.status.as_str()
+    }
+}
+
+fn agent_status_style(agent: &AgentRun) -> Style {
+    if agent.needs_permission {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        status_style(agent.status)
+    }
 }
 
 fn status_color(status: AgentStatus) -> Color {

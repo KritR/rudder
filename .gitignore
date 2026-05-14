@@ -5,3 +5,4 @@ target/
 .rudder-worktrees/
 npm-debug.log*
 .DS_Store
+RUDDER.md
