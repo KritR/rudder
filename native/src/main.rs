@@ -134,6 +134,7 @@ struct Suggestion {
 enum SuggestionAction {
     Insert(String),
     SetModel { backend: Backend, model: String },
+    ShowHelp,
 }
 
 impl App {
@@ -202,6 +203,7 @@ impl App {
                     self.focus = FocusPane::Worker;
                 }
             }
+            KeyCode::Char('M') => self.merge_all_ready(),
             KeyCode::Char('m') => self.merge_selected_agent(),
             KeyCode::Char('d') => self.delete_selected_agent(),
             _ => {}
@@ -314,6 +316,12 @@ impl App {
                 self.task_input.clear();
                 self.picker_index = 0;
                 self.notice = Some(format!("{} {}", self.backend.as_str(), self.model));
+            }
+            SuggestionAction::ShowHelp => {
+                self.task_input.clear();
+                self.picker_index = 0;
+                self.notice =
+                    Some("Tab focus  Enter start/focus  m merge  M merge all  d del".to_string());
             }
         }
     }
@@ -471,46 +479,77 @@ impl App {
     }
 
     fn merge_selected_agent(&mut self) {
-        let Some(run) = self.agents.get(self.selected_agent) else {
+        if self.agents.get(self.selected_agent).is_none() {
             return;
+        }
+        match self.merge_agent_at(self.selected_agent) {
+            Ok(()) => {
+                self.delete_pending = None;
+                self.notice = Some("merged selected worktree".to_string());
+            }
+            Err(error) => self.notice = Some(format!("merge stopped: {error}")),
+        }
+    }
+
+    fn merge_all_ready(&mut self) {
+        let ready = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.status == AgentStatus::Done && run.worktree_branch.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        if ready.is_empty() {
+            self.notice = Some("no completed worktrees ready to merge".to_string());
+            return;
+        }
+
+        let mut merged = 0;
+        for index in ready {
+            if let Err(error) = self.merge_agent_at(index) {
+                self.notice = Some(format!("merge all stopped after {merged}: {error}"));
+                return;
+            }
+            merged += 1;
+        }
+        self.delete_pending = None;
+        self.notice = Some(format!(
+            "merged {merged} worktree{}",
+            if merged == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn merge_agent_at(&mut self, index: usize) -> Result<()> {
+        let Some(run) = self.agents.get(index) else {
+            anyhow::bail!("no selected agent");
         };
         let Some(branch) = run.worktree_branch.clone() else {
-            self.notice = Some("selected agent is not in a worktree".to_string());
-            return;
+            anyhow::bail!("selected agent is not in a worktree");
         };
         let cwd = run.cwd.clone();
         let task = run.task.clone();
         let worktree_path = run.worktree_path.clone();
 
         if has_git_changes(&cwd) {
-            if let Err(error) = git_status_command(&cwd, &["add", "-A"]) {
-                self.notice = Some(format!("merge failed: {error}"));
-                return;
-            }
+            git_status_command(&cwd, &["add", "-A"])?;
             let message = format!("rudder: {}", short_task(&task));
             let _ = git_status_command(&cwd, &["commit", "-m", &message]);
         }
 
-        match git_status_command(&self.cwd, &["merge", "--no-ff", &branch]) {
-            Ok(()) => {
-                if let Some(path) = worktree_path {
-                    let _ = Command::new("git")
-                        .args(["worktree", "remove", "--force"])
-                        .arg(path)
-                        .current_dir(&self.cwd)
-                        .output();
-                }
-                if let Some(run) = self.agents.get_mut(self.selected_agent) {
-                    run.worktree_path = None;
-                    run.worktree_branch = None;
-                }
-                self.delete_pending = None;
-                self.notice = Some("merged selected worktree".to_string());
-            }
-            Err(error) => {
-                self.notice = Some(format!("merge stopped: {error}"));
-            }
+        git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
+        if let Some(path) = worktree_path {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(path)
+                .current_dir(&self.cwd)
+                .output();
         }
+        if let Some(run) = self.agents.get_mut(index) {
+            run.worktree_path = None;
+            run.worktree_branch = None;
+        }
+        Ok(())
     }
 
     fn poll_agents(&mut self) {
@@ -1086,11 +1125,18 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
 }
 
 fn command_suggestions() -> Vec<Suggestion> {
-    vec![Suggestion {
-        label: "/model".to_string(),
-        detail: "pick Claude or Codex model".to_string(),
-        action: SuggestionAction::Insert("/model ".to_string()),
-    }]
+    vec![
+        Suggestion {
+            label: "/model".to_string(),
+            detail: "pick Claude or Codex model".to_string(),
+            action: SuggestionAction::Insert("/model ".to_string()),
+        },
+        Suggestion {
+            label: "/help".to_string(),
+            detail: "show shortcuts".to_string(),
+            action: SuggestionAction::ShowHelp,
+        },
+    ]
 }
 
 fn model_suggestions() -> Vec<Suggestion> {
