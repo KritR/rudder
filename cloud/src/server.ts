@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { betterAuth } from "better-auth";
 import Database from "better-sqlite3";
 import { toNodeHandler } from "better-auth/node";
@@ -60,13 +61,17 @@ const flyWorkerMemoryMb = Number(process.env.RUDDER_WORKER_MEMORY_MB || 1024);
 const flyWorkerCpus = Number(process.env.RUDDER_WORKER_CPUS || 1);
 const flyWorkerCpuKind = process.env.RUDDER_WORKER_CPU_KIND || "shared";
 const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 15 * 60 * 1000);
+const stateKey = process.env.RUDDER_CLOUD_STATE_KEY || "control-plane/rudder-cloud.sqlite";
+const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
 const deviceLogins = new Map<string, DeviceLogin>();
 const configuredProviders = {
   google: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
   github: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
 };
+const s3 = new S3Client({ region: awsRegion });
 
 await fs.mkdir(dataDir, { recursive: true });
+await restoreDatabaseFromS3();
 
 const database = new Database(dbPath);
 database.pragma("journal_mode = WAL");
@@ -134,8 +139,6 @@ const updateHeartbeat = database.prepare(`
   where id = @id
 `);
 
-const s3 = new S3Client({ region: awsRegion });
-
 const auth = betterAuth({
   baseURL,
   secret: requiredEnv("BETTER_AUTH_SECRET"),
@@ -146,6 +149,9 @@ const auth = betterAuth({
 const authHandler = toNodeHandler(auth.handler);
 
 const server = http.createServer(async (req, res) => {
+  res.once("finish", () => {
+    schedulePersistDatabase();
+  });
   try {
     const url = new URL(req.url || "/", baseURL);
     if (url.pathname.startsWith("/api/auth")) {
@@ -157,6 +163,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         s3: Boolean(snapshotBucket),
         fly: Boolean(flyApiToken && flyAppName && flyWorkerImage),
+        state: Boolean(snapshotBucket && persistStateToS3),
         auth: configuredProviders,
       });
       return;
@@ -197,6 +204,108 @@ const server = http.createServer(async (req, res) => {
 server.listen(port, () => {
   console.log(`rudder cloud listening on ${baseURL}`);
 });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    void persistDatabaseToS3().finally(() => {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    });
+  });
+}
+
+let persistTimer: NodeJS.Timeout | undefined;
+let persistInFlight = false;
+let persistAgain = false;
+
+async function restoreDatabaseFromS3(): Promise<void> {
+  if (!snapshotBucket || !persistStateToS3) {
+    return;
+  }
+  try {
+    const response = await s3.send(new GetObjectCommand({
+      Bucket: snapshotBucket,
+      Key: stateKey,
+    }));
+    if (!response.Body) {
+      return;
+    }
+    const buffer = await streamToBuffer(response.Body);
+    if (buffer.length === 0) {
+      return;
+    }
+    await fs.writeFile(dbPath, buffer, { mode: 0o600 });
+  } catch (error) {
+    const name = error && typeof error === "object" && "name" in error ? String(error.name) : "";
+    if (name !== "NoSuchKey" && name !== "NotFound") {
+      console.warn(`rudder cloud state restore skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function schedulePersistDatabase(): void {
+  if (!snapshotBucket || !persistStateToS3) {
+    return;
+  }
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+  persistTimer = setTimeout(() => {
+    persistTimer = undefined;
+    void persistDatabaseToS3();
+  }, 750);
+  persistTimer.unref?.();
+}
+
+async function persistDatabaseToS3(): Promise<void> {
+  if (!snapshotBucket || !persistStateToS3) {
+    return;
+  }
+  if (persistInFlight) {
+    persistAgain = true;
+    return;
+  }
+  persistInFlight = true;
+  try {
+    database.pragma("wal_checkpoint(FULL)");
+    const body = await fs.readFile(dbPath);
+    await s3.send(new PutObjectCommand({
+      Bucket: snapshotBucket,
+      Key: stateKey,
+      Body: body,
+      ContentType: "application/vnd.sqlite3",
+      ServerSideEncryption: "AES256",
+    }));
+  } catch (error) {
+    console.warn(`rudder cloud state persist failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    persistInFlight = false;
+    if (persistAgain) {
+      persistAgain = false;
+      schedulePersistDatabase();
+    }
+  }
+}
+
+async function streamToBuffer(body: unknown): Promise<Buffer> {
+  if (Buffer.isBuffer(body)) {
+    return body;
+  }
+  if (body instanceof Uint8Array) {
+    return Buffer.from(body);
+  }
+  if (body instanceof Readable || (body && typeof body === "object" && Symbol.asyncIterator in body)) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+  if (body && typeof body === "object" && "transformToByteArray" in body) {
+    const bytes = await (body as { transformToByteArray(): Promise<Uint8Array> }).transformToByteArray();
+    return Buffer.from(bytes);
+  }
+  throw new Error("unsupported S3 body type");
+}
 
 async function handleCliLoginStart(res: ServerResponse): Promise<void> {
   const deviceCode = randomUUID();

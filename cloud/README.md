@@ -17,6 +17,8 @@ GITHUB_CLIENT_ID=<github oauth client id>
 GITHUB_CLIENT_SECRET=<github oauth client secret>
 RUDDER_CLOUD_DATA_DIR=/data
 RUDDER_S3_BUCKET=<snapshot bucket>
+RUDDER_CLOUD_STATE_KEY=control-plane/rudder-cloud.sqlite
+RUDDER_CLOUD_PERSIST_STATE=1
 AWS_REGION=us-east-1
 FLY_API_TOKEN=<fly token>
 FLY_APP_NAME=<existing fly machines app>
@@ -90,13 +92,17 @@ uploaded launch/onload snapshots in `RUDDER_S3_BUCKET` using server-side
 encryption and gives each Fly Machine a one-hour presigned URL. Fly workers do
 not receive AWS credentials.
 
+The control plane also persists its SQLite state to S3 at
+`RUDDER_CLOUD_STATE_KEY` by default. That keeps CLI tokens, sail records, worker
+heartbeats, and Better Auth tables available across App Runner restarts without
+requiring a database server for the early deployment. Set
+`RUDDER_CLOUD_PERSIST_STATE=0` to disable that behavior for local development.
+
 The intended AWS shape is:
 
 - container image in ECR
 - App Runner service for the control plane
-- S3 bucket for encrypted snapshot objects
-- encrypted persistent storage or managed database for production state; the
-  current service uses SQLite at `RUDDER_CLOUD_DB`
+- S3 bucket for encrypted snapshot objects and persisted control-plane state
 - secrets stored in AWS Secrets Manager or App Runner environment secrets
 
 Build and push the image, then create or update the App Runner service with the
