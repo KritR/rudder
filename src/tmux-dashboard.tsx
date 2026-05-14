@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
+import fsp from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useInput, useWindowSize } from "ink";
+import { permissionAttentionFromOutput, type AgentAttention } from "./agent-attention.js";
 import { discoverEffortOptions, fallbackEffortOptions, type EffortOption } from "./effort.js";
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import { startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
-import { listRuns, loadConfig, saveConfig } from "./state.js";
+import { listRuns, loadConfig, outputPath, saveConfig } from "./state.js";
 import {
   loadTmuxDashboardState,
   updateTmuxDashboardState,
@@ -17,11 +19,21 @@ import type { BackendId, EffortLevel, RunRecord, RudderConfig } from "./types.js
 import { shortenHome } from "./util.js";
 
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
+const ATTENTION_TAIL_BYTES = 64 * 1024;
 
 type PaneDefaults = {
   tmuxSessionName: string;
   backend?: BackendId;
   model?: string;
+};
+
+type AgentPaneRun = RunRecord & {
+  attention: AgentAttention;
+};
+
+type AlertState = {
+  terminal: Set<string>;
+  permission: Set<string>;
 };
 
 type SlashCommand = {
@@ -70,11 +82,11 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [branch, setBranch] = useState("HEAD");
   const [config, setConfig] = useState<RudderConfig | null>(null);
-  const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [runs, setRuns] = useState<AgentPaneRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [notice, setNotice] = useState("");
   const [deleteIntent, setDeleteIntent] = useState<{ runId: string; canMerge: boolean } | null>(null);
-  const finishedRef = useRef<Set<string> | null>(null);
+  const alertRef = useRef<AlertState | null>(null);
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -82,7 +94,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
     const [nextBranch, nextConfig, nextRuns, state] = await Promise.all([
       currentBranch(root),
       loadConfig(),
-      listRuns(root),
+      loadAgentPaneRuns(root),
       loadTmuxDashboardState(root, defaults.tmuxSessionName),
     ]);
     setRepoRoot(root);
@@ -99,7 +111,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   }, [refresh]);
 
   useEffect(() => {
-    notifyFinishedRuns(runs, finishedRef);
+    notifyRunAlerts(runs, alertRef);
   }, [runs]);
 
   const selectedIndex = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
@@ -199,7 +211,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
             {run.id === selectedRun?.id ? "> " : "  "}{summarize(run.task, width - 3)}
           </Text>
           <Text>
-            <Text color={statusColor(run)}>  {statusMark(run)}</Text>
+            <Text color={runStatusColor(run)}>  {statusMark(run)}</Text>
             <Text color="gray">  {run.backend} </Text>
             <Text color="magenta">{modelLabel(run, config)}</Text>
           </Text>
@@ -604,6 +616,35 @@ function toNativeBackend(backend: BackendId): NativeBackendId {
   return backend === "codex" ? "codex" : "claude";
 }
 
+async function loadAgentPaneRuns(repoRoot: string): Promise<AgentPaneRun[]> {
+  const runs = await listRuns(repoRoot);
+  return await Promise.all(runs.map(async (run) => {
+    const output = await readTailIfExists(outputPath(repoRoot, run.id));
+    return {
+      ...run,
+      attention: permissionAttentionFromOutput(output),
+    };
+  }));
+}
+
+async function readTailIfExists(file: string): Promise<string> {
+  const handle = await fsp.open(file, "r").catch(() => null);
+  if (!handle) {
+    return "";
+  }
+  try {
+    const stat = await handle.stat();
+    const length = Math.min(stat.size, ATTENTION_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, Math.max(0, stat.size - length));
+    return buffer.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 async function focusSelectedWorker(repoRoot: string, tmuxSessionName: string, run: RunRecord | undefined): Promise<void> {
   if (run?.terminal?.paneId) {
     await selectPane(run.terminal.paneId).catch(() => undefined);
@@ -615,22 +656,37 @@ async function focusSelectedWorker(repoRoot: string, tmuxSessionName: string, ru
   }
 }
 
-function notifyFinishedRuns(runs: RunRecord[], ref: React.MutableRefObject<Set<string> | null>): void {
-  const finished = new Set(runs.filter((run) => isTerminalRun(run)).map((run) => run.id));
+function notifyRunAlerts(runs: AgentPaneRun[], ref: React.MutableRefObject<AlertState | null>): void {
+  const terminal = new Set(runs.filter((run) => isTerminalRun(run)).map((run) => run.id));
+  const permission = new Set(runs.filter((run) => runNeedsPermission(run)).map((run) => run.id));
   if (!ref.current) {
-    ref.current = finished;
+    ref.current = { terminal, permission };
     return;
   }
   for (const run of runs) {
-    if (isTerminalRun(run) && !ref.current.has(run.id)) {
+    if (isTerminalRun(run) && !ref.current.terminal.has(run.id)) {
       playCompletionSound();
-      ref.current.add(run.id);
+      ref.current.terminal.add(run.id);
+    }
+    if (runNeedsPermission(run) && !ref.current.permission.has(run.id)) {
+      playCompletionSound();
+      ref.current.permission.add(run.id);
     }
   }
+  ref.current.terminal = terminal;
+  ref.current.permission = permission;
 }
 
 function isTerminalRun(run: RunRecord): boolean {
   return ["completed", "failed", "cancelled", "merged", "merge-conflict"].includes(run.status);
+}
+
+function isActiveRun(run: RunRecord): boolean {
+  return ["created", "running", "steering", "verifying"].includes(run.status);
+}
+
+function runNeedsPermission(run: AgentPaneRun): boolean {
+  return isActiveRun(run) && run.attention.needsPermission;
 }
 
 function playCompletionSound(): void {
@@ -647,13 +703,18 @@ function playCompletionSound(): void {
   }
 }
 
-function statusMark(run: RunRecord): string {
+function statusMark(run: AgentPaneRun): string {
+  if (runNeedsPermission(run)) return "needs permission";
   if (run.status === "merged") return "merged";
   if (run.status === "completed") return "done";
   if (run.status === "failed" || run.status === "merge-conflict") return "failed";
   if (run.status === "cancelled") return "stopped";
   if (run.status === "running" || run.status === "steering" || run.status === "verifying") return "running";
   return "queued";
+}
+
+function runStatusColor(run: AgentPaneRun): string {
+  return runNeedsPermission(run) ? "yellow" : statusColor(run);
 }
 
 function statusColor(run: RunRecord): string {

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
+import { permissionAttentionFromOutput, type AgentAttention } from "./agent-attention.js";
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import {
@@ -26,6 +27,7 @@ type UiRun = RunRecord & {
   output: string;
   events: RudderEvent[];
   work: WorkItem[];
+  attention: AgentAttention;
 };
 
 type WorkItem = {
@@ -39,6 +41,11 @@ type FocusPane = "agents" | "worker" | "task";
 type DeletePrompt = {
   runId: string;
   canMerge: boolean;
+};
+
+type AlertState = {
+  terminal: Set<string>;
+  permission: Set<string>;
 };
 
 const INTERACTIVE_BACKENDS: BackendId[] = ["claude", "codex"];
@@ -101,7 +108,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [deletePrompt, setDeletePrompt] = useState<DeletePrompt | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
-  const notifiedFinishedRuns = useRef<Set<string> | null>(null);
+  const notifiedAlerts = useRef<AlertState | null>(null);
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -113,7 +120,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     setRepoRoot(root);
     setConfig(nextConfig);
     setBranch(nextBranch);
-    notifyFinishedRuns(nextRuns, notifiedFinishedRuns);
+    notifyRunAlerts(nextRuns, notifiedAlerts);
     setRuns(nextRuns);
     if (!preferencesLoaded) {
       setBackend(toInteractiveBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend));
@@ -690,7 +697,7 @@ function RunRail(props: {
 }
 
 function RunCard(props: { run: UiRun; selected: boolean; targeted: boolean; expanded: boolean; width: number }): React.ReactElement {
-  const tone = statusColor(props.run.status);
+  const tone = runStatusColor(props.run);
   const label = props.selected ? (props.targeted ? ">>" : "> ") : "  ";
   const task = truncate(props.run.task, Math.max(12, props.width - 14));
   const progress = completionPercent(props.run);
@@ -701,7 +708,7 @@ function RunCard(props: { run: UiRun; selected: boolean; targeted: boolean; expa
       <Text wrap="truncate" color={props.selected ? "white" : "gray"} bold={props.selected}>
         {label} {meta} {statusGlyph(props.run.status)} {props.run.backend} {task}
       </Text>
-      <Text wrap="truncate" color={tone}>  {statusWord(props.run.status)} {props.targeted ? "editing " : ""}{summary}</Text>
+      <Text wrap="truncate" color={tone}>  {statusWord(props.run)} {props.targeted ? "editing " : ""}{summary}</Text>
     </Box>
   );
 }
@@ -727,13 +734,13 @@ function DetailPane(props: {
   const outputHeight = Math.max(5, props.height - 6 - composerHeight);
   const contentWidth = Math.max(10, props.width - 4);
   return (
-    <Box width={props.width} height={props.height} borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : statusColor(props.run.status)} paddingX={1} flexDirection="column">
+    <Box width={props.width} height={props.height} borderStyle={props.focused ? "double" : "single"} borderColor={props.focused ? "cyan" : runStatusColor(props.run)} paddingX={1} flexDirection="column">
       <Box justifyContent="space-between">
         <Box>
           {props.focused ? <FocusPill label="focus" /> : null}
           <Text bold color={props.focused ? "cyan" : undefined}> worker</Text>
         </Box>
-        <Text color={statusColor(props.run.status)}>{workerStateLabel(props.run)}</Text>
+        <Text color={runStatusColor(props.run)}>{workerStateLabel(props.run)}</Text>
       </Box>
       <Text wrap="truncate" color="gray">{fitLine(props.run.task, contentWidth)}</Text>
       <Box flexDirection="column" marginTop={1} minHeight={0}>
@@ -910,6 +917,7 @@ async function loadUiRuns(repoRoot: string): Promise<UiRun[]> {
       output,
       events,
       work: buildWork(events, run),
+      attention: permissionAttentionFromOutput(output),
     };
   }));
 }
@@ -1139,18 +1147,25 @@ function modelForBackend(backend: BackendId, config: RudderConfig | null): strin
   return config.backends.acpx?.model;
 }
 
-function notifyFinishedRuns(runs: UiRun[], ref: React.MutableRefObject<Set<string> | null>): void {
-  const finished = new Set(runs.filter((run) => isTerminal(run.status)).map((run) => run.id));
+function notifyRunAlerts(runs: UiRun[], ref: React.MutableRefObject<AlertState | null>): void {
+  const terminal = new Set(runs.filter((run) => isTerminal(run.status)).map((run) => run.id));
+  const permission = new Set(runs.filter((run) => runNeedsPermission(run)).map((run) => run.id));
   if (!ref.current) {
-    ref.current = finished;
+    ref.current = { terminal, permission };
     return;
   }
   for (const run of runs) {
-    if (isTerminal(run.status) && !ref.current.has(run.id)) {
+    if (isTerminal(run.status) && !ref.current.terminal.has(run.id)) {
       playCompletionSound();
-      ref.current.add(run.id);
+      ref.current.terminal.add(run.id);
+    }
+    if (runNeedsPermission(run) && !ref.current.permission.has(run.id)) {
+      playCompletionSound();
+      ref.current.permission.add(run.id);
     }
   }
+  ref.current.terminal = terminal;
+  ref.current.permission = permission;
 }
 
 function playCompletionSound(): void {
@@ -1242,6 +1257,14 @@ function statusColor(status: RunStatus): string {
   return "cyan";
 }
 
+function runStatusColor(run: UiRun): string {
+  return runNeedsPermission(run) ? "yellow" : statusColor(run.status);
+}
+
+function runNeedsPermission(run: UiRun): boolean {
+  return isActive(run.status) && run.attention.needsPermission;
+}
+
 function toneColor(tone: WorkItem["tone"]): string {
   if (tone === "success") {
     return "green";
@@ -1275,6 +1298,9 @@ function workGlyph(tone: WorkItem["tone"]): string {
 }
 
 function completionPercent(run: UiRun): number {
+  if (runNeedsPermission(run)) {
+    return 90;
+  }
   if (run.status === "merged") {
     return 100;
   }
@@ -1321,6 +1347,9 @@ function canMerge(run: UiRun): boolean {
 }
 
 function runSummary(run: UiRun): string {
+  if (runNeedsPermission(run)) {
+    return run.attention.summary ? `needs permission: ${run.attention.summary}` : "needs permission";
+  }
   const latestWork = run.work.at(-1);
   if (run.status === "steering") {
     return "auto-steering after completion";
@@ -1336,6 +1365,9 @@ function runSummary(run: UiRun): string {
 }
 
 function workerStateLabel(run: UiRun): string {
+  if (runNeedsPermission(run)) {
+    return "needs permission";
+  }
   if (run.status === "completed") {
     return canMerge(run) ? "done  m merge" : "done";
   }
@@ -1355,6 +1387,9 @@ function workerStateLabel(run: UiRun): string {
 }
 
 function agentRailSummary(run: UiRun): string {
+  if (runNeedsPermission(run)) {
+    return run.attention.summary ?? "waiting for permission";
+  }
   const output = summarizeOutput(run.output);
   if (output) {
     return output;
@@ -1375,7 +1410,11 @@ function summarizeOutput(output: string): string {
   return sentence || normalized.slice(0, 180);
 }
 
-function statusWord(status: RunStatus): string {
+function statusWord(run: UiRun): string {
+  if (runNeedsPermission(run)) {
+    return "permission:";
+  }
+  const status = run.status;
   if (status === "completed" || status === "merged") {
     return "done:";
   }
