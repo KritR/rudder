@@ -22,6 +22,16 @@ type DeviceLogin = {
   expiresAt: number;
 };
 
+type GithubBrowserLogin = {
+  githubDeviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete?: string;
+  expiresAt: number;
+  intervalMs: number;
+  nextPollAt: number;
+};
+
 type SailStatus = "queued" | "running" | "paused" | "completed" | "failed";
 
 type Sail = {
@@ -63,7 +73,9 @@ const flyWorkerCpuKind = process.env.RUDDER_WORKER_CPU_KIND || "shared";
 const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 15 * 60 * 1000);
 const stateKey = process.env.RUDDER_CLOUD_STATE_KEY || "control-plane/rudder-cloud.sqlite";
 const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
+const githubDeviceClientId = process.env.RUDDER_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
 const deviceLogins = new Map<string, DeviceLogin>();
+const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
 const configuredProviders = {
   google: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
   github: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
@@ -182,6 +194,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/cli/login") {
       renderLoginPage(url, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/cli/github/start") {
+      await handleCliGithubStart(url, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/cli/github/wait") {
+      await handleCliGithubWait(url, res);
       return;
     }
     if (req.method === "GET" && url.pathname === "/cli/approve") {
@@ -354,21 +374,29 @@ async function handleCliGithubToken(req: IncomingMessage, res: ServerResponse): 
     throw badRequest("token is required");
   }
   const user = await githubUser(githubToken);
+  const issued = issueRudderToken(`github:${user.id}`, user.email ?? `${user.login}@users.noreply.github.com`);
+  const responseBody: JsonRecord = {
+    token: issued.token,
+    accountId: issued.accountId,
+    provider: "github",
+  };
+  if (issued.email) {
+    responseBody.email = issued.email;
+  }
+  sendJson(res, 200, responseBody);
+}
+
+function issueRudderToken(accountId: string, email?: string): { token: string; accountId: string; email?: string } {
   const rudderToken = `rdr_${randomBytes(32).toString("base64url")}`;
   const now = new Date().toISOString();
   insertToken.run({
     tokenHash: tokenHash(rudderToken),
-    accountId: `github:${user.id}`,
-    email: user.email ?? `${user.login}@users.noreply.github.com`,
+    accountId,
+    email: email ?? null,
     createdAt: now,
     lastUsedAt: now,
   });
-  sendJson(res, 200, {
-    token: rudderToken,
-    accountId: `github:${user.id}`,
-    email: user.email ?? `${user.login}@users.noreply.github.com`,
-    provider: "github",
-  });
+  return { token: rudderToken, accountId, email };
 }
 
 function renderLoginPage(url: URL, res: ServerResponse): void {
@@ -381,13 +409,137 @@ function renderLoginPage(url: URL, res: ServerResponse): void {
     configuredProviders.github
       ? `<a href="/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}">Continue with GitHub</a>`
       : "",
+    deviceCode
+      ? `<a href="/cli/github/start?device_code=${encodeURIComponent(deviceCode)}">Continue with GitHub device login</a>`
+      : "",
   ].filter(Boolean).join("\n");
-  const body = links || "<p>No OAuth providers are configured yet.</p>";
+  const body = links || "<p>No OAuth providers are configured yet. Run <code>rudder login</code> from the CLI to use GitHub device login.</p>";
   sendHtml(res, `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rudder Cloud Login</title>
-<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111}a{display:block;margin:12px 0;color:#111}</style></head>
+<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}a{display:block;margin:12px 0;color:#111}code{background:#f2f2f2;padding:2px 5px}</style></head>
 <body><h1>Rudder Cloud</h1><p>Choose a provider to finish CLI login.</p>
 ${body}
+</body></html>`);
+}
+
+async function handleCliGithubStart(url: URL, res: ServerResponse): Promise<void> {
+  const deviceCode = url.searchParams.get("device_code") || "";
+  const login = deviceLogins.get(deviceCode);
+  if (!login || login.expiresAt < Date.now()) {
+    sendHtml(res, "<p>Login expired. Run <code>rudder login</code> again.</p>", 400);
+    return;
+  }
+  const existing = githubBrowserLogins.get(deviceCode);
+  const githubLogin = existing && existing.expiresAt > Date.now()
+    ? existing
+    : await startGithubBrowserLogin(deviceCode);
+  renderGithubDevicePage(res, deviceCode, githubLogin);
+}
+
+async function handleCliGithubWait(url: URL, res: ServerResponse): Promise<void> {
+  const deviceCode = url.searchParams.get("device_code") || "";
+  const login = deviceLogins.get(deviceCode);
+  const githubLogin = githubBrowserLogins.get(deviceCode);
+  if (!login || login.expiresAt < Date.now() || !githubLogin || githubLogin.expiresAt < Date.now()) {
+    githubBrowserLogins.delete(deviceCode);
+    sendHtml(res, "<p>Login expired. Run <code>rudder login</code> again.</p>", 400);
+    return;
+  }
+  if (Date.now() < githubLogin.nextPollAt) {
+    renderGithubDevicePage(res, deviceCode, githubLogin);
+    return;
+  }
+  githubLogin.nextPollAt = Date.now() + githubLogin.intervalMs;
+  const poll = await githubOAuthRequest<{
+    access_token?: string;
+    error?: string;
+    error_description?: string;
+    interval?: number;
+  }>("https://github.com/login/oauth/access_token", {
+    client_id: githubDeviceClientId,
+    device_code: githubLogin.githubDeviceCode,
+    grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+  });
+  if (poll.access_token) {
+    const user = await githubUser(poll.access_token);
+    const issued = issueRudderToken(`github:${user.id}`, user.email ?? `${user.login}@users.noreply.github.com`);
+    login.token = issued.token;
+    login.accountId = issued.accountId;
+    login.email = issued.email;
+    githubBrowserLogins.delete(deviceCode);
+    sendHtml(res, "<p>Rudder Cloud login complete. You can close this tab.</p>");
+    return;
+  }
+  if (poll.error === "slow_down") {
+    githubLogin.intervalMs = Math.max(githubLogin.intervalMs + 5000, (poll.interval ?? 5) * 1000);
+    githubLogin.nextPollAt = Date.now() + githubLogin.intervalMs;
+  } else if (poll.error && poll.error !== "authorization_pending") {
+    githubBrowserLogins.delete(deviceCode);
+    sendHtml(res, `<p>GitHub login failed: ${escapeHtml(poll.error_description || poll.error)}</p>`, 400);
+    return;
+  }
+  renderGithubDevicePage(res, deviceCode, githubLogin);
+}
+
+async function startGithubBrowserLogin(deviceCode: string): Promise<GithubBrowserLogin> {
+  const start = await githubOAuthRequest<{
+    device_code?: string;
+    user_code?: string;
+    verification_uri?: string;
+    verification_uri_complete?: string;
+    expires_in?: number;
+    interval?: number;
+    error?: string;
+    error_description?: string;
+  }>("https://github.com/login/device/code", {
+    client_id: githubDeviceClientId,
+    scope: "read:user user:email",
+  });
+  if (!start.device_code || !start.user_code || !start.verification_uri) {
+    throw new Error(start.error_description || start.error || "GitHub device login failed");
+  }
+  const githubLogin: GithubBrowserLogin = {
+    githubDeviceCode: start.device_code,
+    userCode: start.user_code,
+    verificationUri: start.verification_uri,
+    verificationUriComplete: start.verification_uri_complete,
+    expiresAt: Date.now() + (start.expires_in ?? 900) * 1000,
+    intervalMs: Math.max(1000, (start.interval ?? 5) * 1000),
+    nextPollAt: Date.now() + Math.max(1000, (start.interval ?? 5) * 1000),
+  };
+  githubBrowserLogins.set(deviceCode, githubLogin);
+  return githubLogin;
+}
+
+async function githubOAuthRequest<T>(url: string, body: Record<string, string>): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const parsed = text ? parseJson(text) : null;
+  if (!response.ok) {
+    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `${response.status} ${response.statusText}`);
+  }
+  return parsed as T;
+}
+
+function renderGithubDevicePage(res: ServerResponse, deviceCode: string, githubLogin: GithubBrowserLogin): void {
+  const href = githubLogin.verificationUriComplete || githubLogin.verificationUri;
+  sendHtml(res, `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="${Math.ceil(githubLogin.intervalMs / 1000)};url=/cli/github/wait?device_code=${encodeURIComponent(deviceCode)}">
+<title>Rudder Cloud GitHub Login</title>
+<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}.code{font:600 32px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;margin:20px 0}a{color:#111}p{max-width:620px}</style></head>
+<body><h1>Rudder Cloud</h1>
+<p>Authorize Rudder with GitHub, then return here. This page will finish automatically.</p>
+<div class="code">${escapeHtml(githubLogin.userCode)}</div>
+<p><a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">Open GitHub authorization</a></p>
+<p>Waiting for GitHub approval...</p>
 </body></html>`);
 }
 
@@ -403,18 +555,13 @@ async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: 
     renderLoginPage(url, res);
     return;
   }
-  const token = `rdr_${randomBytes(32).toString("base64url")}`;
-  const now = new Date().toISOString();
-  login.token = token;
-  login.accountId = String(session.user.id || tokenHash(token));
+  const issued = issueRudderToken(
+    String(session.user.id || `better-auth:${randomUUID()}`),
+    typeof session.user.email === "string" ? session.user.email : undefined,
+  );
+  login.token = issued.token;
+  login.accountId = issued.accountId;
   login.email = typeof session.user.email === "string" ? session.user.email : undefined;
-  insertToken.run({
-    tokenHash: tokenHash(token),
-    accountId: login.accountId,
-    email: login.email ?? null,
-    createdAt: now,
-    lastUsedAt: now,
-  });
   sendHtml(res, "<p>Rudder Cloud login complete. You can close this tab.</p>");
 }
 
@@ -897,6 +1044,14 @@ function sendJson(res: ServerResponse, status: number, body: Json): void {
 function sendHtml(res: ServerResponse, body: string, status = 200): void {
   res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
   res.end(body);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function getBetterAuthSession(req: IncomingMessage): Promise<{ user?: { id?: string; email?: string } } | null> {
