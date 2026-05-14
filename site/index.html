@@ -229,10 +229,14 @@
         display: inline-block;
         padding: 2px 7px;
         margin-bottom: 14px;
-        background: #111;
-        color: #fff;
+        background: #39ff14;
+        color: #111;
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 12px;
+      }
+
+      .note {
+        color: #555;
       }
 
       .merge-button {
@@ -298,7 +302,7 @@
           <p class="lede">
             Rudder is a native terminal workspace for Claude Code and Codex.
             Start tasks, watch real agent processes, keep every run isolated,
-            and merge completed work with a tap.
+            review changes with Hunk, and merge completed work with one key.
           </p>
           <div class="install">
             <code id="install-command">npm install -g @viraatdas/rudder@latest
@@ -324,6 +328,10 @@ rudder</code>
               <span>When a worker exits with changes, Rudder waits briefly, then sends a focused verification follow-up so the task keeps moving toward done.</span>
             </div>
             <div class="point">
+              <strong>Hunk review built in</strong>
+              <span>Press v to open a light-mode Hunk review with multi-file navigation, mouse support, watch mode, untracked files, and agent notes.</span>
+            </div>
+            <div class="point">
               <strong>Merge with one key</strong>
               <span>When an agent is done, press m from the agent list to merge that worktree back into your branch.</span>
             </div>
@@ -335,21 +343,23 @@ rudder</code>
             <div class="label">agents</div>
             <div class="run active">› fix auth callback<br />  running  claude sonnet(xhigh)</div>
             <div class="run muted">  add parser tests<br />  done  codex gpt-5.5(xhigh)</div>
-            <div class="merge-button">m merge selected</div>
+            <div class="merge-button">v review with Hunk</div>
           </div>
           <div class="pane worker">
-            <span class="focus">FOCUS worker</span>
-            <pre>$ claude --model sonnet
+            <span class="focus">review</span>
+            <pre>hunk diff --watch
 
-Reading auth routes...
-Editing callback handler...
-Running npm test -- auth
+files
+  src/auth/callback.ts
+  tests/auth-callback.test.ts
 
-All checks passed.</pre>
+@@ magic link redirect @@
+  return redirect(nextUrl)
+<span class="note">agent note: verified with npm test -- auth</span></pre>
           </div>
           <div class="pane task">
             <pre><strong>TASK</strong> fix the redirect after magic link verification_
-Enter start   Tab focus pane   / commands   claude sonnet</pre>
+Enter start   Tab focus pane   /model   claude sonnet</pre>
           </div>
         </section>
       </main>
