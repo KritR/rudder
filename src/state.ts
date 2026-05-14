@@ -1,6 +1,14 @@
 import path from "node:path";
 import fsp from "node:fs/promises";
-import type { AuthProfileStore, RudderConfig, RunRecord, RudderEvent } from "./types.js";
+import type {
+  AuthProfileStore,
+  BackendConfig,
+  BackendId,
+  EffortLevel,
+  RudderConfig,
+  RunRecord,
+  RudderEvent,
+} from "./types.js";
 import {
   ensureDir,
   newRunId,
@@ -93,6 +101,59 @@ export function defaultConfig(): RudderConfig {
 
 export async function saveConfig(config: RudderConfig): Promise<void> {
   await writeJson(globalConfigPath(), config, { mode: 0o600 });
+}
+
+export async function rememberBackendSelection(params: {
+  backend: BackendId;
+  model?: string;
+  effort?: EffortLevel;
+  updateModel?: boolean;
+  updateEffort?: boolean;
+}): Promise<RudderConfig> {
+  const config = await loadConfig();
+  applyBackendSelection(config, params);
+  await saveConfig(config);
+  return config;
+}
+
+function applyBackendSelection(
+  config: RudderConfig,
+  params: {
+    backend: BackendId;
+    model?: string;
+    effort?: EffortLevel;
+    updateModel?: boolean;
+    updateEffort?: boolean;
+  },
+): void {
+  config.lastUsedBackend = params.backend;
+  config.backends = config.backends ?? {};
+  if (!params.updateModel && !params.updateEffort) {
+    return;
+  }
+
+  const next: BackendConfig = { ...(config.backends[params.backend] ?? {}) };
+  if (params.updateModel) {
+    if (params.model) {
+      next.model = params.model;
+    } else {
+      delete next.model;
+    }
+  }
+  if (params.updateEffort) {
+    if (params.backend === "claude") {
+      if (params.effort) {
+        next.effort = params.effort;
+      } else {
+        delete next.effort;
+      }
+    } else if (params.effort) {
+      next.reasoningEffort = params.effort;
+    } else {
+      delete next.reasoningEffort;
+    }
+  }
+  config.backends[params.backend] = next;
 }
 
 export async function loadAuthStore(): Promise<AuthProfileStore> {

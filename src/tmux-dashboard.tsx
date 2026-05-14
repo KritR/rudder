@@ -6,7 +6,7 @@ import { discoverEffortOptions, fallbackEffortOptions, type EffortOption } from 
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import { startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
-import { listRuns, loadConfig, saveConfig } from "./state.js";
+import { listRuns, loadConfig, rememberBackendSelection } from "./state.js";
 import {
   loadTmuxDashboardState,
   updateTmuxDashboardState,
@@ -349,7 +349,10 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       const nextModel = task.slice("/model ".length).trim() || undefined;
       setModel(nextModel);
       setEffort(undefined);
-      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, backend, nextModel, undefined);
+      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, backend, nextModel, undefined, {
+        updateModel: true,
+        updateEffort: true,
+      });
       setTaskInput("");
       setNotice("");
       return;
@@ -360,7 +363,10 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setModel(undefined);
       const nextEffort = effortForBackend(nextBackend, config);
       setEffort(nextEffort);
-      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, nextBackend, undefined, nextEffort);
+      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, nextBackend, undefined, nextEffort, {
+        updateModel: false,
+        updateEffort: false,
+      });
       setTaskInput("");
       setNotice("");
       setModelPickerOpen(false);
@@ -463,7 +469,10 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         setBackend(nextBackend);
         setModel(nextModel);
         setEffort(nextEffort);
-        void updateBackendDefaults(repoRoot, defaults.tmuxSessionName, nextBackend, nextModel, nextEffort);
+        void updateBackendDefaults(repoRoot, defaults.tmuxSessionName, nextBackend, nextModel, nextEffort, {
+          updateModel: true,
+          updateEffort: true,
+        });
         setModelPickerOpen(false);
         setModelPickerStep("model");
         setPendingModel(null);
@@ -695,24 +704,19 @@ async function updateBackendDefaults(
   backend: NativeBackendId,
   model: string | undefined,
   effort: EffortLevel | undefined,
+  options: {
+    updateModel: boolean;
+    updateEffort: boolean;
+  },
 ): Promise<void> {
   await updateTmuxDashboardState(repoRoot, tmuxSessionName, { backend, model, effort });
-  const config = await loadConfig();
-  config.lastUsedBackend = backend;
-  if (backend === "claude") {
-    config.backends.claude = {
-      ...(config.backends.claude ?? {}),
-      model,
-      effort,
-    };
-  } else {
-    config.backends.codex = {
-      ...(config.backends.codex ?? {}),
-      model,
-      reasoningEffort: effort,
-    };
-  }
-  await saveConfig(config);
+  await rememberBackendSelection({
+    backend,
+    model,
+    effort,
+    updateModel: options.updateModel,
+    updateEffort: options.updateEffort,
+  });
 }
 
 function withBackend(options: ModelOption[], backend: NativeBackendId): ModelOption[] {
