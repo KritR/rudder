@@ -128,6 +128,15 @@ export async function runCloudCommand(command: string, args: string[], options: 
 
 async function login(options: CloudCommandOptions): Promise<void> {
   const client = await cloudClient({ requireToken: false });
+  const githubLogin = await tryGithubCliLogin(client).catch(() => null);
+  if (githubLogin?.token || githubLogin?.accessToken) {
+    const token = githubLogin.token ?? githubLogin.accessToken;
+    if (token) {
+      await saveCloudLogin(client, githubLogin, token, options, "GitHub CLI");
+      return;
+    }
+  }
+
   const response = await client.request<LoginStartResponse>("/api/cli/login", {
     method: "POST",
     body: {
@@ -151,27 +160,7 @@ async function login(options: CloudCommandOptions): Promise<void> {
     const poll = await pollLogin(client, pollPath, deviceCode);
     const token = poll.token ?? poll.accessToken;
     if (token) {
-      await saveCloudAuth({
-        version: 1,
-        token,
-        cloudUrl: client.baseUrl,
-        accountId: poll.accountId,
-        email: poll.email,
-        expiresAt: poll.expiresAt ?? (poll.expiresIn ? new Date(Date.now() + poll.expiresIn * 1000).toISOString() : undefined),
-        updatedAt: nowIso(),
-      });
-      if (options.json) {
-        const result: Record<string, JsonValue> = { ok: true, cloudUrl: client.baseUrl };
-        if (poll.email) {
-          result.email = poll.email;
-        }
-        if (poll.accountId) {
-          result.accountId = poll.accountId;
-        }
-        printJson(result);
-      } else {
-        console.log(`Logged in to ${client.baseUrl}${poll.email ? ` as ${poll.email}` : ""}.`);
-      }
+      await saveCloudLogin(client, poll, token, options, "browser");
       return;
     }
     if (poll.pending === false) {
@@ -179,6 +168,48 @@ async function login(options: CloudCommandOptions): Promise<void> {
     }
   }
   throw new Error("Timed out waiting for cloud login.");
+}
+
+async function tryGithubCliLogin(client: CloudClient): Promise<LoginPollResponse | null> {
+  const gh = await runCommand("gh", ["auth", "token"], { allowFailure: true });
+  const token = gh.stdout.trim();
+  if (gh.code !== 0 || !token) {
+    return null;
+  }
+  return await client.request<LoginPollResponse>("/api/cli/login/github-token", {
+    method: "POST",
+    body: { token },
+  });
+}
+
+async function saveCloudLogin(
+  client: CloudClient,
+  login: LoginPollResponse,
+  token: string,
+  options: CloudCommandOptions,
+  source: string,
+): Promise<void> {
+  await saveCloudAuth({
+    version: 1,
+    token,
+    cloudUrl: client.baseUrl,
+    accountId: login.accountId,
+    email: login.email,
+    expiresAt: login.expiresAt ?? (login.expiresIn ? new Date(Date.now() + login.expiresIn * 1000).toISOString() : undefined),
+    updatedAt: nowIso(),
+  });
+  if (options.json) {
+    const result: Record<string, JsonValue> = { ok: true, cloudUrl: client.baseUrl, source };
+    if (login.email) {
+      result.email = login.email;
+    }
+    if (login.accountId) {
+      result.accountId = login.accountId;
+    }
+    printJson(result);
+  } else {
+    console.log(`Logged in to ${client.baseUrl}${login.email ? ` as ${login.email}` : ""} via ${source}.`);
+  }
 }
 
 async function launch(args: string[], options: CloudCommandOptions): Promise<void> {

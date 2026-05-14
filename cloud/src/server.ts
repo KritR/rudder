@@ -165,6 +165,10 @@ const server = http.createServer(async (req, res) => {
       await handleCliLoginStart(res);
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/cli/login/github-token") {
+      await handleCliGithubToken(req, res);
+      return;
+    }
     if (url.pathname === "/api/cli/login/poll") {
       await handleCliLoginPoll(req, res);
       return;
@@ -232,6 +236,30 @@ async function handleCliLoginPoll(req: IncomingMessage, res: ServerResponse): Pr
     responseBody.email = login.email;
   }
   sendJson(res, 200, responseBody);
+}
+
+async function handleCliGithubToken(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  const githubToken = stringField(body, "token");
+  if (!githubToken) {
+    throw badRequest("token is required");
+  }
+  const user = await githubUser(githubToken);
+  const rudderToken = `rdr_${randomBytes(32).toString("base64url")}`;
+  const now = new Date().toISOString();
+  insertToken.run({
+    tokenHash: tokenHash(rudderToken),
+    accountId: `github:${user.id}`,
+    email: user.email ?? `${user.login}@users.noreply.github.com`,
+    createdAt: now,
+    lastUsedAt: now,
+  });
+  sendJson(res, 200, {
+    token: rudderToken,
+    accountId: `github:${user.id}`,
+    email: user.email ?? `${user.login}@users.noreply.github.com`,
+    provider: "github",
+  });
 }
 
 function renderLoginPage(url: URL, res: ServerResponse): void {
@@ -422,7 +450,7 @@ async function createFlyMachine(params: {
   repoName?: string;
 }): Promise<FlyMachine> {
   ensureFlyConfigured();
-  return await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
+  const machine = await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
     method: "POST",
     body: {
       name: `rudder-${params.sailId}`,
@@ -450,6 +478,13 @@ async function createFlyMachine(params: {
       },
     },
   });
+  if (!machine.id) {
+    return machine;
+  }
+  return await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machine.id)}/start`,
+    { method: "POST", body: {} },
+  ).catch(() => machine);
 }
 
 async function mutateFlySail(sail: Sail, accountId: string, action: string): Promise<Sail> {
@@ -584,6 +619,32 @@ async function flyRequest<T>(pathname: string, init: { method: string; body?: Js
     throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `Fly API ${response.status}`);
   }
   return parsed as T;
+}
+
+async function githubUser(token: string): Promise<{ id: number | string; login: string; email?: string }> {
+  const response = await fetch("https://api.github.com/user", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "rudder-cloud",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  const text = await response.text();
+  const parsed = text ? parseJson(text) : null;
+  if (!response.ok) {
+    throw unauthorized();
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw unauthorized();
+  }
+  const id = typeof parsed.id === "number" || typeof parsed.id === "string" ? parsed.id : undefined;
+  const login = typeof parsed.login === "string" ? parsed.login : undefined;
+  const email = typeof parsed.email === "string" ? parsed.email : undefined;
+  if (!id || !login) {
+    throw unauthorized();
+  }
+  return { id, login, email };
 }
 
 function listAccountSails(accountId: string): Sail[] {
