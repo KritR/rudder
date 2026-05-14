@@ -33,7 +33,7 @@ import {
   processAlive,
   removeWorktree,
 } from "./git.js";
-import { ensureDir, isTty, newRunId, nowIso, pathExists, shortenHome } from "./util.js";
+import { ensureDir, isTty, newRunId, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
 import { createAgentPane, killPane, respawnPane, selectPane } from "./tmux.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
@@ -553,14 +553,49 @@ export async function writeAgentContext(repoRoot: string): Promise<void> {
     ...runs.slice(0, 12).map((run) => formatAgentContextRun(run)),
     "",
   ];
-  await ensureDir(path.dirname(agentContextPath(repoRoot)));
-  await fsp.writeFile(agentContextPath(repoRoot), `${lines.join("\n")}\n`, "utf8");
+  await writeRudderContextFiles(repoRoot, active, `${lines.join("\n")}\n`);
 }
 
 function formatAgentContextRun(run: RunRecord): string {
   const location = run.worktree.enabled ? `worktree=${shortenHome(run.worktree.path)}` : "current checkout";
   const prompt = run.currentPrompt && run.currentPrompt !== run.task ? ` current="${run.currentPrompt.slice(0, 140)}"` : "";
   return `- ${run.id}: ${run.status}, ${run.backend}, ${location}, task="${run.task.slice(0, 140)}"${prompt}`;
+}
+
+async function writeRudderContextFiles(repoRoot: string, activeRuns: RunRecord[], content: string): Promise<void> {
+  await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
+  const workspaces = new Set([
+    repoRoot,
+    ...activeRuns.map((run) => run.worktree.path),
+  ]);
+  for (const workspace of workspaces) {
+    await ensureRudderExcluded(workspace);
+    await ensureDir(path.dirname(agentContextPath(workspace)));
+    await fsp.writeFile(agentContextPath(workspace), content, "utf8");
+  }
+}
+
+async function ensureRudderExcluded(workspace: string): Promise<void> {
+  const result = await runCommand("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: workspace,
+    allowFailure: true,
+  });
+  const excludePath = result.stdout.trim();
+  if (!excludePath) {
+    return;
+  }
+  await ensureLine(path.resolve(workspace, excludePath), "RUDDER.md");
+}
+
+async function ensureLine(filePath: string, line: string): Promise<void> {
+  const existing = await fsp.readFile(filePath, "utf8").catch(() => "");
+  const lines = existing.split(/\r?\n/).map((item) => item.trim());
+  if (lines.includes(line)) {
+    return;
+  }
+  const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
+  await ensureDir(path.dirname(filePath));
+  await fsp.appendFile(filePath, `${prefix}${line}\n`, "utf8");
 }
 
 function delay(ms: number): Promise<void> {

@@ -45,7 +45,7 @@ export function outputPath(repoRoot: string, runId: string): string {
 }
 
 export function agentContextPath(repoRoot: string): string {
-  return path.join(projectStateDir(repoRoot), "agent-context.md");
+  return path.join(repoRoot, "RUDDER.md");
 }
 
 export function specPath(repoRoot: string, runId: string): string {

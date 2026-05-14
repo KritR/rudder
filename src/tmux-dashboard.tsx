@@ -186,11 +186,13 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
       <Text>agents <Text color="gray">{runs.length} runs</Text></Text>
       {visibleRuns.length === 0 ? <Text color="gray">No agents yet.</Text> : visibleRuns.map((run) => (
         <Box key={run.id} flexDirection="column">
-          <Text color={run.id === selectedRun?.id ? "cyan" : undefined}>
+          <Text color={run.id === selectedRun?.id ? "cyan" : taskColor(run)}>
             {run.id === selectedRun?.id ? "> " : "  "}{summarize(run.task, width - 3)}
           </Text>
-          <Text color={statusColor(run)}>
-            {"  "}{statusMark(run)} {completionPercent(run)}%  {run.backend} {modelLabel(run, config)}
+          <Text>
+            <Text color={statusColor(run)}>  {statusMark(run)}</Text>
+            <Text color="gray">  {run.backend} </Text>
+            <Text color="magenta">{modelLabel(run, config)}</Text>
           </Text>
         </Box>
       ))}
@@ -316,7 +318,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     }
     if (task === "/help") {
       setTaskInput("");
-      setNotice("/backend claude|codex, /model <id>, /clear, /detach");
+      setNotice("/backend claude|codex, /model, /model <id>, /clear, /detach");
       return;
     }
     if (task === "/detach") {
@@ -470,9 +472,10 @@ function CommandMenu({ commands, selected }: { commands: SlashCommand[]; selecte
 function ModelMenu({ options, selected, backend }: { options: ModelOption[]; selected: number; backend: NativeBackendId }): React.ReactElement {
   const start = Math.max(0, Math.min(selected - 2, Math.max(0, options.length - 7)));
   const visible = options.slice(start, start + 7);
+  const otherBackend = backend === "claude" ? "codex" : "claude";
   return (
     <Box flexDirection="column">
-      <Text color="gray">Pick a {backend} model. Enter selects, Esc cancels.</Text>
+      <Text color="gray">Pick a {backend} model. Use /backend {otherBackend} for {otherBackend} models.</Text>
       {visible.map((option, index) => {
         const absoluteIndex = start + index;
         return (
@@ -506,18 +509,15 @@ function statusColor(run: RunRecord): string {
   if (run.status === "merged" || run.status === "completed") return "green";
   if (run.status === "failed" || run.status === "merge-conflict") return "red";
   if (run.status === "cancelled") return "yellow";
-  if (run.status === "running" || run.status === "steering" || run.status === "verifying") return "cyan";
+  if (run.status === "running" || run.status === "steering" || run.status === "verifying") return "yellow";
   return "gray";
 }
 
-function completionPercent(run: RunRecord): number {
-  if (run.status === "merged") return 100;
-  if (run.status === "completed") return 95;
-  if (run.status === "failed" || run.status === "merge-conflict" || run.status === "cancelled") return 50;
-  if (run.status === "verifying") return 85;
-  if (run.status === "steering") return 75;
-  if (run.status === "running") return 60;
-  return 10;
+function taskColor(run: RunRecord): string | undefined {
+  if (run.status === "merged" || run.status === "completed") return "green";
+  if (run.status === "running" || run.status === "steering" || run.status === "verifying") return "yellow";
+  if (run.status === "failed" || run.status === "merge-conflict") return "red";
+  return undefined;
 }
 
 function modelLabel(run: RunRecord, config: RudderConfig | null): string {

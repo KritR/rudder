@@ -25,7 +25,7 @@ export async function createSpec(run: RunRecord): Promise<SpecContract> {
   if (await pathExists(contextFile)) {
     const content = await fsp.readFile(contextFile, "utf8");
     instructionsFiles.push({
-      path: ".rudder/agent-context.md",
+      path: "RUDDER.md",
       content: content.slice(0, 12_000),
     });
   }
@@ -66,6 +66,7 @@ export function renderContract(spec: SpecContract): string {
       : "Suggested verification: choose the smallest relevant checks for this repo.",
     "",
     "Working rules:",
+    "- Read RUDDER.md first if it exists; it lists other active Rudder agents and their worktrees.",
     "- Keep changes focused on the task.",
     "- Preserve unrelated user changes.",
     "- Run relevant checks when practical and report any checks that could not be run.",

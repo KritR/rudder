@@ -156,9 +156,14 @@ resolve.
 Each run gets a lightweight Rudder contract with:
 
 - repository instructions from `AGENTS.md`, `CLAUDE.md`, and `README.md`
-- active-agent context from `.rudder/agent-context.md`
+- active-agent context from `RUDDER.md`
 - acceptance criteria for the task
 - suggested verification commands
+
+Before a task starts, Rudder writes `RUDDER.md` into the checkout and adds it to
+`.gitignore` once. The file lists active agents, their worktrees, and what they
+are working on, so new Claude Code or Codex workers can avoid stepping on the
+same work.
 
 For tmux-launched agents, the contract is injected into the native process at
 startup. The worker pane remains yours after the initial task, so you can keep

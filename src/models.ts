@@ -11,7 +11,7 @@ const MODEL_PICKER_LIMIT = 12;
 export type ModelOption = {
   label: string;
   value?: string;
-  detail: string;
+  detail?: string;
 };
 
 type CodexCache = {
@@ -52,7 +52,7 @@ export async function discoverModelOptions(
   backend: BackendId,
   configuredDefault?: string,
 ): Promise<ModelOption[]> {
-  const defaultDetail = configuredDefault ? `uses ${configuredDefault}` : "CLI default";
+  const defaultDetail = configuredDefault || "CLI default";
   const options: ModelOption[] = [{ label: "Default", value: undefined, detail: defaultDetail }];
   if (backend === "claude") {
     for (const option of claudeCodeAliasOptions()) {
@@ -76,7 +76,7 @@ export async function discoverModelOptions(
 }
 
 export function fallbackModelOptions(backend: BackendId, configuredDefault?: string): ModelOption[] {
-  const defaultDetail = configuredDefault ? `uses ${configuredDefault}` : "CLI default";
+  const defaultDetail = configuredDefault || "CLI default";
   if (backend === "claude") {
     return [
       { label: "Default", value: undefined, detail: defaultDetail },
@@ -85,8 +85,8 @@ export function fallbackModelOptions(backend: BackendId, configuredDefault?: str
   }
   return [
     { label: "Default", value: undefined, detail: defaultDetail },
-    { label: "gpt-5.5", value: "gpt-5.5", detail: "Codex model" },
-    { label: "gpt-5.4-codex", value: "gpt-5.4-codex", detail: "Codex model" },
+    { label: "gpt-5.5", value: "gpt-5.5" },
+    { label: "gpt-5.4-codex", value: "gpt-5.4-codex" },
   ];
 }
 
@@ -216,11 +216,11 @@ function isUsableTextModel(id: string, model: ModelsDevModel): boolean {
 
 function claudeCodeAliasOptions(): ModelOption[] {
   return [
-    { label: "sonnet", value: "sonnet", detail: "Claude Code alias" },
-    { label: "sonnet[1m]", value: "sonnet[1m]", detail: "Claude Code alias" },
-    { label: "opus", value: "opus", detail: "Claude Code alias" },
-    { label: "opus[1m]", value: "opus[1m]", detail: "Claude Code alias" },
-    { label: "haiku", value: "haiku", detail: "Claude Code alias" },
+    { label: "sonnet", value: "sonnet" },
+    { label: "sonnet[1m]", value: "sonnet[1m]" },
+    { label: "opus", value: "opus" },
+    { label: "opus[1m]", value: "opus[1m]" },
+    { label: "haiku", value: "haiku" },
   ];
 }
 
