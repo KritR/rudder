@@ -6,13 +6,13 @@
     <title>Rudder</title>
     <meta
       name="description"
-      content="Rudder is the terminal OS for running Claude Code and Codex agents in isolated worktrees."
+      content="Rudder is the terminal OS for running Claude Code and Codex agents in isolated worktrees, with Rudder Cloud for remote worker runs."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="The terminal OS for running Claude Code and Codex agents side by side without letting them fight over the same checkout."
+      content="The terminal OS for running Claude Code and Codex agents side by side, locally or through Rudder Cloud."
     />
     <meta name="theme-color" content="#ffffff" />
     <style>
@@ -169,6 +169,14 @@
         box-shadow: 12px 12px 0 #111;
       }
 
+      .screenshot {
+        display: block;
+        width: 100%;
+        border: 1px solid #111;
+        box-shadow: 12px 12px 0 #111;
+        background: #eef1f7;
+      }
+
       .pane {
         padding: 18px;
         border-color: #111;
@@ -280,6 +288,10 @@
         .worker {
           margin: 10px;
         }
+
+        .screenshot {
+          box-shadow: 8px 8px 0 #111;
+        }
       }
     </style>
   </head>
@@ -303,6 +315,7 @@
             Rudder is a native terminal workspace for Claude Code and Codex.
             Start tasks, watch real agent processes, keep every run isolated,
             review changes with Hunk, and merge completed work with one key.
+            Rudder Cloud lets runs keep going away from your laptop.
           </p>
           <div class="install">
             <code id="install-command">npm install -g @viraatdas/rudder@latest
@@ -324,43 +337,26 @@ rudder</code>
               <span>Each prompt runs in its own git worktree so parallel tasks do not collide.</span>
             </div>
             <div class="point">
-              <strong>Driven to completion</strong>
-              <span>When a worker exits with changes, Rudder waits briefly, then sends a focused verification follow-up so the task keeps moving toward done.</span>
+              <strong>Rudder Cloud</strong>
+              <span>Log in with rudder login, open /cloud or /sail in the dashboard, list cloud workers, and onload a worktree when a local run should continue remotely.</span>
+            </div>
+            <div class="point">
+              <strong>Local to cloud</strong>
+              <span>Cloud onload is built around the same worktree and merge flow: prepare isolated source state, run remotely, review locally, then merge intentionally.</span>
+            </div>
+            <div class="point">
+              <strong>No-secret safety</strong>
+              <span>Cloud snapshots include useful config paths, while filtering AWS credentials, .env files, SSH keys, Docker auth, kube config, and private keys.</span>
             </div>
             <div class="point">
               <strong>Hunk review built in</strong>
-              <span>Press v to open a light-mode Hunk review with multi-file navigation, mouse support, watch mode, untracked files, and agent notes.</span>
-            </div>
-            <div class="point">
-              <strong>Merge with one key</strong>
-              <span>When an agent is done, press m from the agent list to merge that worktree back into your branch.</span>
+              <span>Press v to open a light-mode Hunk review, then press m from the agent list to merge the completed worktree back into your branch.</span>
             </div>
           </div>
         </section>
 
-        <section class="terminal" aria-label="Rudder terminal layout mockup">
-          <div class="pane agents">
-            <div class="label">agents</div>
-            <div class="run active">› fix auth callback<br />  running  claude sonnet(xhigh)</div>
-            <div class="run muted">  add parser tests<br />  done  codex gpt-5.5(xhigh)</div>
-            <div class="merge-button">v review with Hunk</div>
-          </div>
-          <div class="pane worker">
-            <span class="focus">review</span>
-            <pre>hunk diff --watch
-
-files
-  src/auth/callback.ts
-  tests/auth-callback.test.ts
-
-@@ magic link redirect @@
-  return redirect(nextUrl)
-<span class="note">agent note: verified with npm test -- auth</span></pre>
-          </div>
-          <div class="pane task">
-            <pre><strong>TASK</strong> fix the redirect after magic link verification_
-Enter start   Tab focus pane   /model   claude sonnet</pre>
-          </div>
+        <section aria-label="Rudder dashboard screenshot">
+          <img class="screenshot" src="/rudder-dashboard.svg" alt="Rudder dashboard with agents on the left, a Codex worker on the right, and task input at the bottom." />
         </section>
       </main>
     </div>

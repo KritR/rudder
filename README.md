@@ -15,6 +15,12 @@ Rudder is a terminal command center for running local coding agents. It opens a
 native three-pane dashboard, creates an isolated git worktree for each task, and
 runs real Claude Code or Codex processes in the worker pane.
 
+![Rudder dashboard running Codex in a worker pane](site/rudder-dashboard.svg)
+
+Rudder Cloud is now scaffolded behind `/login`, `/cloud`, and `/sail`. It keeps
+the same local dashboard and worktree flow, with an optional cloud worker path
+for tasks that should continue away from your laptop.
+
 ## Install
 
 ```bash
@@ -65,6 +71,49 @@ does not require API keys when you already use Claude Code or Codex login.
 
 Config is written to `~/.rudder/config.json`. Mirrored auth metadata is written
 to `~/.rudder/auth-profiles.json`.
+
+## Rudder Cloud
+
+Rudder Cloud is the hosted worker mode for Rudder. The local app remains the
+control surface: you start in your repo, choose a task, and decide whether it
+should run locally or be handed to a cloud worker.
+
+```bash
+rudder login
+rudder cloud list
+rudder cloud onload <runId>
+rudder cloud "fix the long-running migration"
+rudder sail "try the alternate parser"
+```
+
+Inside the dashboard, `/cloud` opens the cloud controls. `/sail` is a short
+alias for starting a cloud worker. `/cloud <name>` also starts a cloud worker
+for that task name.
+
+`rudder login` connects this machine to Rudder Cloud through the browser. The
+control plane uses Better Auth with Google and GitHub providers. It is separate
+from Claude Code and Codex login: provider auth still belongs to the official
+CLIs unless you explicitly configure otherwise.
+
+`rudder cloud list` will show cloud-capable runs and remote workers. `rudder
+cloud onload <runId>` will move a local run to the cloud so it can continue from
+the same task context.
+
+Cloud onload is designed around Rudder's existing worktree model. If a task is
+already in a worktree, that worktree is the unit Rudder prepares for the cloud.
+If a task is still in the main checkout, Rudder prepares a worktree first so the
+cloud run does not mutate your local branch directly. Completed cloud work comes
+back through the same review and merge path as local work.
+
+Rudder includes selected HOME config paths in the launch snapshot so cloud
+workers can behave like your local environment where that is useful: Claude,
+Codex, GitHub CLI, git config, npm, Vercel, and Hunk config are considered. It
+filters obvious high-risk material such as AWS credentials, `.env` files, SSH
+keys, Docker auth, kube config, and private key directories.
+
+The cloud control plane code lives in `cloud/`. It uses Better Auth for
+Google/GitHub login and is designed to deploy as a separate AWS container
+service, so the local CLI package stays small.
 
 ## Dashboard
 

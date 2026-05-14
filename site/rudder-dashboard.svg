@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2440 1260" role="img" aria-labelledby="title desc">
+  <title id="title">Rudder dashboard running Codex in a worker pane</title>
+  <desc id="desc">A light terminal dashboard with an agents pane, a focused worker pane, and a task input pane.</desc>
+  <rect width="2440" height="1210" rx="18" fill="#eef1f7"/>
+  <rect x="8" y="8" width="2424" height="1194" rx="16" fill="#eef1f7" stroke="#a4a9b8" stroke-width="2"/>
+
+  <g font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="22" fill="#52586e">
+    <rect x="8" y="26" width="334" height="1114" fill="none" stroke="#39ff14" stroke-width="3"/>
+    <rect x="15" y="22" width="84" height="25" fill="#39ff14"/>
+    <text x="22" y="42" font-size="20" fill="#1d2438" font-weight="700">agents</text>
+    <text x="16" y="72" font-weight="700" fill="#364054">rudder</text>
+    <text x="16" y="103">/Users/viraat/Documents/LexNet main</text>
+    <text x="16" y="134">agents <tspan fill="#39ff14" font-weight="700">2</tspan> runs</text>
+
+    <text x="16" y="190" fill="#a6adbd">j/k move</text>
+    <text x="16" y="220" fill="#a6adbd">Enter focus</text>
+    <text x="16" y="250" fill="#a6adbd">r restart</text>
+    <text x="16" y="280" fill="#a6adbd">v review</text>
+    <text x="16" y="310" fill="#a6adbd">m merge</text>
+    <text x="16" y="340" fill="#a6adbd">dd delete</text>
+
+    <text x="16" y="402" fill="#18a8a8" font-weight="700">&gt;</text>
+    <text x="44" y="402" fill="#4f5568" font-weight="700">say hi to the world!</text>
+    <text x="36" y="432" fill="#ff9f1a" font-weight="700">running</text>
+    <text x="150" y="432" fill="#aab1c0">codex</text>
+    <text x="232" y="432" fill="#ff59d4">gpt-5.5(xhigh)</text>
+
+    <text x="44" y="464" fill="#4f5568" font-weight="700">edit the readme file</text>
+    <text x="36" y="494" fill="#ff9f1a" font-weight="700">running</text>
+    <text x="150" y="494" fill="#aab1c0">codex</text>
+    <text x="232" y="494" fill="#ff59d4">gpt-5.5(xhigh)</text>
+  </g>
+
+  <g font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="20" fill="#52586e">
+    <rect x="366" y="28" width="2058" height="1112" fill="none" stroke="#777d8e" stroke-width="2"/>
+    <rect x="382" y="20" width="110" height="28" fill="#eef1f7"/>
+    <text x="390" y="42" fill="#a9afbf">worker</text>
+    <text x="2390" y="25" fill="#a9afbf">...</text>
+
+    <text x="389" y="82" fill="#474d62" font-weight="700">Tip:</text>
+    <text x="440" y="82">New For a limited time, Codex is included in your plan for free - let's build together.</text>
+
+    <text x="389" y="150">&gt; [RUDDER PROMPT]</text>
+    <text x="389" y="178">Read RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo.</text>
+    <text x="389" y="206">If a Hunk review is open for this worktree, use hunk review commands to inspect and annotate the live review.</text>
+    <text x="389" y="234">[END PROMPT]</text>
+    <text x="389" y="285">say hi to the world!</text>
+
+    <text x="365" y="350" fill="#ff9f1a">△ 10 hooks need review before they can run. Open /hooks to review them.</text>
+    <text x="389" y="395">• I'll inspect the workspace first so I can make the smallest relevant change for the request.</text>
+
+    <text x="389" y="444">• <tspan font-weight="700">Explored</tspan></text>
+    <text x="410" y="474" fill="#20a8b8">└ List ls</text>
+    <text x="389" y="535" fill="#39c44a">•</text>
+    <text x="410" y="535">Ran <tspan fill="#7fa7ff">test -f RUDDER.md &amp;&amp; sed -n '1,220p' RUDDER.md || true</tspan></text>
+    <text x="430" y="565" fill="#a0a8ba">└ # RUDDER PROMPT CONTEXT</text>
+    <text x="430" y="608" fill="#a0a8ba">... +9 lines (ctrl + t to view transcript)</text>
+
+    <text x="389" y="660">• <tspan fill="#20a8b8">RUDDER.md</tspan> only contains coordination metadata for this worktree; checking the app layout now.</text>
+    <text x="389" y="718">• <tspan font-weight="700">Explored</tspan></text>
+    <text x="410" y="748" fill="#20a8b8">Read README.md</text>
+    <text x="410" y="778" fill="#20a8b8">List web</text>
+    <text x="410" y="808" fill="#20a8b8">List .</text>
+    <text x="410" y="838" fill="#20a8b8">List lexnet</text>
+    <text x="389" y="902">• Inspecting repository details <tspan fill="#a0a8ba">(27s · esc to interrupt)</tspan></text>
+    <text x="389" y="994" fill="#a0a8ba">&gt; Use /skills to list available skills</text>
+    <text x="389" y="1060" fill="#e7b447">gpt-5.5 xhigh fast · ~/Documents/.rudder-worktrees/lexnet/run-say-hi</text>
+  </g>
+
+  <g font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="22" fill="#52586e">
+    <rect x="6" y="1182" width="2428" height="2" fill="#8a91a2"/>
+    <rect x="8" y="1184" width="2424" height="50" fill="#eef1f7" stroke="#8a91a2" stroke-width="2"/>
+    <rect x="18" y="1176" width="62" height="24" fill="#eef1f7"/>
+    <text x="18" y="1196" fill="#8a91a2">task</text>
+    <text x="16" y="1220" fill="#a6adbd">Type a task or /model</text>
+    <text x="16" y="1248" fill="#a6adbd">Enter start Up/Down history Tab focus Alt-1/2/3 pane /model  codex gpt-5.5(xhigh)</text>
+  </g>
+</svg>
