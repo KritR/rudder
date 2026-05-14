@@ -124,6 +124,7 @@ export async function configureRudderSession(sessionName: string): Promise<void>
   await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour240"], true);
   await runTmux(["bind-key", "-T", "root", "Tab", "select-pane", "-t", ":.+"], true);
   await runTmux(["bind-key", "-T", "root", "BTab", "select-pane", "-t", ":.-"], true);
+  await runTmux(["bind-key", "-n", "C-c", "detach-client"], true);
 }
 
 export async function attachTmuxSession(sessionName: string): Promise<number> {

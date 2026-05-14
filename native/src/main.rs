@@ -282,6 +282,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return true;
+        }
+
         if self.handle_merge_prompt_key(key) {
             return false;
         }
@@ -323,19 +327,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-
-        let worker_has_terminal = self.focus == FocusPane::Worker
-            && self
-                .agents
-                .get(self.selected_agent)
-                .and_then(|run| run.terminal.as_ref())
-                .is_some();
-        if !worker_has_terminal
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('c')
-        {
-            return true;
         }
 
         match key.code {
@@ -1872,6 +1863,21 @@ mod app_tests {
         app.delete_selected_agent();
         assert!(app.agents.is_empty());
         assert!(app.delete_pending.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_exits_from_every_focus_pane() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut app = App::new();
+
+        app.focus = FocusPane::Agents;
+        assert!(app.handle_key(key));
+
+        app.focus = FocusPane::Worker;
+        assert!(app.handle_key(key));
+
+        app.focus = FocusPane::Task;
+        assert!(app.handle_key(key));
     }
 }
 

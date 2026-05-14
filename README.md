@@ -86,8 +86,9 @@ writes the current agent context to `RUDDER.md`, and starts the selected backend
 inside the worker pane.
 
 When the worker pane is focused, your keystrokes go directly to Claude Code or
-Codex. Their slash commands, cursor movement, copy/paste, interrupts, and
-terminal UI continue to work normally.
+Codex. Their slash commands, cursor movement, copy/paste, and terminal UI
+continue to work normally. `Ctrl-C` is reserved by Rudder and leaves the
+dashboard from any pane.
 
 ## Keys
 
@@ -99,6 +100,7 @@ terminal UI continue to work normally.
 | `Ctrl-G` | Toggle Rudder nav mode while focused inside a worker |
 | `PageUp` / `PageDown` | Scroll the focused worker pane by roughly one page |
 | `j` / `k` or arrows | Move through agents when the agents pane is focused |
+| `Ctrl-C` | Leave Rudder from any pane |
 | `/model` | Open the provider-first model picker |
 | `/help` | Show the short command hint |
 | `v` | Open the selected agent's Hunk review view |
