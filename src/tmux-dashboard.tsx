@@ -204,7 +204,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [backend, setBackend] = useState<NativeBackendId>(toNativeBackend(defaults.backend ?? "claude"));
   const [model, setModel] = useState<string | undefined>(defaults.model);
   const [input, setInput] = useState("");
-  const [notice, setNotice] = useState("Type a task. Tab moves focus between panes.");
+  const [notice, setNotice] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [commandIndex, setCommandIndex] = useState(0);
 
@@ -239,7 +239,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       return;
     }
     if (task === "/model") {
-      setNotice("Use /model <id>. Examples: sonnet, opus, gpt-5.5");
+      setNotice("Use /model <id>. Examples: sonnet, opus, gpt-5.5.");
       setInput("");
       return;
     }
@@ -248,7 +248,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setModel(nextModel);
       await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { model: nextModel });
       setInput("");
-      setNotice(nextModel ? `model ${nextModel}` : "model default");
+      setNotice("");
       return;
     }
     if (task === "/backend claude" || task === "/backend codex") {
@@ -257,12 +257,12 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setModel(undefined);
       await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { backend: nextBackend, model: undefined });
       setInput("");
-      setNotice(`backend ${nextBackend}`);
+      setNotice("");
       return;
     }
     if (task === "/clear") {
       setInput("");
-      setNotice("cleared");
+      setNotice("");
       return;
     }
     if (task === "/help") {
@@ -296,7 +296,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       });
       await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model });
       setInput("");
-      setNotice("started in worker pane");
+      setNotice("");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
@@ -320,7 +320,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       }
       if (key.escape) {
         setInput("");
-        setNotice("cancelled command");
+        setNotice("");
         return;
       }
     }
@@ -329,7 +329,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         const command = commandOptions[commandIndex];
         if (command?.complete) {
           setInput(command.complete);
-          setNotice(command.detail);
+          setNotice("");
           return;
         }
         if (command) {
@@ -363,7 +363,8 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     <Box flexDirection="column">
       <Text>
         <Text color="cyan" bold>TASK</Text> {input}<Text color="cyan">_</Text>
-        <Text color="gray">  {submitting ? "starting..." : notice}</Text>
+        {submitting ? <Text color="gray">  starting...</Text> : null}
+        {!submitting && notice ? <Text color="yellow">  {notice}</Text> : null}
       </Text>
       {commandMenuOpen ? (
         <CommandMenu commands={commandOptions} selected={commandIndex} />
@@ -391,27 +392,8 @@ function CommandMenu({ commands, selected }: { commands: SlashCommand[]; selecte
   );
 }
 
-function WorkerIdle({ defaults }: { defaults: PaneDefaults }): React.ReactElement {
-  const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
-  const [stateReady, setStateReady] = useState(false);
-
-  useEffect(() => {
-    const timer = setInterval(async () => {
-      const root = findRepoRoot();
-      setRepoRoot(root);
-      setStateReady(Boolean(await loadTmuxDashboardState(root, defaults.tmuxSessionName)));
-    }, 750);
-    return () => clearInterval(timer);
-  }, [defaults.tmuxSessionName]);
-
-  return (
-    <Box flexDirection="column">
-      <Text bold>worker</Text>
-      <Text color="gray">{shortenHome(repoRoot)}</Text>
-      <Text>{stateReady ? "Start a task in the bottom pane. Claude Code or Codex will run here." : "Preparing Rudder panes..."}</Text>
-      <Text color="gray">Tab cycles focus. Once the worker is focused, this pane is the native agent process.</Text>
-    </Box>
-  );
+function WorkerIdle(_props: { defaults: PaneDefaults }): React.ReactElement {
+  return <Box />;
 }
 
 function toNativeBackend(backend: BackendId): NativeBackendId {

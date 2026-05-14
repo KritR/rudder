@@ -57,7 +57,7 @@ export async function ensureTmuxDashboardSession(params: {
       "-t",
       agentPaneId,
       "-l",
-      "6",
+      "5",
       "-c",
       params.repoRoot,
       "-P",
