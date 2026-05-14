@@ -101,6 +101,20 @@ Better Auth with Google and GitHub providers once those OAuth clients are
 configured. It is separate from Claude Code and Codex login: provider auth still
 belongs to the official CLIs unless you explicitly configure otherwise.
 
+Cloud admins can attach existing OAuth clients without redeploying the control
+plane:
+
+```bash
+rudder cloud login
+rudder cloud setup-github <github-client-id>
+rudder cloud setup-google <google-client-id>
+```
+
+Both setup commands prompt for the client secret without echoing it and persist
+the provider credentials into Rudder Cloud's S3-backed state. For automation,
+use `RUDDER_GITHUB_CLIENT_ID`, `RUDDER_GITHUB_CLIENT_SECRET`,
+`RUDDER_GOOGLE_CLIENT_ID`, and `RUDDER_GOOGLE_CLIENT_SECRET`.
+
 `rudder cloud list` will show cloud-capable runs and remote workers. `rudder
 cloud onload <runId>` will move a local run to the cloud so it can continue from
 the same task context.
