@@ -112,7 +112,7 @@ export async function configureRudderSession(sessionName: string): Promise<void>
     "-t",
     sessionName,
     "pane-border-format",
-    "#{?pane_active,#[fg=black,bg=brightcyan,bold]  FOCUS #{pane_title}  #[default]#[fg=brightcyan,bold]══#[fg=brightmagenta,bold]════════#[fg=brightcyan,bold]════════,#[fg=colour244]  #{pane_title}  ───────────────}",
+    "#{?pane_active,#[fg=black,bg=brightcyan,bold]  ▶ FOCUS #{pane_title}  #[default]#[fg=brightcyan,bold]══#[fg=brightmagenta,bold]══════#[fg=brightyellow,bold]══════#[fg=brightcyan,bold]════,#[fg=colour244]  #{pane_title}  ───────────────}",
   ], true);
   await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=brightcyan,bold"], true);
   await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour245"], true);
