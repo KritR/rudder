@@ -98,6 +98,7 @@ dashboard from any pane.
 | `Tab` / `Shift+Tab` | Cycle focus across agents, worker, and task panes |
 | `Alt-1` / `Alt-2` / `Alt-3` | Focus agents, worker, or task directly |
 | `Ctrl-G` | Toggle Rudder nav mode while focused inside a worker |
+| `Shift+Enter` | Insert a new line in the focused worker prompt |
 | `PageUp` / `PageDown` | Scroll the focused worker pane by roughly one page |
 | `j` / `k` or arrows | Move through agents when the agents pane is focused |
 | `Ctrl-C` | Leave Rudder from any pane |
@@ -105,6 +106,7 @@ dashboard from any pane.
 | `/help` | Show the short command hint |
 | `v` | Toggle the selected agent's review view |
 | `Esc` | Leave the review view when it is focused |
+| `r` | Restart the selected stopped agent in its worktree |
 | `m` | Merge the selected completed worktree |
 | `M` | Merge all completed worktrees |
 | `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
@@ -160,6 +162,9 @@ The exact model and effort flags are omitted when set to `auto`.
 
 Every dashboard task runs in its own git worktree under
 `~/.rudder-worktrees/...`, so parallel agents do not edit the same checkout.
+Run records are saved under `.rudder/runs/`. If you exit Rudder, live worker
+processes stop, but the agents remain listed next time you open Rudder in the
+same repo. Select one and press `r` to restart it manually in the same worktree.
 
 Press `m` to merge the selected completed agent back into the original branch.
 Press `M` to merge all completed agents. Rudder asks for confirmation before

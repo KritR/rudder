@@ -36,15 +36,12 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const TICK_RATE: Duration = Duration::from_millis(50);
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
-const BACKGROUND_COLOR: Color = Color::White;
-const TEXT_COLOR: Color = Color::Rgb(24, 28, 39);
-const MUTED_COLOR: Color = Color::Rgb(100, 108, 128);
-const INACTIVE_COLOR: Color = Color::Rgb(166, 173, 190);
-const FOCUS_COLOR: Color = Color::Rgb(0, 176, 89);
-const MODEL_COLOR: Color = Color::Rgb(188, 75, 205);
-const RUNNING_COLOR: Color = Color::Rgb(178, 103, 0);
-const DONE_COLOR: Color = Color::Rgb(45, 128, 82);
-const FAILED_COLOR: Color = Color::Rgb(198, 36, 54);
+const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
+const INACTIVE_COLOR: Color = Color::DarkGray;
+const MODEL_COLOR: Color = Color::Magenta;
+const RUNNING_COLOR: Color = Color::Yellow;
+const DONE_COLOR: Color = Color::Gray;
+const FAILED_COLOR: Color = Color::Red;
 const MIN_WHEEL_SCROLL_ROWS: u16 = 6;
 const MAX_WHEEL_SCROLL_ROWS: u16 = 18;
 const TASK_HISTORY_LIMIT: usize = 100;
@@ -93,6 +90,14 @@ impl Backend {
             Self::Codex => "codex",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude" | "anthropic" => Some(Self::Claude),
+            "codex" | "openai" => Some(Self::Codex),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +137,7 @@ enum AgentStatus {
     Running,
     Done,
     Failed,
+    Stopped,
 }
 
 impl AgentStatus {
@@ -140,6 +146,7 @@ impl AgentStatus {
             Self::Running => "running",
             Self::Done => "done",
             Self::Failed => "failed",
+            Self::Stopped => "stopped",
         }
     }
 }
@@ -187,6 +194,7 @@ struct MergeConflictPrompt {
 
 struct AgentRun {
     id: String,
+    created_at: String,
     task: String,
     backend: Backend,
     model: String,
@@ -245,8 +253,11 @@ struct CliSelection {
 
 impl App {
     fn new() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .map(|path| repo_root(&path))
+            .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
+        let agents = load_persisted_agents(&cwd);
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
@@ -258,7 +269,7 @@ impl App {
             task_history: Vec::new(),
             task_history_index: None,
             task_history_draft: String::new(),
-            agents: Vec::new(),
+            agents,
             selected_agent: 0,
             backend: selection.backend,
             model: selection.model,
@@ -385,6 +396,7 @@ impl App {
                 self.focus = FocusPane::Task;
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
+            KeyCode::Char('r') => self.restart_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -408,6 +420,7 @@ impl App {
                 }
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
+            KeyCode::Char('r') => self.restart_selected_agent(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
             KeyCode::Char('d') => self.delete_selected_agent(),
@@ -445,8 +458,15 @@ impl App {
             return false;
         }
 
-        if key.code == KeyCode::Char('q') && self.selected_terminal_mut().is_none() {
-            return true;
+        if self.selected_terminal_mut().is_none() {
+            match key.code {
+                KeyCode::Char('r') => {
+                    self.restart_selected_agent();
+                    return false;
+                }
+                KeyCode::Char('q') => return true,
+                _ => {}
+            }
         }
 
         match key.code {
@@ -937,6 +957,7 @@ impl App {
 
         let mut run = AgentRun {
             id: worktree.id.clone(),
+            created_at: now_stamp(),
             task: input.clone(),
             backend,
             model,
@@ -974,7 +995,54 @@ impl App {
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
         self.focus = FocusPane::Worker;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
+    }
+
+    fn restart_selected_agent(&mut self) {
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        if run.terminal.is_some() && run.status == AgentStatus::Running {
+            self.notice = Some("selected agent is already running".to_string());
+            return;
+        }
+
+        let prompt = run.task.clone();
+        let command = agent_command(run.backend, &run.model, run.effort, &prompt);
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(run.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.completed_at = None;
+                run.last_output_at = Instant::now();
+                run.autosteered = false;
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.last_error = None;
+                self.focus = FocusPane::Worker;
+                self.worker_view = WorkerView::Terminal;
+                self.notice = Some(format!("restarted {}", short_task(&run.task)));
+                let _ = save_native_run_record(&self.cwd, run);
+                let _ = write_rudder_context(&self.cwd, &self.agents, None);
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("restart failed: {error}"));
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+        }
     }
 
     fn handle_command(&mut self, input: &str) -> bool {
@@ -1130,6 +1198,7 @@ impl App {
         }
 
         let run = self.agents.remove(self.selected_agent);
+        let _ = remove_native_run_record(&self.cwd, &run.id);
         let worktree_error = run.worktree_path.as_ref().and_then(|path| {
             let output = Command::new("git")
                 .args(["worktree", "remove", "--force"])
@@ -1320,6 +1389,7 @@ impl App {
 
         let mut run = AgentRun {
             id,
+            created_at: now_stamp(),
             task: "Resolve merge conflicts".to_string(),
             backend: self.backend,
             model: self.model.clone(),
@@ -1349,6 +1419,9 @@ impl App {
                 self.selected_agent = self.agents.len().saturating_sub(1);
                 self.focus = FocusPane::Worker;
                 self.notice = Some("started AI merge-conflict resolver".to_string());
+                if let Some(run) = self.agents.get(self.selected_agent) {
+                    let _ = save_native_run_record(&self.cwd, run);
+                }
                 let _ = write_rudder_context(&self.cwd, &self.agents, None);
             }
             Err(error) => {
@@ -1365,7 +1438,7 @@ impl App {
             prompt.conflicted_files.join("\n")
         };
         Some(format!(
-            "Read RUDDER.md first. A git merge for this Rudder task stopped with conflicts:\n\n{}\n\nConflicted files:\n{}\n\nGit reported:\n{}\n\nResolve the merge conflicts in this checkout. Inspect git status and the conflicted files, keep the intended changes from both sides where appropriate, run the relevant checks if possible, and tell me what you changed. Do not abort the merge unless resolving is impossible.",
+            "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first. A git merge for this Rudder task stopped with conflicts:\n\n{}\n\nConflicted files:\n{}\n\nGit reported:\n{}\n\nResolve the merge conflicts in this checkout. Inspect git status and the conflicted files, keep the intended changes from both sides where appropriate, run the relevant checks if possible, and tell me what you changed. Do not abort the merge unless resolving is impossible.\n[END RUDDER PROMPT INJECTION]",
             prompt.task, files, prompt.error
         ))
     }
@@ -1398,12 +1471,15 @@ impl App {
         if let Some(run) = self.agents.get_mut(index) {
             run.worktree_path = None;
             run.worktree_branch = None;
+            let _ = save_native_run_record(&self.cwd, run);
         }
         Ok(())
     }
 
     fn poll_agents(&mut self) {
+        let repo_root = self.cwd.clone();
         for run in &mut self.agents {
+            let mut changed = false;
             let Some(terminal) = run.terminal.as_mut() else {
                 continue;
             };
@@ -1413,6 +1489,7 @@ impl App {
                 if run.status == AgentStatus::Done {
                     run.status = AgentStatus::Running;
                     run.completed_at = None;
+                    changed = true;
                 }
             }
             if run.status == AgentStatus::Running {
@@ -1438,12 +1515,14 @@ impl App {
                     Ok(Some(status)) => {
                         if status.success() {
                             mark_run_done(run);
+                            changed = true;
                         } else {
                             run.status = AgentStatus::Failed;
                             run.completed_at = Some(Instant::now());
                             run.needs_permission = false;
                             run.permission_notified = false;
                             play_completion_sound();
+                            changed = true;
                         };
                     }
                     Ok(None) => {
@@ -1453,6 +1532,7 @@ impl App {
                             })
                         {
                             mark_run_done(run);
+                            changed = true;
                         }
                     }
                     Err(error) => {
@@ -1462,14 +1542,19 @@ impl App {
                         run.needs_permission = false;
                         run.permission_notified = false;
                         play_completion_sound();
+                        changed = true;
                     }
                 }
             } else {
                 run.needs_permission = false;
                 run.permission_notified = false;
             }
+            if changed {
+                let _ = save_native_run_record(&repo_root, run);
+            }
         }
 
+        let repo_root = self.cwd.clone();
         for run in &mut self.agents {
             if run.status != AgentStatus::Done || run.autosteered {
                 continue;
@@ -1482,7 +1567,7 @@ impl App {
             }
 
             let prompt = format!(
-                "Read RUDDER.md first. Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.",
+                "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first. Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.\n[END RUDDER PROMPT INJECTION]",
                 run.task
             );
             let command = agent_command(run.backend, &run.model, run.effort, &prompt);
@@ -1502,13 +1587,29 @@ impl App {
                     run.permission_notified = false;
                     run.last_error = None;
                     self.notice = Some(format!("auto-steering {}", short_task(&run.task)));
+                    let _ = save_native_run_record(&repo_root, run);
                 }
                 Err(error) => {
                     run.status = AgentStatus::Failed;
                     run.last_error = Some(error.to_string());
+                    let _ = save_native_run_record(&repo_root, run);
                 }
             }
         }
+    }
+
+    fn shutdown(&mut self) {
+        for run in &mut self.agents {
+            if run.terminal.is_some() && run.status == AgentStatus::Running {
+                run.terminal = None;
+                run.status = AgentStatus::Stopped;
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.completed_at = None;
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+        }
+        let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 }
 
@@ -1817,6 +1918,10 @@ mod app_tests {
             terminal_bytes_for_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty())),
             Some(b"\x1b[6~".to_vec())
         );
+        assert_eq!(
+            terminal_bytes_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(b"\x1b[13;2u".to_vec())
+        );
     }
 
     #[test]
@@ -1888,6 +1993,7 @@ mod app_tests {
         let mut app = App::new();
         app.agents.push(AgentRun {
             id: "run-1".to_string(),
+            created_at: now_stamp(),
             task: "test task".to_string(),
             backend: Backend::Claude,
             model: "sonnet".to_string(),
@@ -1998,6 +2104,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if app.handle_key(key) {
+                        app.shutdown();
                         break;
                     }
                 }
@@ -2015,7 +2122,6 @@ fn run(terminal: &mut Tui) -> Result<()> {
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(app_style()), area);
     let task_height = task_pane_height(app, area.width);
 
     let rows = Layout::default()
@@ -2092,6 +2198,7 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for hint in [
         "j/k move",
         "Enter focus",
+        "r restart",
         "v review",
         "m merge",
         "dd delete",
@@ -2263,7 +2370,21 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     }
 
     let Some(terminal) = run.terminal.as_mut() else {
-        return vec![Line::from("worker did not start")];
+        return vec![
+            Line::from(Span::styled(
+                format!("{}  {}", run.status.as_str(), short_task(&run.task)),
+                pane_text_style(true),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press r to restart this agent in its worktree.",
+                muted_style(true),
+            )),
+            Line::from(Span::styled(
+                run.cwd.display().to_string(),
+                muted_style(true),
+            )),
+        ];
     };
 
     let mut lines = terminal
@@ -2467,7 +2588,6 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
             .border_style(
                 Style::default()
                     .fg(FOCUS_COLOR)
-                    .bg(BACKGROUND_COLOR)
                     .add_modifier(Modifier::BOLD),
             )
             .style(app_style()),
@@ -2538,7 +2658,6 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .border_style(
             Style::default()
                 .fg(border_color)
-                .bg(BACKGROUND_COLOR)
                 .add_modifier(Modifier::BOLD),
         )
         .style(app_style());
@@ -2565,19 +2684,18 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
     let border_style = if focused {
         Style::default()
             .fg(FOCUS_COLOR)
-            .bg(BACKGROUND_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
+        Style::default().fg(INACTIVE_COLOR)
     };
 
     let title_style = if focused {
         Style::default()
-            .fg(BACKGROUND_COLOR)
+            .fg(Color::Black)
             .bg(FOCUS_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        muted_style(true)
+        Style::default().fg(Color::Gray)
     };
     let _ = nav_mode;
 
@@ -2585,7 +2703,6 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
         .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(app_style())
 }
 
 fn task_input_lines(value: &str, cursor: usize, width: u16) -> Vec<String> {
@@ -2695,17 +2812,21 @@ fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, 
 
 fn pane_text_style(focused: bool) -> Style {
     if focused {
-        app_style()
+        Style::default()
     } else {
-        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
 fn muted_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(MUTED_COLOR).bg(BACKGROUND_COLOR)
+        Style::default().fg(Color::Gray)
     } else {
-        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -2713,29 +2834,31 @@ fn accent_style(focused: bool) -> Style {
     if focused {
         Style::default()
             .fg(FOCUS_COLOR)
-            .bg(BACKGROUND_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
 fn model_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(MODEL_COLOR).bg(BACKGROUND_COLOR)
+        Style::default().fg(MODEL_COLOR)
     } else {
-        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
 fn app_style() -> Style {
-    Style::default().fg(TEXT_COLOR).bg(BACKGROUND_COLOR)
+    Style::default()
 }
 
 fn error_style() -> Style {
     Style::default()
         .fg(FAILED_COLOR)
-        .bg(BACKGROUND_COLOR)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -2803,9 +2926,7 @@ fn page_scroll_rows(area: Option<Rect>) -> isize {
 }
 
 fn status_style(status: AgentStatus) -> Style {
-    Style::default()
-        .fg(status_color(status))
-        .bg(BACKGROUND_COLOR)
+    Style::default().fg(status_color(status))
 }
 
 fn agent_status_label(agent: &AgentRun) -> &'static str {
@@ -2820,7 +2941,6 @@ fn agent_status_style(agent: &AgentRun) -> Style {
     if agent.needs_permission {
         Style::default()
             .fg(RUNNING_COLOR)
-            .bg(BACKGROUND_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
         status_style(agent.status)
@@ -2832,6 +2952,7 @@ fn status_color(status: AgentStatus) -> Color {
         AgentStatus::Running => RUNNING_COLOR,
         AgentStatus::Done => DONE_COLOR,
         AgentStatus::Failed => FAILED_COLOR,
+        AgentStatus::Stopped => INACTIVE_COLOR,
     }
 }
 
@@ -3571,7 +3692,7 @@ fn agent_command(
     task: &str,
 ) -> TerminalCommand {
     let prompt = format!(
-        "Read RUDDER.md first if it exists. If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n\n{task}"
+        "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo. If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n[END RUDDER PROMPT INJECTION]\n\nUSER TASK:\n{task}"
     );
     match backend {
         Backend::Claude => {
@@ -3755,6 +3876,7 @@ fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
                 ch.to_string().into_bytes()
             }
         }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[13;2u".to_vec(),
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Backspace => {
             if key
@@ -3886,6 +4008,169 @@ fn current_branch() -> Option<String> {
     } else {
         Some(branch)
     }
+}
+
+fn native_runs_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".rudder").join("runs")
+}
+
+fn native_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
+    native_runs_dir(repo_root).join(run_id)
+}
+
+fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
+    let Ok(entries) = fs::read_dir(native_runs_dir(repo_root)) else {
+        return Vec::new();
+    };
+    let mut agents = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| fs::read_to_string(entry.path().join("run.json")).ok())
+        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter_map(|record| agent_from_run_record(repo_root, record))
+        .collect::<Vec<_>>();
+    agents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    agents
+}
+
+fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<AgentRun> {
+    let id = record.get("id")?.as_str()?.to_string();
+    let task = record.get("task")?.as_str()?.to_string();
+    let backend = record
+        .get("backend")
+        .and_then(|value| value.as_str())
+        .and_then(Backend::parse)
+        .unwrap_or(Backend::Claude);
+    let model = record
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| default_model_for(backend).to_string());
+    let effort = record
+        .get("effort")
+        .and_then(|value| value.as_str())
+        .and_then(EffortLevel::parse);
+    let status = agent_status_from_record(record.get("status").and_then(|value| value.as_str()));
+    let created_at = record
+        .get("createdAt")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(now_stamp);
+    let worktree = record.get("worktree");
+    let worktree_enabled = worktree
+        .and_then(|value| value.get("enabled"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let cwd = worktree
+        .and_then(|value| value.get("path"))
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    let worktree_branch = worktree
+        .and_then(|value| value.get("branch"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let worktree_path = worktree_enabled.then_some(cwd.clone());
+
+    Some(AgentRun {
+        id,
+        created_at,
+        task,
+        backend,
+        model,
+        effort,
+        status,
+        cwd,
+        worktree_branch,
+        worktree_path,
+        terminal: None,
+        terminal_size: None,
+        review_terminal: None,
+        review_size: None,
+        review_error: None,
+        last_output_at: Instant::now(),
+        completed_at: None,
+        autosteered: false,
+        needs_permission: false,
+        permission_notified: false,
+        last_error: None,
+    })
+}
+
+fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
+    match status {
+        Some("completed") | Some("merged") => AgentStatus::Done,
+        Some("failed") => AgentStatus::Failed,
+        Some("running") | Some("steering") | Some("verifying") | Some("created") => {
+            AgentStatus::Stopped
+        }
+        Some("cancelled") | Some("merge-conflict") => AgentStatus::Stopped,
+        _ => AgentStatus::Stopped,
+    }
+}
+
+fn run_record_status(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Running => "running",
+        AgentStatus::Done => "completed",
+        AgentStatus::Failed => "failed",
+        AgentStatus::Stopped => "cancelled",
+    }
+}
+
+fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
+    let run_dir = native_run_dir(repo_root, &run.id);
+    fs::create_dir_all(&run_dir)?;
+    let record_path = run_dir.join("run.json");
+    let target_branch = current_branch().unwrap_or_else(|| "HEAD".to_string());
+    let base_commit = git_output(repo_root, ["rev-parse", "HEAD"])
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let now = now_stamp();
+    let record = serde_json::json!({
+        "id": run.id,
+        "status": run_record_status(run.status),
+        "task": run.task,
+        "backend": run.backend.as_str(),
+        "model": run.model,
+        "effort": run.effort.map(|effort| effort.as_str()),
+        "createdAt": run.created_at,
+        "updatedAt": now,
+        "repoRoot": repo_root,
+        "targetBranch": target_branch,
+        "baseCommit": base_commit,
+        "worktree": {
+            "enabled": run.worktree_path.is_some(),
+            "path": run.cwd,
+            "branch": run.worktree_branch,
+        },
+        "currentPrompt": run.task,
+        "turns": [{ "ts": run.created_at, "prompt": run.task, "source": "user" }],
+        "lastUserInputAt": run.created_at,
+        "autoSteer": { "count": if run.autosteered { 1 } else { 0 }, "max": 2 },
+    });
+    let temp = record_path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    fs::write(
+        &temp,
+        format!("{}\n", serde_json::to_string_pretty(&record)?),
+    )?;
+    fs::rename(temp, record_path)?;
+    Ok(())
+}
+
+fn remove_native_run_record(repo_root: &Path, run_id: &str) -> Result<()> {
+    let dir = native_run_dir(repo_root, run_id);
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -4108,7 +4393,7 @@ fn write_rudder_context(
     pending: Option<&WorktreeInfo>,
 ) -> Result<()> {
     ensure_gitignore_contains(repo_root, "RUDDER.md")?;
-    let mut body = String::from("# Rudder Context\n\nActive local Rudder agents:\n");
+    let mut body = String::from("# RUDDER PROMPT INJECTION CONTEXT\n\nThis file is generated and prompt-injected by Rudder. It is not user-authored repo documentation. Use it to coordinate with other Rudder agents in this checkout.\n\n## Active local Rudder agents\n");
     if agents.is_empty() && pending.is_none() {
         body.push_str("- none\n");
     }
@@ -4133,7 +4418,7 @@ fn write_rudder_context(
         "\nRead this file before making changes so you know what other Rudder agents are doing.\n",
     );
     body.push_str(
-        "\nHunk review: Rudder opens `hunk diff --watch` in the review pane. If a live Hunk review is open, run `hunk skill path`, load that skill, then use `hunk session review --repo . --json` to inspect the review and `hunk session comment add/apply --repo .` to leave inline notes for the user.\n",
+        "\n## Rudder review integration\n\nRudder opens `hunk diff --watch` in the review pane when available. If a live Hunk review is open, run `hunk skill path`, load that skill, then use `hunk session review --repo . --json` to inspect the review and `hunk session comment add/apply --repo .` to leave inline notes for the user.\n",
     );
     fs::write(repo_root.join("RUDDER.md"), body.as_bytes())?;
     if let Some(worktree) = pending {
@@ -4222,6 +4507,14 @@ fn new_run_id(task: &str) -> String {
         .unwrap_or_default()
         .as_millis();
     format!("{millis}-{}-{}", slugify(task, "task"), std::process::id())
+}
+
+fn now_stamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
 }
 
 fn id_short(id: &str) -> String {

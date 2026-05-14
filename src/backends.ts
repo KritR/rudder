@@ -97,7 +97,7 @@ function codexBackend(): BackendAdapter {
         'model_reasoning_summary="detailed"',
         "-c",
         "model_supports_reasoning_summaries=true",
-        `${request.contract}\n\nUSER TASK:\n${request.prompt}`,
+        `${request.contract}\n\nEND RUDDER PROMPT INJECTION\n\nUSER TASK:\n${request.prompt}`,
       ]);
       return await spawnAndStream({
         command: "codex",
@@ -140,7 +140,7 @@ function acpxBackend(): BackendAdapter {
         "codex",
         "-s",
         sessionName,
-        `${request.contract}\n\nUSER TASK:\n${request.prompt}`,
+        `${request.contract}\n\nEND RUDDER PROMPT INJECTION\n\nUSER TASK:\n${request.prompt}`,
       ];
       return await spawnAndStream({
         command: "acpx",
