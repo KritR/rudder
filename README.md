@@ -86,6 +86,10 @@ rudder cloud "fix the long-running migration"
 rudder sail "try the alternate parser"
 ```
 
+By default the CLI points at the hosted Rudder Cloud control plane:
+`https://mpd2pmnpep.us-east-1.awsapprunner.com`. Set `RUDDER_CLOUD_URL` to
+override it for local development or another deployment.
+
 Inside the dashboard, `/cloud` opens the cloud controls. `/sail` is a short
 alias for starting a cloud worker. `/cloud <name>` also starts a cloud worker
 for that task name.

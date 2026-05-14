@@ -24,6 +24,12 @@ FLY_REGION=iad
 RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
 ```
 
+Current hosted control plane:
+
+```text
+https://mpd2pmnpep.us-east-1.awsapprunner.com
+```
+
 Current Exla defaults:
 
 ```bash

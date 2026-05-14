@@ -61,6 +61,10 @@ const flyWorkerCpus = Number(process.env.RUDDER_WORKER_CPUS || 1);
 const flyWorkerCpuKind = process.env.RUDDER_WORKER_CPU_KIND || "shared";
 const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 15 * 60 * 1000);
 const deviceLogins = new Map<string, DeviceLogin>();
+const configuredProviders = {
+  google: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+  github: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
+};
 
 await fs.mkdir(dataDir, { recursive: true });
 
@@ -136,16 +140,7 @@ const auth = betterAuth({
   baseURL,
   secret: requiredEnv("BETTER_AUTH_SECRET"),
   database,
-  socialProviders: {
-    google: {
-      clientId: requiredEnv("GOOGLE_CLIENT_ID"),
-      clientSecret: requiredEnv("GOOGLE_CLIENT_SECRET"),
-    },
-    github: {
-      clientId: requiredEnv("GITHUB_CLIENT_ID"),
-      clientSecret: requiredEnv("GITHUB_CLIENT_SECRET"),
-    },
-  },
+  socialProviders: socialProviders(),
 });
 
 const authHandler = toNodeHandler(auth.handler);
@@ -162,6 +157,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         s3: Boolean(snapshotBucket),
         fly: Boolean(flyApiToken && flyAppName && flyWorkerImage),
+        auth: configuredProviders,
       });
       return;
     }
@@ -241,12 +237,20 @@ async function handleCliLoginPoll(req: IncomingMessage, res: ServerResponse): Pr
 function renderLoginPage(url: URL, res: ServerResponse): void {
   const deviceCode = url.searchParams.get("device_code") || "";
   const callbackURL = `/cli/approve?device_code=${encodeURIComponent(deviceCode)}`;
+  const links = [
+    configuredProviders.google
+      ? `<a href="/api/auth/sign-in/social?provider=google&callbackURL=${encodeURIComponent(callbackURL)}">Continue with Google</a>`
+      : "",
+    configuredProviders.github
+      ? `<a href="/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}">Continue with GitHub</a>`
+      : "",
+  ].filter(Boolean).join("\n");
+  const body = links || "<p>No OAuth providers are configured yet.</p>";
   sendHtml(res, `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rudder Cloud Login</title>
 <style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111}a{display:block;margin:12px 0;color:#111}</style></head>
 <body><h1>Rudder Cloud</h1><p>Choose a provider to finish CLI login.</p>
-<a href="/api/auth/sign-in/social?provider=google&callbackURL=${encodeURIComponent(callbackURL)}">Continue with Google</a>
-<a href="/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}">Continue with GitHub</a>
+${body}
 </body></html>`);
 }
 
@@ -651,6 +655,27 @@ function requireWorkerBearer(req: IncomingMessage, sailRow: Record<string, unkno
   if (!token.startsWith("rdrw_") || !expected || tokenHash(token) !== expected) {
     throw unauthorized();
   }
+}
+
+function socialProviders(): JsonRecord {
+  const providers: JsonRecord = {};
+  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const githubClientId = process.env.GITHUB_CLIENT_ID;
+  const githubClientSecret = process.env.GITHUB_CLIENT_SECRET;
+  if (googleClientId && googleClientSecret) {
+    providers.google = {
+      clientId: googleClientId,
+      clientSecret: googleClientSecret,
+    };
+  }
+  if (githubClientId && githubClientSecret) {
+    providers.github = {
+      clientId: githubClientId,
+      clientSecret: githubClientSecret,
+    };
+  }
+  return providers;
 }
 
 function ensureColumn(table: string, column: string, definition: string): void {

@@ -59,6 +59,7 @@ type CloudClient = {
 
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_CLOUD_URL = "https://mpd2pmnpep.us-east-1.awsapprunner.com";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
 const DEFAULT_HOME_PATHS = [
   "~/.claude",
@@ -306,7 +307,7 @@ async function cloudClient(options: { requireToken: boolean }): Promise<CloudCli
 }
 
 function normalizeCloudUrl(raw: string | undefined): string {
-  const value = raw?.trim();
+  const value = raw?.trim() || DEFAULT_CLOUD_URL;
   if (!value) {
     throw new Error("RUDDER_CLOUD_URL is not configured. Set it to your Rudder Cloud control plane URL.");
   }
@@ -596,7 +597,7 @@ Usage:
   rudder sail resume <id>
 
 Environment:
-  RUDDER_CLOUD_URL              Cloud control plane URL
+  RUDDER_CLOUD_URL              Cloud control plane URL (defaults to ${DEFAULT_CLOUD_URL})
   RUDDER_CLOUD_HOME_PATHS       Extra comma-separated HOME paths to include in snapshots
 `);
 }

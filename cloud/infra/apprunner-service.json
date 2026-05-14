@@ -10,9 +10,10 @@
         "RuntimeEnvironmentVariables": {
           "NODE_ENV": "production",
           "PORT": "3000",
+          "BETTER_AUTH_URL": "https://mpd2pmnpep.us-east-1.awsapprunner.com",
           "AWS_REGION": "us-east-1",
           "RUDDER_S3_BUCKET": "rudder-cloud-snapshots-597088032164-us-east-1",
-          "RUDDER_CLOUD_DATA_DIR": "/data",
+          "RUDDER_CLOUD_DATA_DIR": "/tmp/rudder-cloud",
           "FLY_APP_NAME": "rudder-workers-exla",
           "FLY_REGION": "iad",
           "RUDDER_WORKER_IMAGE": "public.ecr.aws/exla/rudder-worker:latest",
@@ -28,7 +29,8 @@
   },
   "InstanceConfiguration": {
     "Cpu": "0.25 vCPU",
-    "Memory": "0.5 GB"
+    "Memory": "0.5 GB",
+    "InstanceRoleArn": "arn:aws:iam::597088032164:role/rudder-cloud-apprunner-instance-role"
   },
   "HealthCheckConfiguration": {
     "Protocol": "HTTP",
