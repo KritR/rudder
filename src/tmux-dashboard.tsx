@@ -44,7 +44,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
 export async function runTmuxAgentPane(defaults: PaneDefaults): Promise<void> {
   const instance = render(<AgentPane defaults={defaults} />, {
     exitOnCtrlC: false,
-    maxFps: 20,
+    maxFps: 5,
   });
   await instance.waitUntilExit();
 }
@@ -52,7 +52,7 @@ export async function runTmuxAgentPane(defaults: PaneDefaults): Promise<void> {
 export async function runTmuxTaskPane(defaults: PaneDefaults): Promise<void> {
   const instance = render(<TaskPane defaults={defaults} />, {
     exitOnCtrlC: false,
-    maxFps: 30,
+    maxFps: 10,
   });
   await instance.waitUntilExit();
 }
@@ -60,12 +60,13 @@ export async function runTmuxTaskPane(defaults: PaneDefaults): Promise<void> {
 export async function runTmuxWorkerIdle(defaults: PaneDefaults): Promise<void> {
   const instance = render(<WorkerIdle defaults={defaults} />, {
     exitOnCtrlC: false,
-    maxFps: 10,
+    maxFps: 1,
   });
   await instance.waitUntilExit();
 }
 
 function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement {
+  useHiddenCursor();
   const size = useWindowSize();
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [branch, setBranch] = useState("HEAD");
@@ -79,7 +80,6 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
-    await reconcileNativeTerminals(root).catch(() => undefined);
     const [nextBranch, nextConfig, nextRuns, state] = await Promise.all([
       currentBranch(root),
       loadConfig(),
@@ -107,8 +107,25 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 1000);
+    const timer = setInterval(() => void refresh(), 2000);
     return () => clearInterval(timer);
+  }, [refresh]);
+
+  useEffect(() => {
+    let stopped = false;
+    const reconcile = async () => {
+      if (stopped) {
+        return;
+      }
+      const root = findRepoRoot();
+      await reconcileNativeTerminals(root).catch(() => undefined);
+      await refresh();
+    };
+    const timer = setInterval(() => void reconcile(), 5000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -225,6 +242,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
 }
 
 function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement {
+  useHiddenCursor();
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [config, setConfig] = useState<RudderConfig | null>(null);
   const [backend, setBackend] = useState<NativeBackendId>(toNativeBackend(defaults.backend ?? "claude"));
@@ -279,7 +297,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 1500);
+    const timer = setInterval(() => void refresh(), 3000);
     return () => clearInterval(timer);
   }, [refresh]);
 
@@ -626,7 +644,17 @@ function EffortMenu({ option, selected, backend, options }: { option?: ModelOpti
 }
 
 function WorkerIdle(_props: { defaults: PaneDefaults }): React.ReactElement {
+  useHiddenCursor();
   return <Box />;
+}
+
+function useHiddenCursor(): void {
+  useEffect(() => {
+    process.stdout.write("\u001b[?25l");
+    return () => {
+      process.stdout.write("\u001b[?25h");
+    };
+  }, []);
 }
 
 function toNativeBackend(backend: BackendId): NativeBackendId {
