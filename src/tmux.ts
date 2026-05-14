@@ -33,6 +33,7 @@ export async function ensureTmuxDashboardSession(params: {
 }): Promise<void> {
   if (await tmuxSessionExists(params.sessionName) && await loadTmuxDashboardState(params.repoRoot, params.sessionName)) {
     await configureRudderSession(params.sessionName);
+    await normalizeTmuxDashboardLayout(params.repoRoot, params.sessionName);
     return;
   }
   if (await tmuxSessionExists(params.sessionName)) {
@@ -87,6 +88,7 @@ export async function ensureTmuxDashboardSession(params: {
   ).stdout.trim();
   const agentWidth = Math.max(28, Math.min(44, Math.floor(await windowWidth(params.sessionName) * 0.22)));
   await runTmux(["resize-pane", "-t", agentPaneId, "-x", String(agentWidth)], true);
+  await runTmux(["resize-pane", "-t", taskPaneId, "-y", "3"], true);
   await runTmux(["select-pane", "-t", workerPaneId, "-T", "worker"], true);
   await runTmux(["set-option", "-p", "-t", workerPaneId, "remain-on-exit", "on"], true);
   await saveTmuxDashboardState({
@@ -101,6 +103,17 @@ export async function ensureTmuxDashboardSession(params: {
     effort: params.effort,
   });
   await selectPane(taskPaneId || agentPaneId);
+}
+
+export async function normalizeTmuxDashboardLayout(repoRoot: string, sessionName: string): Promise<void> {
+  const state = await loadTmuxDashboardState(repoRoot, sessionName);
+  if (!state) {
+    return;
+  }
+  const width = await windowWidth(sessionName);
+  const agentWidth = Math.max(30, Math.min(46, Math.floor(width * 0.22)));
+  await runTmux(["resize-pane", "-t", state.agentPaneId, "-x", String(agentWidth)], true);
+  await runTmux(["resize-pane", "-t", state.taskPaneId, "-y", "3"], true);
 }
 
 export async function configureRudderSession(sessionName: string): Promise<void> {
@@ -158,7 +171,6 @@ export async function createAgentPane(params: {
     if (params.logPath) {
       await runTmux(["pipe-pane", "-o", "-t", paneId, `cat >> ${shellQuote(params.logPath)}`], true);
     }
-    await runTmux(["select-layout", "-t", `${params.sessionName}:0`, "tiled"], true);
     await selectPane(paneId);
   }
   return paneId;

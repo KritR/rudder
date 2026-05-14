@@ -34,7 +34,7 @@ import {
   removeWorktree,
 } from "./git.js";
 import { ensureDir, isTty, newRunId, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
-import { createAgentPane, killPane, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
+import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
 
@@ -224,6 +224,7 @@ export async function startNativeRun(params: {
     const title = `${backend}:${shortTask(params.task)}`;
     const paneId = params.workerPaneId;
     if (paneId) {
+      await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
       await respawnPane({
         paneId,
         cwd: worktreeInfo.path,
@@ -256,6 +257,7 @@ export async function startNativeRun(params: {
       data: { paneId: launchedPaneId, worktree: worktreeInfo.path },
     });
     await writeAgentContext(repoRoot);
+    await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
     if (params.focus !== false && launchedPaneId) {
       await selectPane(launchedPaneId);
     }
