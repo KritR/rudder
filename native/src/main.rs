@@ -1036,6 +1036,24 @@ mod app_tests {
         assert_eq!(editable, "fix the login bug");
         assert_eq!(cursor, 13);
     }
+
+    #[test]
+    fn command_hint_wraps_to_available_width() {
+        let lines = wrap_command_hint(
+            &["j/k move", "Enter focus", "v diff", "m merge", "d delete"],
+            22,
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "j/k move  Enter focus".to_string(),
+                "v diff  m merge".to_string(),
+                "d delete".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| line.len() <= 22));
+    }
 }
 
 fn main() -> Result<()> {
@@ -1217,10 +1235,15 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     lines.push(ListItem::new(Line::default()));
-    lines.push(ListItem::new(Line::from(Span::styled(
-        "j/k move  Enter focus  v diff  m merge",
-        muted_style(focused),
-    ))));
+    for hint in wrap_command_hint(
+        &["j/k move", "Enter focus", "v diff", "m merge", "d delete"],
+        block_inner(area).width,
+    ) {
+        lines.push(ListItem::new(Line::from(Span::styled(
+            hint,
+            muted_style(focused),
+        ))));
+    }
 
     frame.render_widget(
         List::new(lines).block(pane_block("agents", focused, app.nav_mode)),
@@ -1519,6 +1542,34 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
         )))
         .borders(Borders::ALL)
         .border_style(border_style)
+}
+
+fn wrap_command_hint(commands: &[&str], width: u16) -> Vec<String> {
+    let max_width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for command in commands {
+        if current.is_empty() {
+            current.push_str(command);
+            continue;
+        }
+
+        let next_len = current.len() + 2 + command.len();
+        if next_len <= max_width {
+            current.push_str("  ");
+            current.push_str(command);
+        } else {
+            lines.push(current);
+            current = (*command).to_string();
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
 }
 
 fn pane_text_style(focused: bool) -> Style {
