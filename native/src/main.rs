@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     hash::{Hash, Hasher},
     io::{self, Stdout},
@@ -11,7 +12,7 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -66,13 +67,6 @@ enum Backend {
 }
 
 impl Backend {
-    fn toggle(self) -> Self {
-        match self {
-            Self::Claude => Self::Codex,
-            Self::Codex => Self::Claude,
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -139,10 +133,7 @@ struct Suggestion {
 #[derive(Clone)]
 enum SuggestionAction {
     Insert(String),
-    SetBackend(Backend),
-    SetModel(String),
-    ClearRuns,
-    ShowHelp,
+    SetModel { backend: Backend, model: String },
 }
 
 impl App {
@@ -270,7 +261,7 @@ impl App {
             KeyCode::Char('/') if self.task_input.is_empty() => {
                 self.task_input.push('/');
                 self.picker_index = 0;
-                self.notice = Some("pick a command".to_string());
+                self.notice = Some("type /model".to_string());
             }
             KeyCode::Char(ch) => {
                 self.task_input.push(ch);
@@ -317,30 +308,12 @@ impl App {
                 self.task_input = value;
                 self.picker_index = 0;
             }
-            SuggestionAction::SetBackend(backend) => {
+            SuggestionAction::SetModel { backend, model } => {
                 self.backend = backend;
-                self.model = default_model_for(backend).to_string();
-                self.task_input.clear();
-                self.picker_index = 0;
-                self.notice = Some(format!("backend {}", backend.as_str()));
-            }
-            SuggestionAction::SetModel(model) => {
                 self.model = model;
                 self.task_input.clear();
                 self.picker_index = 0;
-                self.notice = Some(format!("model {}", self.model));
-            }
-            SuggestionAction::ClearRuns => {
-                self.agents.clear();
-                self.selected_agent = 0;
-                self.task_input.clear();
-                self.picker_index = 0;
-                self.notice = Some("cleared local dashboard runs".to_string());
-            }
-            SuggestionAction::ShowHelp => {
-                self.task_input.clear();
-                self.picker_index = 0;
-                self.notice = Some("Tab focus  Enter select/start  /model  /backend".to_string());
+                self.notice = Some(format!("{} {}", self.backend.as_str(), self.model));
             }
         }
     }
@@ -439,35 +412,15 @@ impl App {
     fn handle_command(&mut self, input: &str) -> bool {
         let mut parts = input.split_whitespace();
         match parts.next() {
-            Some("/clear") => {
-                self.agents.clear();
-                self.selected_agent = 0;
-                self.notice = Some("cleared local dashboard runs".to_string());
-                true
-            }
-            Some("/backend") => {
-                match parts.next() {
-                    Some("claude") => self.backend = Backend::Claude,
-                    Some("codex") => self.backend = Backend::Codex,
-                    _ => self.backend = self.backend.toggle(),
-                }
-                self.model = default_model_for(self.backend).to_string();
-                self.notice = Some(format!("backend {}", self.backend.as_str()));
-                true
-            }
             Some("/model") => {
                 let model = parts.collect::<Vec<_>>().join(" ");
                 if model.is_empty() {
                     self.notice = Some("usage: /model <model-id-or-alias>".to_string());
                 } else {
+                    self.backend = backend_for_model(&model);
                     self.model = model;
-                    self.notice = Some(format!("model {}", self.model));
+                    self.notice = Some(format!("{} {}", self.backend.as_str(), self.model));
                 }
-                true
-            }
-            Some("/help") => {
-                self.notice =
-                    Some("Tab focus pane, Enter start/focus, /backend, /model, /clear".to_string());
                 true
             }
             _ => false,
@@ -674,11 +627,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
 
         if event::poll(TICK_RATE)? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if app.handle_key(key) {
                         break;
                     }
                 }
+                Event::Key(_) => {}
                 Event::Paste(text) => app.handle_paste(text),
                 _ => {}
             }
@@ -885,7 +839,7 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let input = if app.task_input.is_empty() {
         Line::from(Span::styled(
-            "Type a task or /help",
+            "Type a task or /model",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
@@ -895,7 +849,7 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let hint = app
         .notice
         .as_deref()
-        .unwrap_or("Enter start  Tab focus pane  / commands");
+        .unwrap_or("Enter start  Tab focus pane  /model");
     let paragraph = Paragraph::new(vec![
         input,
         Line::from(vec![
@@ -1110,7 +1064,7 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        return model_suggestions(app.backend)
+        return model_suggestions()
             .into_iter()
             .filter(|suggestion| {
                 query.is_empty()
@@ -1118,29 +1072,6 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
                     || suggestion.detail.to_ascii_lowercase().contains(&query)
             })
             .collect();
-    }
-
-    if input.starts_with("/backend") {
-        let query = input
-            .strip_prefix("/backend")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        return vec![
-            Suggestion {
-                label: "claude".to_string(),
-                detail: "switch backend".to_string(),
-                action: SuggestionAction::SetBackend(Backend::Claude),
-            },
-            Suggestion {
-                label: "codex".to_string(),
-                detail: "switch backend".to_string(),
-                action: SuggestionAction::SetBackend(Backend::Codex),
-            },
-        ]
-        .into_iter()
-        .filter(|suggestion| query.is_empty() || suggestion.label.starts_with(&query))
-        .collect();
     }
 
     let query = input.trim_start_matches('/').to_ascii_lowercase();
@@ -1155,57 +1086,189 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
 }
 
 fn command_suggestions() -> Vec<Suggestion> {
+    vec![Suggestion {
+        label: "/model".to_string(),
+        detail: "pick Claude or Codex model".to_string(),
+        action: SuggestionAction::Insert("/model ".to_string()),
+    }]
+}
+
+fn model_suggestions() -> Vec<Suggestion> {
+    let mut seen = HashSet::new();
+    let mut suggestions = Vec::new();
+
+    for (backend, model, detail) in fallback_model_rows() {
+        push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
+    }
+    for (backend, model, detail) in cached_models_dev_rows() {
+        push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
+    }
+
+    suggestions
+}
+
+fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)> {
     vec![
-        Suggestion {
-            label: "/model".to_string(),
-            detail: "pick model for active backend".to_string(),
-            action: SuggestionAction::Insert("/model ".to_string()),
-        },
-        Suggestion {
-            label: "/backend".to_string(),
-            detail: "switch claude/codex".to_string(),
-            action: SuggestionAction::Insert("/backend ".to_string()),
-        },
-        Suggestion {
-            label: "/clear".to_string(),
-            detail: "clear local dashboard runs".to_string(),
-            action: SuggestionAction::ClearRuns,
-        },
-        Suggestion {
-            label: "/help".to_string(),
-            detail: "show shortcuts".to_string(),
-            action: SuggestionAction::ShowHelp,
-        },
+        (Backend::Claude, "sonnet", "Claude"),
+        (Backend::Claude, "sonnet[1m]", "Claude large context"),
+        (Backend::Claude, "opus", "Claude"),
+        (Backend::Claude, "opus[1m]", "Claude large context"),
+        (Backend::Claude, "haiku", "Claude"),
+        (Backend::Claude, "claude-sonnet-4-6", "Claude explicit id"),
+        (Backend::Codex, "gpt-5.5", "Codex"),
+        (Backend::Codex, "gpt-5.4-codex", "Codex"),
+        (Backend::Codex, "gpt-5.4", "Codex"),
+        (Backend::Codex, "gpt-5.3-codex", "Codex"),
+        (Backend::Codex, "gpt-5.3-codex-spark", "Codex fast"),
     ]
 }
 
-fn model_suggestions(backend: Backend) -> Vec<Suggestion> {
-    let models: &[(&str, &str)] = match backend {
-        Backend::Claude => &[
-            ("sonnet", "fast default"),
-            ("sonnet[1m]", "large context"),
-            ("opus", "stronger reasoning"),
-            ("opus[1m]", "large context"),
-            ("haiku", "small and fast"),
-            ("claude-sonnet-4-6", "explicit id"),
-        ],
-        Backend::Codex => &[
-            ("gpt-5.5", "default"),
-            ("gpt-5.4-codex", "coding tuned"),
-            ("gpt-5.4", "general"),
-            ("gpt-5.3-codex", "coding tuned"),
-            ("gpt-5.3-codex-spark", "fast coding"),
-        ],
+fn push_model_suggestion(
+    suggestions: &mut Vec<Suggestion>,
+    seen: &mut HashSet<String>,
+    backend: Backend,
+    model: &str,
+    detail: &str,
+) {
+    let key = format!("{}:{model}", backend.as_str());
+    if !seen.insert(key) {
+        return;
+    }
+    suggestions.push(Suggestion {
+        label: model.to_string(),
+        detail: format!("{} {}", backend.as_str(), detail),
+        action: SuggestionAction::SetModel {
+            backend,
+            model: model.to_string(),
+        },
+    });
+}
+
+fn cached_models_dev_rows() -> Vec<(Backend, String, String)> {
+    let Some(cache_path) = models_dev_cache_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(cache_path) else {
+        return Vec::new();
+    };
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
     };
 
-    models
+    let mut rows = Vec::new();
+    collect_provider_models(&data, "anthropic", Backend::Claude, &mut rows);
+    collect_provider_models(&data, "openai", Backend::Codex, &mut rows);
+    rows
+}
+
+fn collect_provider_models(
+    data: &serde_json::Value,
+    provider: &str,
+    backend: Backend,
+    rows: &mut Vec<(Backend, String, String)>,
+) {
+    let Some(models) = data
+        .get(provider)
+        .and_then(|provider| provider.get("models"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+
+    let mut entries = models
         .iter()
-        .map(|(model, detail)| Suggestion {
-            label: (*model).to_string(),
-            detail: (*detail).to_string(),
-            action: SuggestionAction::SetModel((*model).to_string()),
+        .filter(|(id, model)| match backend {
+            Backend::Claude => is_claude_picker_model(id, model),
+            Backend::Codex => is_codex_picker_model(id, model),
         })
-        .collect()
+        .map(|(id, model)| {
+            let detail = model
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    model
+                        .get("release_date")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("models.dev")
+                .to_string();
+            (id.clone(), detail)
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|a, b| score_model(backend, &b.0).cmp(&score_model(backend, &a.0)));
+    for (id, detail) in entries.into_iter().take(8) {
+        rows.push((backend, id, detail));
+    }
+}
+
+fn is_claude_picker_model(id: &str, model: &serde_json::Value) -> bool {
+    id.starts_with("claude-")
+        && !id.contains("3-")
+        && (id.contains("sonnet") || id.contains("opus") || id.contains("haiku"))
+        && model
+            .get("tool_call")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+}
+
+fn is_codex_picker_model(id: &str, model: &serde_json::Value) -> bool {
+    let text_output = model
+        .get("modalities")
+        .and_then(|modalities| modalities.get("output"))
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|output| output.iter().any(|value| value.as_str() == Some("text")));
+    text_output
+        && !id.contains("deep-research")
+        && !id.contains("chat-latest")
+        && !id.contains("pro")
+        && (id.contains("codex") || id.starts_with("gpt-5"))
+}
+
+fn score_model(backend: Backend, id: &str) -> i32 {
+    match backend {
+        Backend::Claude => {
+            let mut score = 0;
+            if id.contains("sonnet") {
+                score += 40;
+            }
+            if id.contains("opus") {
+                score += 35;
+            }
+            if id.contains("haiku") {
+                score += 20;
+            }
+            score
+        }
+        Backend::Codex => {
+            let mut score = 0;
+            if id.contains("codex") {
+                score += 40;
+            }
+            if id.starts_with("gpt-5.5") {
+                score += 35;
+            }
+            if id.starts_with("gpt-5.4") {
+                score += 30;
+            }
+            score
+        }
+    }
+}
+
+fn models_dev_cache_path() -> Option<PathBuf> {
+    std::env::var_os("RUDDER_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rudder")))
+        .map(|home| home.join("models-dev.json"))
+}
+
+fn backend_for_model(model: &str) -> Backend {
+    if model.starts_with("gpt-") || model.contains("codex") {
+        Backend::Codex
+    } else {
+        Backend::Claude
+    }
 }
 
 fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
