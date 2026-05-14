@@ -801,7 +801,7 @@ impl App {
             "sh",
             [
                 "-lc",
-                "if ! command -v hunk >/dev/null 2>&1; then npm install -g hunkdiff@latest; fi; exec hunk diff --watch",
+                "if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch; fi; exec npx --yes hunkdiff@latest diff --watch",
             ],
         );
         let options = TerminalPaneOptions {
@@ -815,7 +815,8 @@ impl App {
                 let _ = terminal.drain_output();
                 run.review_terminal = Some(terminal);
                 run.review_error = None;
-                self.notice = Some("opened Hunk review".to_string());
+                self.notice =
+                    Some("opening Hunk review; first run may download hunkdiff".to_string());
             }
             Err(error) => {
                 run.review_error = Some(error.to_string());
@@ -1099,6 +1100,18 @@ mod app_tests {
         assert_eq!(editable, "fix the login bug");
         assert_eq!(cursor, 13);
     }
+
+    #[test]
+    fn wraps_long_notice_text_to_width() {
+        let lines = wrap_text(
+            "merge stopped: error: Merging is not possible because you have unmerged files.",
+            28,
+        );
+
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.chars().count() <= 28));
+        assert_eq!(lines[0], "merge stopped: error:");
+    }
 }
 
 fn main() -> Result<()> {
@@ -1168,13 +1181,14 @@ fn run(terminal: &mut Tui) -> Result<()> {
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
+    let task_height = task_pane_height(app, area.width);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
             Constraint::Length(1),
-            Constraint::Length(4),
+            Constraint::Length(task_height),
         ])
         .split(area);
 
@@ -1474,10 +1488,17 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .notice
         .as_deref()
         .unwrap_or("Enter start  Tab focus  Alt-1/2/3 pane  /model");
-    let paragraph = Paragraph::new(vec![
-        input,
-        Line::from(vec![
-            Span::styled(hint.to_string(), muted_style(focused)),
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let mut lines = vec![input];
+    let wrapped_hint = wrap_text(hint, inner_width);
+    if app.notice.is_some() {
+        for line in wrapped_hint {
+            lines.push(Line::from(Span::styled(line, muted_style(focused))));
+        }
+    } else {
+        let first_hint = wrapped_hint.first().cloned().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(first_hint, muted_style(focused)),
             Span::raw("  "),
             Span::styled(app.backend.as_str(), accent_style(focused)),
             Span::raw(" "),
@@ -1486,9 +1507,13 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("({})", effort_label(app.effort)),
                 model_style(focused),
             ),
-        ]),
-    ])
-    .block(pane_block("task", focused, app.nav_mode));
+        ]));
+        for line in wrapped_hint.into_iter().skip(1) {
+            lines.push(Line::from(Span::styled(line, muted_style(focused))));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(pane_block("task", focused, app.nav_mode));
 
     frame.render_widget(paragraph, area);
 
@@ -1499,6 +1524,19 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             frame.set_cursor_position((x, y));
         }
     }
+}
+
+fn task_pane_height(app: &App, width: u16) -> u16 {
+    let hint = app
+        .notice
+        .as_deref()
+        .unwrap_or("Enter start  Tab focus  Alt-1/2/3 pane  /model");
+    let inner_width = width.saturating_sub(2).max(1);
+    let hint_lines = wrap_text(hint, inner_width).len().max(1) as u16;
+    2_u16
+        .saturating_add(1)
+        .saturating_add(hint_lines)
+        .clamp(4, 10)
 }
 
 fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
@@ -1582,23 +1620,58 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
     } else {
         Style::default().fg(Color::Gray)
     };
-    let active = if focused {
-        if nav_mode {
-            " NAV"
-        } else {
-            " ACTIVE"
-        }
-    } else {
-        ""
-    };
+    let _ = nav_mode;
 
     Block::default()
-        .title(Line::from(Span::styled(
-            format!(" {title}{active} "),
-            title_style,
-        )))
+        .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .borders(Borders::ALL)
         .border_style(border_style)
+}
+
+fn wrap_text(value: &str, width: u16) -> Vec<String> {
+    let max_width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in value.split_whitespace() {
+        if current.is_empty() {
+            push_wrapped_word(&mut lines, &mut current, word, max_width);
+            continue;
+        }
+
+        if current.chars().count() + 1 + word.chars().count() <= max_width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            push_wrapped_word(&mut lines, &mut current, word, max_width);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, max_width: usize) {
+    if word.chars().count() <= max_width {
+        current.push_str(word);
+        return;
+    }
+
+    let mut chunk = String::new();
+    for ch in word.chars() {
+        if chunk.chars().count() == max_width {
+            lines.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(ch);
+    }
+    *current = chunk;
 }
 
 fn pane_text_style(focused: bool) -> Style {
