@@ -60,6 +60,7 @@ type CloudClient = {
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CLOUD_URL = "https://mpd2pmnpep.us-east-1.awsapprunner.com";
+const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
 const DEFAULT_HOME_PATHS = [
   "~/.claude",
@@ -137,6 +138,15 @@ async function login(options: CloudCommandOptions): Promise<void> {
     }
   }
 
+  const githubDeviceLogin = await tryGithubDeviceLogin(client, options).catch(() => null);
+  if (githubDeviceLogin?.token || githubDeviceLogin?.accessToken) {
+    const token = githubDeviceLogin.token ?? githubDeviceLogin.accessToken;
+    if (token) {
+      await saveCloudLogin(client, githubDeviceLogin, token, options, "GitHub device");
+      return;
+    }
+  }
+
   const response = await client.request<LoginStartResponse>("/api/cli/login", {
     method: "POST",
     body: {
@@ -171,6 +181,9 @@ async function login(options: CloudCommandOptions): Promise<void> {
 }
 
 async function tryGithubCliLogin(client: CloudClient): Promise<LoginPollResponse | null> {
+  if (process.env.RUDDER_SKIP_GH_CLI === "1") {
+    return null;
+  }
   const gh = await runCommand("gh", ["auth", "token"], { allowFailure: true });
   const token = gh.stdout.trim();
   if (gh.code !== 0 || !token) {
@@ -180,6 +193,82 @@ async function tryGithubCliLogin(client: CloudClient): Promise<LoginPollResponse
     method: "POST",
     body: { token },
   });
+}
+
+async function tryGithubDeviceLogin(client: CloudClient, options: CloudCommandOptions): Promise<LoginPollResponse | null> {
+  const start = await githubOAuthRequest<{
+    device_code?: string;
+    user_code?: string;
+    verification_uri?: string;
+    verification_uri_complete?: string;
+    expires_in?: number;
+    interval?: number;
+    error?: string;
+    error_description?: string;
+  }>("https://github.com/login/device/code", {
+    client_id: GITHUB_CLI_CLIENT_ID,
+    scope: "read:user user:email",
+  });
+  if (!start.device_code || !start.user_code || !start.verification_uri) {
+    return null;
+  }
+  if (!options.json) {
+    const url = start.verification_uri_complete ?? start.verification_uri;
+    console.log(`Opening ${url}`);
+    console.log(`GitHub code: ${start.user_code}`);
+    openBrowser(url);
+  }
+
+  const intervalMs = Math.max(1000, (start.interval ?? 5) * 1000);
+  const timeoutMs = Math.max(intervalMs, (start.expires_in ?? 900) * 1000);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await sleep(intervalMs);
+    const poll = await githubOAuthRequest<{
+      access_token?: string;
+      token_type?: string;
+      scope?: string;
+      error?: string;
+      error_description?: string;
+      interval?: number;
+    }>("https://github.com/login/oauth/access_token", {
+      client_id: GITHUB_CLI_CLIENT_ID,
+      device_code: start.device_code,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    });
+    if (poll.access_token) {
+      return await client.request<LoginPollResponse>("/api/cli/login/github-token", {
+        method: "POST",
+        body: { token: poll.access_token },
+      });
+    }
+    if (poll.error === "authorization_pending") {
+      continue;
+    }
+    if (poll.error === "slow_down") {
+      await sleep(Math.max(intervalMs, (poll.interval ?? 5) * 1000));
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+async function githubOAuthRequest<T>(url: string, body: Record<string, string>): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const parsed = text ? parseJson(text) : null;
+  if (!response.ok) {
+    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `${response.status} ${response.statusText}`);
+  }
+  return parsed as T;
 }
 
 async function saveCloudLogin(

@@ -56,9 +56,9 @@ the provider consoles and added as App Runner secrets before the hosted login
 flow can go live.
 
 Until provider OAuth clients are installed, the CLI can still log in through an
-already-authenticated GitHub CLI. `rudder login` sends the local `gh auth token`
-to `/api/cli/login/github-token`; the server verifies it with GitHub and stores
-only a hashed Rudder Cloud token.
+already-authenticated GitHub CLI or GitHub's browser device flow. `rudder login`
+sends the resulting GitHub token to `/api/cli/login/github-token`; the server
+verifies it with GitHub and stores only a hashed Rudder Cloud token.
 
 OAuth callback URLs:
 

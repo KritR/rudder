@@ -96,10 +96,10 @@ for that task name.
 
 `rudder login` connects this machine to Rudder Cloud. If GitHub CLI is already
 authenticated, Rudder reuses it to issue a Rudder Cloud token. Otherwise it
-opens the browser login flow. The control plane supports Better Auth with Google
-and GitHub providers once those OAuth clients are configured. It is separate
-from Claude Code and Codex login: provider auth still belongs to the official
-CLIs unless you explicitly configure otherwise.
+falls back to GitHub's browser device flow. The control plane also supports
+Better Auth with Google and GitHub providers once those OAuth clients are
+configured. It is separate from Claude Code and Codex login: provider auth still
+belongs to the official CLIs unless you explicitly configure otherwise.
 
 `rudder cloud list` will show cloud-capable runs and remote workers. `rudder
 cloud onload <runId>` will move a local run to the cloud so it can continue from
