@@ -105,18 +105,19 @@
 
       .install {
         display: inline-flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 12px;
         margin-top: 34px;
         padding: 8px;
         border: 1px solid #111;
-        white-space: nowrap;
       }
 
       .install code {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 14px;
         padding: 4px 6px;
+        line-height: 1.7;
+        white-space: pre;
       }
 
       .copy {
@@ -300,7 +301,8 @@
             and merge completed work with a tap.
           </p>
           <div class="install">
-            <code id="install-command">npm install -g @viraatdas/rudder@latest</code>
+            <code id="install-command">npm install -g @viraatdas/rudder@latest
+rudder</code>
             <button class="copy" type="button" data-copy="install-command">Copy</button>
           </div>
 
