@@ -8,6 +8,16 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import type { JsonValue } from "./types.js";
 
+const DEFAULT_PATH = [
+  "/opt/homebrew/bin",
+  "/opt/homebrew/sbin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+].join(":");
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
@@ -88,6 +98,7 @@ export async function writeJson(
 export function commandExists(command: string): boolean {
   const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], {
     encoding: "utf8",
+    env: commandEnv(),
   });
   return result.status === 0 && result.stdout.trim().length > 0;
 }
@@ -100,7 +111,7 @@ export async function runCommand(
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options?.cwd,
-      env: { ...process.env, ...options?.env },
+      env: commandEnv(options?.env),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -132,6 +143,7 @@ export function runCommandSync(
 ): { stdout: string; stderr: string; code: number } {
   const result = spawnSync(command, args, {
     cwd: options?.cwd,
+    env: commandEnv(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -207,6 +219,26 @@ export function shortHash(value: string): string {
 
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function commandEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...extra };
+  const existingPath = env.PATH?.trim();
+  env.PATH = existingPath ? mergePath(existingPath, DEFAULT_PATH) : DEFAULT_PATH;
+  return env;
+}
+
+function mergePath(primary: string, fallback: string): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const item of `${primary}:${fallback}`.split(":")) {
+    if (!item || seen.has(item)) {
+      continue;
+    }
+    seen.add(item);
+    parts.push(item);
+  }
+  return parts.join(":");
 }
 
 export function parseJsonLine(line: string): JsonValue | null {
