@@ -32,13 +32,14 @@ function claudeBackend(): BackendAdapter {
       };
       await saveRunRecord(request.run);
       const env = await backendEnv("anthropic");
+      const effort = request.run.effort || "xhigh";
       const args = [
         "-p",
         request.prompt,
         "--model",
         request.run.model || "sonnet",
         "--effort",
-        "xhigh",
+        effort,
         "--permission-mode",
         "bypassPermissions",
         "--dangerously-skip-permissions",
@@ -74,6 +75,7 @@ function codexBackend(): BackendAdapter {
     },
     async run(request, emit) {
       const env = await backendEnv("openai");
+      const effort = codexEffort(request.run.effort);
       const args = [
         "exec",
         "--json",
@@ -89,7 +91,7 @@ function codexBackend(): BackendAdapter {
         "-c",
         'approval_policy="never"',
         "-c",
-        'model_reasoning_effort="xhigh"',
+        `model_reasoning_effort="${effort}"`,
         "-c",
         'model_reasoning_summary="detailed"',
         "-c",
@@ -106,6 +108,10 @@ function codexBackend(): BackendAdapter {
       });
     },
   };
+}
+
+function codexEffort(effort: RunRequest["run"]["effort"]): string {
+  return effort === "max" ? "xhigh" : effort || "xhigh";
 }
 
 function acpxBackend(): BackendAdapter {

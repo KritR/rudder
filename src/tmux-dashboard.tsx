@@ -3,14 +3,14 @@ import { Box, Text, render, useInput, useWindowSize } from "ink";
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import { startNativeRun, deleteRun, mergeRun, stopRun } from "./run-manager.js";
-import { listRuns, loadConfig } from "./state.js";
+import { listRuns, loadConfig, saveConfig } from "./state.js";
 import {
   loadTmuxDashboardState,
   updateTmuxDashboardState,
   type NativeBackendId,
 } from "./tmux-state.js";
 import { detachClient, resizePane, selectPane } from "./tmux.js";
-import type { BackendId, RunRecord, RudderConfig } from "./types.js";
+import type { BackendId, EffortLevel, RunRecord, RudderConfig } from "./types.js";
 import { shortenHome } from "./util.js";
 
 type PaneDefaults = {
@@ -207,13 +207,17 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [config, setConfig] = useState<RudderConfig | null>(null);
   const [backend, setBackend] = useState<NativeBackendId>(toNativeBackend(defaults.backend ?? "claude"));
   const [model, setModel] = useState<string | undefined>(defaults.model);
+  const [effort, setEffort] = useState<EffortLevel | undefined>();
   const [input, setInput] = useState("");
   const inputRef = useRef("");
   const [notice, setNotice] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [commandIndex, setCommandIndex] = useState(0);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [modelPickerStep, setModelPickerStep] = useState<"model" | "effort">("model");
   const [modelIndex, setModelIndex] = useState(0);
+  const [effortIndex, setEffortIndex] = useState(0);
+  const [pendingModel, setPendingModel] = useState<ModelOption | null>(null);
   const [claudeModels, setClaudeModels] = useState<ModelOption[]>([]);
   const [codexModels, setCodexModels] = useState<ModelOption[]>([]);
   const [taskPaneId, setTaskPaneId] = useState<string | undefined>();
@@ -226,8 +230,10 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     ]);
     setRepoRoot(root);
     setConfig(nextConfig);
-    setBackend(state?.backend ?? toNativeBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend));
+    const nextBackend = state?.backend ?? toNativeBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
+    setBackend(nextBackend);
     setModel(state?.model ?? defaults.model);
+    setEffort(state?.effort ?? effortForBackend(nextBackend, nextConfig));
     setTaskPaneId(state?.taskPaneId);
   }, [defaults.backend, defaults.model, defaults.tmuxSessionName]);
 
@@ -302,13 +308,15 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setTaskInput("");
       setNotice("");
       setModelPickerOpen(true);
+      setModelPickerStep("model");
       setModelIndex(0);
+      setPendingModel(null);
       return;
     }
     if (task.startsWith("/model ")) {
       const nextModel = task.slice("/model ".length).trim() || undefined;
       setModel(nextModel);
-      await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { model: nextModel });
+      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, backend, nextModel, effort);
       setTaskInput("");
       setNotice("");
       return;
@@ -317,7 +325,9 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       const nextBackend = task.endsWith("codex") ? "codex" : "claude";
       setBackend(nextBackend);
       setModel(undefined);
-      await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { backend: nextBackend, model: undefined });
+      const nextEffort = effortForBackend(nextBackend, config);
+      setEffort(nextEffort);
+      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, nextBackend, undefined, nextEffort);
       setTaskInput("");
       setNotice("");
       setModelPickerOpen(false);
@@ -352,12 +362,13 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         task,
         backend,
         model,
+        effort,
         tmuxSessionName: defaults.tmuxSessionName,
         workerPaneId: state.workerPaneId,
         focus: true,
         silent: true,
       });
-      await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model });
+      await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model, effort });
       setTaskInput("");
       setNotice("");
     } catch (error) {
@@ -365,7 +376,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     } finally {
       setSubmitting(false);
     }
-  }, [backend, defaults.tmuxSessionName, model, repoRoot, setTaskInput, submitting]);
+  }, [backend, config, defaults.tmuxSessionName, effort, model, repoRoot, setTaskInput, submitting]);
 
   useInput((chunk, key) => {
     if (key.ctrl && chunk === "c") {
@@ -374,26 +385,55 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     }
     if (modelPickerOpen) {
       if (key.escape) {
-        setModelPickerOpen(false);
+        if (modelPickerStep === "effort") {
+          setModelPickerStep("model");
+          setPendingModel(null);
+        } else {
+          setModelPickerOpen(false);
+        }
         setNotice("");
         return;
       }
+      const activeBackend = toNativeBackend(pendingModel?.backend ?? backend);
+      const effortOptions = effortOptionsForBackend(activeBackend);
       if (key.upArrow || chunk === "k") {
-        setModelIndex((current) => Math.max(0, current - 1));
+        if (modelPickerStep === "effort") {
+          setEffortIndex((current) => Math.max(0, current - 1));
+        } else {
+          setModelIndex((current) => Math.max(0, current - 1));
+        }
         return;
       }
       if (key.downArrow || chunk === "j") {
-        setModelIndex((current) => Math.min(modelOptions.length - 1, current + 1));
+        if (modelPickerStep === "effort") {
+          setEffortIndex((current) => Math.min(effortOptions.length - 1, current + 1));
+        } else {
+          setModelIndex((current) => Math.min(modelOptions.length - 1, current + 1));
+        }
         return;
       }
       if (key.return) {
-        const option = modelOptions[modelIndex];
-        const nextBackend = toNativeBackend(option?.backend ?? backend);
-        const nextModel = option?.value;
+        if (modelPickerStep === "model") {
+          const option = modelOptions[modelIndex] ?? { label: "Default", value: undefined, backend };
+          const nextBackend = toNativeBackend(option.backend ?? backend);
+          const currentEffort = effortForBackend(nextBackend, config);
+          const nextEffortOptions = effortOptionsForBackend(nextBackend);
+          setPendingModel(option);
+          setEffortIndex(Math.max(0, nextEffortOptions.findIndex((candidate) => candidate.value === currentEffort)));
+          setModelPickerStep("effort");
+          return;
+        }
+        const option = pendingModel ?? modelOptions[modelIndex] ?? { label: "Default", value: undefined, backend };
+        const nextBackend = toNativeBackend(option.backend ?? backend);
+        const nextModel = option.value;
+        const nextEffort = effortOptions[effortIndex]?.value ?? "xhigh";
         setBackend(nextBackend);
         setModel(nextModel);
-        void updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { backend: nextBackend, model: nextModel });
+        setEffort(nextEffort);
+        void updateBackendDefaults(repoRoot, defaults.tmuxSessionName, nextBackend, nextModel, nextEffort);
         setModelPickerOpen(false);
+        setModelPickerStep("model");
+        setPendingModel(null);
         setTaskInput("");
         setNotice("");
         return;
@@ -459,6 +499,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   });
 
   const configured = model || (backend === "claude" ? config?.backends.claude?.model : config?.backends.codex?.model) || "default";
+  const configuredEffort = effort || effortForBackend(backend, config);
 
   return (
     <Box flexDirection="column">
@@ -470,9 +511,11 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       {commandMenuOpen ? (
         <CommandMenu commands={commandOptions} selected={commandIndex} />
       ) : modelPickerOpen ? (
-        <ModelMenu options={modelOptions} selected={modelIndex} backend={backend} />
+        modelPickerStep === "effort"
+          ? <EffortMenu option={pendingModel ?? modelOptions[modelIndex]} selected={effortIndex} backend={toNativeBackend(pendingModel?.backend ?? backend)} />
+          : <ModelMenu options={modelOptions} selected={modelIndex} backend={backend} />
       ) : (
-        <Text color="gray">Enter start  Tab focus pane  / commands  {backend} {configured}</Text>
+        <Text color="gray">Enter start  Tab focus pane  / commands  {backend} {configured} {configuredEffort}</Text>
       )}
     </Box>
   );
@@ -500,6 +543,23 @@ function ModelMenu({ options, selected, backend }: { options: ModelOption[]; sel
           </Text>
         );
       })}
+    </Box>
+  );
+}
+
+function EffortMenu({ option, selected, backend }: { option?: ModelOption; selected: number; backend: NativeBackendId }): React.ReactElement {
+  const options = effortOptionsForBackend(backend);
+  const modelName = option?.label ?? "Default";
+  return (
+    <Box flexDirection="column">
+      <Text color="gray">Pick effort for {backend} {modelName}. Esc goes back.</Text>
+      {options.map((candidate, index) => (
+        <Text key={candidate.value} color={index === selected ? "cyan" : "gray"}>
+          {index === selected ? "> " : "  "}
+          <Text color={candidate.value === "xhigh" || candidate.value === "max" ? "yellow" : undefined}>{candidate.label}</Text>
+          {candidate.detail ? `  ${candidate.detail}` : ""}
+        </Text>
+      ))}
     </Box>
   );
 }
@@ -542,11 +602,57 @@ function modelLabel(run: RunRecord, config: RudderConfig | null): string {
       ? config?.backends.claude?.model
       : config?.backends.codex?.model)
     ?? "default";
-  return summarize(model, 18);
+  const effort = run.effort ?? effortForBackend(toNativeBackend(run.backend), config);
+  return summarize(`${model} ${effort}`, 18);
 }
 
 function modelForBackend(backend: NativeBackendId, config: RudderConfig | null): string | undefined {
   return backend === "claude" ? config?.backends.claude?.model : config?.backends.codex?.model;
+}
+
+function effortForBackend(backend: NativeBackendId, config: RudderConfig | null): EffortLevel {
+  if (backend === "claude") {
+    return config?.backends.claude?.effort ?? "xhigh";
+  }
+  return config?.backends.codex?.reasoningEffort ?? config?.backends.codex?.effort ?? "xhigh";
+}
+
+function effortOptionsForBackend(backend: NativeBackendId): Array<{ label: string; value: EffortLevel; detail: string }> {
+  const common: Array<{ label: string; value: EffortLevel; detail: string }> = [
+    { label: "low", value: "low", detail: "fastest" },
+    { label: "medium", value: "medium", detail: "balanced" },
+    { label: "high", value: "high", detail: "deeper reasoning" },
+    { label: "xhigh", value: "xhigh", detail: "best default for agent work" },
+  ];
+  return backend === "claude"
+    ? [...common, { label: "max", value: "max", detail: "most reasoning" }]
+    : common;
+}
+
+async function updateBackendDefaults(
+  repoRoot: string,
+  tmuxSessionName: string,
+  backend: NativeBackendId,
+  model: string | undefined,
+  effort: EffortLevel | undefined,
+): Promise<void> {
+  await updateTmuxDashboardState(repoRoot, tmuxSessionName, { backend, model, effort });
+  const config = await loadConfig();
+  config.lastUsedBackend = backend;
+  if (backend === "claude") {
+    config.backends.claude = {
+      ...(config.backends.claude ?? {}),
+      model,
+      effort: effort ?? config.backends.claude?.effort ?? "xhigh",
+    };
+  } else {
+    config.backends.codex = {
+      ...(config.backends.codex ?? {}),
+      model,
+      reasoningEffort: effort ?? config.backends.codex?.reasoningEffort ?? "xhigh",
+    };
+  }
+  await saveConfig(config);
 }
 
 function withBackend(options: ModelOption[], backend: NativeBackendId): ModelOption[] {

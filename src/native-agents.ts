@@ -14,13 +14,14 @@ export function nativeAgentCommand(params: {
 
 function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] {
   const model = run.model || "sonnet";
+  const effort = run.effort || "xhigh";
   const sessionId = run.session?.nativeSessionId;
   return compact([
     "claude",
     "--model",
     model,
     "--effort",
-    "xhigh",
+    effort,
     "--permission-mode",
     "bypassPermissions",
     "--dangerously-skip-permissions",
@@ -36,6 +37,7 @@ function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] 
 
 function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
   const model = run.model || "gpt-5.5";
+  const effort = codexEffort(run.effort);
   return [
     "codex",
     "--model",
@@ -48,7 +50,7 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
     "--enable",
     "goals",
     "-c",
-    'model_reasoning_effort="xhigh"',
+    `model_reasoning_effort="${effort}"`,
     "-c",
     'model_reasoning_summary="detailed"',
     "-c",
@@ -57,6 +59,10 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
     run.worktree.path,
     [contract, "", prompt].join("\n"),
   ];
+}
+
+function codexEffort(effort: RunRecord["effort"]): string {
+  return effort === "max" ? "xhigh" : effort || "xhigh";
 }
 
 function paneTitle(run: RunRecord): string {

@@ -85,11 +85,13 @@ export type RudderConfig = {
 
 export type BackendId = "claude" | "codex" | "acpx";
 
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
 export type BackendConfig = {
   profileId?: string;
   model?: string;
-  effort?: "low" | "medium" | "high" | "xhigh" | "max";
-  reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+  effort?: EffortLevel;
+  reasoningEffort?: EffortLevel;
 };
 
 export type RunStatus =
@@ -109,6 +111,7 @@ export type RunRecord = {
   task: string;
   backend: BackendId;
   model?: string;
+  effort?: EffortLevel;
   createdAt: string;
   updatedAt: string;
   repoRoot: string;

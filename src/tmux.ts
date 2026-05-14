@@ -5,6 +5,7 @@ import {
   saveTmuxDashboardState,
   type NativeBackendId,
 } from "./tmux-state.js";
+import type { EffortLevel } from "./types.js";
 import { commandExists, runCommand, shellQuote, shortHash, slugify } from "./util.js";
 
 export function hasTmux(): boolean {
@@ -28,6 +29,7 @@ export async function ensureTmuxDashboardSession(params: {
   taskCommand: string;
   backend: NativeBackendId;
   model?: string;
+  effort?: EffortLevel;
 }): Promise<void> {
   if (await tmuxSessionExists(params.sessionName) && await loadTmuxDashboardState(params.repoRoot, params.sessionName)) {
     await configureRudderSession(params.sessionName);
@@ -96,6 +98,7 @@ export async function ensureTmuxDashboardSession(params: {
     taskPaneId,
     backend: params.backend,
     model: params.model,
+    effort: params.effort,
   });
   await selectPane(taskPaneId || agentPaneId);
 }

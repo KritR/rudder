@@ -121,9 +121,11 @@ legacy full-screen stream TUI.
 
 ## Models
 
-`/model` opens a bounded picker for the active backend. Rudder passes the
-selected value straight through to the underlying CLI: Claude uses
-`claude --model <value>`, and Codex uses `codex --model <value>`.
+`/model` opens a bounded picker for Claude and Codex models. Pick a model, then
+pick the reasoning effort (`low`, `medium`, `high`, `xhigh`, and `max` where the
+backend supports it). Rudder passes both choices to the underlying CLI: Claude
+uses `claude --model <value> --effort <value>`, and Codex uses
+`codex --model <value> -c model_reasoning_effort="<value>"`.
 
 - Claude is alias-first like Claude Code itself: `sonnet`, `sonnet[1m]`,
   `opus`, `opus[1m]`, and `haiku` appear before explicit model IDs.

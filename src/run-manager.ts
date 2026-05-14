@@ -18,7 +18,7 @@ import {
   saveConfig,
   saveRunRecord,
 } from "./state.js";
-import type { BackendId, JsonValue, RunRecord, RudderEvent, VerificationResult } from "./types.js";
+import type { BackendId, EffortLevel, JsonValue, RunRecord, RudderEvent, VerificationResult } from "./types.js";
 import {
   appendEvent,
 } from "./state.js";
@@ -42,6 +42,7 @@ export async function startRun(params: {
   task: string;
   backend?: BackendId;
   model?: string;
+  effort?: EffortLevel;
   detach?: boolean;
   worktree?: boolean;
   queue?: boolean;
@@ -62,6 +63,7 @@ export async function startRun(params: {
       : backend === "codex"
         ? config.backends.codex?.model
         : config.backends.acpx?.model);
+  const effort = params.effort ?? effortForBackend(backend, config);
 
   const active = await activeRunsForCheckout(repoRoot, repoRoot);
   if (params.queue && active.length > 0) {
@@ -80,6 +82,7 @@ export async function startRun(params: {
     task: params.task,
     backend,
     model,
+    effort,
     targetBranch,
     baseCommit,
     useWorktree,
@@ -147,6 +150,7 @@ export async function startNativeRun(params: {
   tmuxSessionName: string;
   backend?: Exclude<BackendId, "acpx">;
   model?: string;
+  effort?: EffortLevel;
   workerPaneId?: string;
   focus?: boolean;
   silent?: boolean;
@@ -159,6 +163,7 @@ export async function startNativeRun(params: {
     (backend === "claude"
       ? normalizeClaudeDefault(config.backends.claude?.model)
       : config.backends.codex?.model);
+  const effort = params.effort ?? effortForBackend(backend, config);
   const baseCommit = await currentCommit(repoRoot);
   const targetBranch = await currentBranch(repoRoot);
   const id = newRunId(params.task);
@@ -169,6 +174,7 @@ export async function startNativeRun(params: {
     task: params.task,
     backend,
     model,
+    effort,
     targetBranch,
     baseCommit,
     useWorktree: true,
@@ -608,6 +614,16 @@ function normalizeClaudeDefault(model: string | undefined): string | undefined {
 
 function toNativeBackend(backend: BackendId): Exclude<BackendId, "acpx"> {
   return backend === "codex" ? "codex" : "claude";
+}
+
+function effortForBackend(backend: BackendId, config: Awaited<ReturnType<typeof loadConfig>>): EffortLevel {
+  if (backend === "claude") {
+    return config.backends.claude?.effort ?? "xhigh";
+  }
+  if (backend === "codex") {
+    return config.backends.codex?.reasoningEffort ?? config.backends.codex?.effort ?? "xhigh";
+  }
+  return config.backends.acpx?.reasoningEffort ?? config.backends.acpx?.effort ?? "xhigh";
 }
 
 function shortTask(task: string): string {

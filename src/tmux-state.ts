@@ -1,6 +1,6 @@
 import path from "node:path";
 import { projectStateDir } from "./state.js";
-import type { BackendId, JsonValue } from "./types.js";
+import type { BackendId, EffortLevel, JsonValue } from "./types.js";
 import { ensureDir, readJson, writeJson } from "./util.js";
 
 export type NativeBackendId = Exclude<BackendId, "acpx">;
@@ -15,6 +15,7 @@ export type TmuxDashboardState = {
   selectedRunId?: string;
   backend: NativeBackendId;
   model?: string;
+  effort?: EffortLevel;
 };
 
 export function tmuxDashboardStatePath(repoRoot: string, sessionName: string): string {

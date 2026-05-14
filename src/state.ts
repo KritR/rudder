@@ -171,6 +171,7 @@ export async function createRunRecord(params: {
   task: string;
   backend: RunRecord["backend"];
   model?: string;
+  effort?: RunRecord["effort"];
   targetBranch: string;
   baseCommit: string;
   useWorktree: boolean;
@@ -185,6 +186,7 @@ export async function createRunRecord(params: {
     task: params.task,
     backend: params.backend,
     model: params.model,
+    effort: params.effort,
     createdAt,
     updatedAt: createdAt,
     repoRoot: params.repoRoot,
