@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -23,7 +26,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
-    TerminalCommand, TerminalPane, TerminalPaneOptions, TerminalSize,
+    StyledTerminalCell, TerminalCommand, TerminalPane, TerminalPaneOptions, TerminalSize,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -106,6 +109,7 @@ struct App {
     model: String,
     notice: Option<String>,
     delete_pending: Option<String>,
+    picker_index: usize,
 }
 
 struct AgentRun {
@@ -125,6 +129,22 @@ struct AgentRun {
     last_error: Option<String>,
 }
 
+#[derive(Clone)]
+struct Suggestion {
+    label: String,
+    detail: String,
+    action: SuggestionAction,
+}
+
+#[derive(Clone)]
+enum SuggestionAction {
+    Insert(String),
+    SetBackend(Backend),
+    SetModel(String),
+    ClearRuns,
+    ShowHelp,
+}
+
 impl App {
     fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -136,14 +156,24 @@ impl App {
             agents: Vec::new(),
             selected_agent: 0,
             backend: Backend::Claude,
-            model: "default".to_string(),
+            model: default_model_for(Backend::Claude).to_string(),
             notice: None,
             delete_pending: None,
+            picker_index: 0,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let worker_has_terminal = self.focus == FocusPane::Worker
+            && self
+                .agents
+                .get(self.selected_agent)
+                .and_then(|run| run.terminal.as_ref())
+                .is_some();
+        if !worker_has_terminal
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
             return true;
         }
 
@@ -206,34 +236,122 @@ impl App {
     }
 
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
+        if self.handle_picker_key(key) {
+            return false;
+        }
+
         match key.code {
-            KeyCode::Esc => self.task_input.clear(),
+            KeyCode::Esc => {
+                self.task_input.clear();
+                self.picker_index = 0;
+            }
             KeyCode::Enter => self.start_task(),
             KeyCode::Backspace => {
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
-                {
+                if key.modifiers.intersects(
+                    KeyModifiers::ALT
+                        | KeyModifiers::CONTROL
+                        | KeyModifiers::SUPER
+                        | KeyModifiers::META,
+                ) {
                     delete_previous_word(&mut self.task_input);
                 } else {
                     self.task_input.pop();
                 }
+                self.clamp_picker_index();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.task_input.clear();
+                self.picker_index = 0;
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 delete_previous_word(&mut self.task_input);
+                self.clamp_picker_index();
             }
             KeyCode::Char('/') if self.task_input.is_empty() => {
                 self.task_input.push('/');
-                self.notice =
-                    Some("commands: /backend claude|codex, /model <id>, /clear".to_string());
+                self.picker_index = 0;
+                self.notice = Some("pick a command".to_string());
             }
-            KeyCode::Char(ch) => self.task_input.push(ch),
+            KeyCode::Char(ch) => {
+                self.task_input.push(ch);
+                self.clamp_picker_index();
+            }
             _ => {}
         }
         false
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
+        let suggestions = suggestions_for(self);
+        if suggestions.is_empty() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.picker_index = self.picker_index.saturating_sub(1);
+                true
+            }
+            KeyCode::Down => {
+                self.picker_index =
+                    (self.picker_index + 1).min(suggestions.len().saturating_sub(1));
+                true
+            }
+            KeyCode::Enter => {
+                let selected = suggestions
+                    .get(self.picker_index.min(suggestions.len().saturating_sub(1)))
+                    .cloned();
+                drop(suggestions);
+                if let Some(selected) = selected {
+                    self.apply_suggestion(selected);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_suggestion(&mut self, suggestion: Suggestion) {
+        match suggestion.action {
+            SuggestionAction::Insert(value) => {
+                self.task_input = value;
+                self.picker_index = 0;
+            }
+            SuggestionAction::SetBackend(backend) => {
+                self.backend = backend;
+                self.model = default_model_for(backend).to_string();
+                self.task_input.clear();
+                self.picker_index = 0;
+                self.notice = Some(format!("backend {}", backend.as_str()));
+            }
+            SuggestionAction::SetModel(model) => {
+                self.model = model;
+                self.task_input.clear();
+                self.picker_index = 0;
+                self.notice = Some(format!("model {}", self.model));
+            }
+            SuggestionAction::ClearRuns => {
+                self.agents.clear();
+                self.selected_agent = 0;
+                self.task_input.clear();
+                self.picker_index = 0;
+                self.notice = Some("cleared local dashboard runs".to_string());
+            }
+            SuggestionAction::ShowHelp => {
+                self.task_input.clear();
+                self.picker_index = 0;
+                self.notice = Some("Tab focus  Enter select/start  /model  /backend".to_string());
+            }
+        }
+    }
+
+    fn clamp_picker_index(&mut self) {
+        let len = suggestions_for(self).len();
+        if len == 0 {
+            self.picker_index = 0;
+        } else {
+            self.picker_index = self.picker_index.min(len - 1);
+        }
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -333,6 +451,7 @@ impl App {
                     Some("codex") => self.backend = Backend::Codex,
                     _ => self.backend = self.backend.toggle(),
                 }
+                self.model = default_model_for(self.backend).to_string();
                 self.notice = Some(format!("backend {}", self.backend.as_str()));
                 true
             }
@@ -524,13 +643,24 @@ fn main() -> Result<()> {
 fn setup_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -585,6 +715,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_worker(frame, main[2], app);
     render_gutter(frame, rows[1], Gutter::Horizontal);
     render_task(frame, rows[2], app);
+    render_suggestions(frame, rows[2], app);
 }
 
 #[derive(Clone, Copy)]
@@ -596,7 +727,7 @@ enum Gutter {
 fn render_gutter(frame: &mut Frame<'_>, area: Rect, gutter: Gutter) {
     let style = Style::default().fg(Color::DarkGray);
     let line = match gutter {
-        Gutter::Horizontal => "─".repeat(area.width as usize),
+        Gutter::Horizontal => " ".repeat(area.width as usize),
         Gutter::Vertical => " ".to_string(),
     };
 
@@ -633,11 +764,9 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let selected = index == app.selected_agent;
         let marker = if selected { "> " } else { "  " };
         let task_style = if selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(status_color(agent.status))
+            Style::default()
         };
 
         lines.push(ListItem::new(Line::from(vec![
@@ -677,7 +806,7 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     lines.push(ListItem::new(Line::default()));
     lines.push(ListItem::new(Line::from(Span::styled(
-        "j/k select  Enter focus  d delete",
+        "j/k move  Enter focus  d del",
         Style::default().fg(Color::Gray),
     ))));
 
@@ -743,9 +872,9 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     };
 
     let mut lines = terminal
-        .visible_lines()
+        .styled_lines()
         .into_iter()
-        .map(Line::from)
+        .map(styled_terminal_line)
         .collect::<Vec<_>>();
     if lines.len() > height {
         lines = lines.split_off(lines.len() - height);
@@ -790,10 +919,71 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
+fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
+    let suggestions = suggestions_for(app);
+    if suggestions.is_empty() {
+        return;
+    }
+
+    let visible_count = suggestions.len().min(8);
+    let height = (visible_count as u16).saturating_add(2);
+    if task_area.y < height {
+        return;
+    }
+    let area = Rect {
+        x: task_area.x,
+        y: task_area.y - height,
+        width: task_area.width,
+        height,
+    };
+
+    let selected_index = app.picker_index.min(suggestions.len().saturating_sub(1));
+    let offset = selected_index.saturating_sub(visible_count.saturating_sub(1));
+    let items = suggestions
+        .iter()
+        .skip(offset)
+        .take(visible_count)
+        .enumerate()
+        .map(|(index, suggestion)| {
+            let selected = index + offset == selected_index;
+            let marker = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(suggestion.label.clone(), style),
+                Span::raw("  "),
+                Span::styled(suggestion.detail.clone(), Style::default().fg(Color::Gray)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+
+    let title = if app.task_input.starts_with("/model") {
+        " model "
+    } else {
+        " commands "
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::LightBlue)),
+    );
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+}
+
 fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default()
-            .fg(Color::Blue)
+            .fg(Color::LightBlue)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -802,7 +992,7 @@ fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
     let title_style = if focused {
         Style::default()
             .fg(Color::Black)
-            .bg(Color::Blue)
+            .bg(Color::LightBlue)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
@@ -830,9 +1020,192 @@ fn status_style(status: AgentStatus) -> Style {
 fn status_color(status: AgentStatus) -> Color {
     match status {
         AgentStatus::Running => Color::Yellow,
-        AgentStatus::Done => Color::Green,
+        AgentStatus::Done => Color::Gray,
         AgentStatus::Failed => Color::Red,
     }
+}
+
+fn styled_terminal_line(cells: Vec<StyledTerminalCell>) -> Line<'static> {
+    let spans = cells
+        .into_iter()
+        .map(|cell| {
+            let style = terminal_cell_style(&cell);
+            Span::styled(cell.contents, style)
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn terminal_cell_style(cell: &StyledTerminalCell) -> Style {
+    let (fg, bg) = if cell.inverse {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    let mut style = Style::default();
+    if let Some(color) = map_vt100_color(fg) {
+        style = style.fg(color);
+    }
+    if let Some(color) = map_vt100_color(bg) {
+        style = style.bg(color);
+    }
+    let mut modifier = Modifier::empty();
+    if cell.bold {
+        modifier |= Modifier::BOLD;
+    }
+    if cell.dim {
+        modifier |= Modifier::DIM;
+    }
+    if cell.italic {
+        modifier |= Modifier::ITALIC;
+    }
+    if cell.underline {
+        modifier |= Modifier::UNDERLINED;
+    }
+    style.add_modifier(modifier)
+}
+
+fn map_vt100_color(color: vt100::Color) -> Option<Color> {
+    match color {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(index) => Some(match index {
+            0 => Color::Black,
+            1 => Color::Red,
+            2 => Color::Green,
+            3 => Color::Yellow,
+            4 => Color::Blue,
+            5 => Color::Magenta,
+            6 => Color::Cyan,
+            7 => Color::Gray,
+            8 => Color::DarkGray,
+            9 => Color::LightRed,
+            10 => Color::LightGreen,
+            11 => Color::LightYellow,
+            12 => Color::LightBlue,
+            13 => Color::LightMagenta,
+            14 => Color::LightCyan,
+            15 => Color::White,
+            _ => Color::Indexed(index),
+        }),
+        vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
+    }
+}
+
+fn default_model_for(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Claude => "sonnet",
+        Backend::Codex => "gpt-5.5",
+    }
+}
+
+fn suggestions_for(app: &App) -> Vec<Suggestion> {
+    let input = app.task_input.trim_start();
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+
+    if input.starts_with("/model") {
+        let query = input
+            .strip_prefix("/model")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        return model_suggestions(app.backend)
+            .into_iter()
+            .filter(|suggestion| {
+                query.is_empty()
+                    || suggestion.label.to_ascii_lowercase().contains(&query)
+                    || suggestion.detail.to_ascii_lowercase().contains(&query)
+            })
+            .collect();
+    }
+
+    if input.starts_with("/backend") {
+        let query = input
+            .strip_prefix("/backend")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        return vec![
+            Suggestion {
+                label: "claude".to_string(),
+                detail: "switch backend".to_string(),
+                action: SuggestionAction::SetBackend(Backend::Claude),
+            },
+            Suggestion {
+                label: "codex".to_string(),
+                detail: "switch backend".to_string(),
+                action: SuggestionAction::SetBackend(Backend::Codex),
+            },
+        ]
+        .into_iter()
+        .filter(|suggestion| query.is_empty() || suggestion.label.starts_with(&query))
+        .collect();
+    }
+
+    let query = input.trim_start_matches('/').to_ascii_lowercase();
+    command_suggestions()
+        .into_iter()
+        .filter(|suggestion| {
+            query.is_empty()
+                || suggestion.label.trim_start_matches('/').starts_with(&query)
+                || suggestion.detail.to_ascii_lowercase().contains(&query)
+        })
+        .collect()
+}
+
+fn command_suggestions() -> Vec<Suggestion> {
+    vec![
+        Suggestion {
+            label: "/model".to_string(),
+            detail: "pick model for active backend".to_string(),
+            action: SuggestionAction::Insert("/model ".to_string()),
+        },
+        Suggestion {
+            label: "/backend".to_string(),
+            detail: "switch claude/codex".to_string(),
+            action: SuggestionAction::Insert("/backend ".to_string()),
+        },
+        Suggestion {
+            label: "/clear".to_string(),
+            detail: "clear local dashboard runs".to_string(),
+            action: SuggestionAction::ClearRuns,
+        },
+        Suggestion {
+            label: "/help".to_string(),
+            detail: "show shortcuts".to_string(),
+            action: SuggestionAction::ShowHelp,
+        },
+    ]
+}
+
+fn model_suggestions(backend: Backend) -> Vec<Suggestion> {
+    let models: &[(&str, &str)] = match backend {
+        Backend::Claude => &[
+            ("sonnet", "fast default"),
+            ("sonnet[1m]", "large context"),
+            ("opus", "stronger reasoning"),
+            ("opus[1m]", "large context"),
+            ("haiku", "small and fast"),
+            ("claude-sonnet-4-6", "explicit id"),
+        ],
+        Backend::Codex => &[
+            ("gpt-5.5", "default"),
+            ("gpt-5.4-codex", "coding tuned"),
+            ("gpt-5.4", "general"),
+            ("gpt-5.3-codex", "coding tuned"),
+            ("gpt-5.3-codex-spark", "fast coding"),
+        ],
+    };
+
+    models
+        .iter()
+        .map(|(model, detail)| Suggestion {
+            label: (*model).to_string(),
+            detail: (*detail).to_string(),
+            action: SuggestionAction::SetModel((*model).to_string()),
+        })
+        .collect()
 }
 
 fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
@@ -843,7 +1216,7 @@ fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
             ];
-            if model != "default" {
+            if !model.trim().is_empty() {
                 args.push("--model".to_string());
                 args.push(model.to_string());
             }
@@ -863,7 +1236,7 @@ fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
                 "-c".to_string(),
                 "model_supports_reasoning_summaries=true".to_string(),
             ];
-            if model != "default" {
+            if !model.trim().is_empty() {
                 args.push("-m".to_string());
                 args.push(model.to_string());
             }
@@ -897,30 +1270,78 @@ fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
     let bytes = match key.code {
         KeyCode::Char(ch) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match ch {
-                    'c' => vec![0x03],
-                    'd' => vec![0x04],
-                    'u' => vec![0x15],
-                    'w' => vec![0x17],
-                    _ => return None,
-                }
+                control_char_bytes(ch)?
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::META)
+            {
+                let mut bytes = vec![0x1b];
+                bytes.extend(ch.to_string().into_bytes());
+                bytes
             } else {
                 ch.to_string().into_bytes()
             }
         }
         KeyCode::Enter => b"\r".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Backspace => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            {
+                vec![0x15]
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                b"\x1b\x7f".to_vec()
+            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                vec![0x17]
+            } else {
+                vec![0x7f]
+            }
+        }
         KeyCode::Esc => vec![0x1b],
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => b"\x1bb".to_vec(),
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => b"\x1bf".to_vec(),
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => b"\x1b[1;5D".to_vec(),
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => b"\x1b[1;5C".to_vec(),
         KeyCode::Left => b"\x1b[D".to_vec(),
         KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Up => modified_arrow("A", key.modifiers),
+        KeyCode::Down => modified_arrow("B", key.modifiers),
         KeyCode::Home => b"\x1b[H".to_vec(),
         KeyCode::End => b"\x1b[F".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         _ => return None,
     };
     Some(bytes)
+}
+
+fn control_char_bytes(ch: char) -> Option<Vec<u8>> {
+    let lower = ch.to_ascii_lowercase();
+    if lower.is_ascii_lowercase() {
+        return Some(vec![(lower as u8) - b'a' + 1]);
+    }
+    match ch {
+        '[' => Some(vec![0x1b]),
+        '\\' => Some(vec![0x1c]),
+        ']' => Some(vec![0x1d]),
+        '^' => Some(vec![0x1e]),
+        '_' => Some(vec![0x1f]),
+        '?' => Some(vec![0x7f]),
+        _ => None,
+    }
+}
+
+fn modified_arrow(final_byte: &str, modifiers: KeyModifiers) -> Vec<u8> {
+    let modifier_code = if modifiers.contains(KeyModifiers::CONTROL) {
+        Some(5)
+    } else if modifiers.contains(KeyModifiers::ALT) {
+        Some(3)
+    } else {
+        None
+    };
+    match modifier_code {
+        Some(code) => format!("\x1b[1;{code}{final_byte}").into_bytes(),
+        None => format!("\x1b[{final_byte}").into_bytes(),
+    }
 }
 
 fn current_branch() -> Option<String> {

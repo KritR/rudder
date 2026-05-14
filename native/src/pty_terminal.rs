@@ -106,6 +106,18 @@ pub struct TerminalPane {
     size: TerminalSize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledTerminalCell {
+    pub contents: String,
+    pub fg: vt100::Color,
+    pub bg: vt100::Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
 impl TerminalPane {
     /// Spawn the user's shell when `command` is `None`, or spawn the supplied
     /// program and arguments when it is `Some`.
@@ -219,6 +231,49 @@ impl TerminalPane {
             .rows(0, self.size.cols)
             .map(|line| line.trim_end_matches(' ').to_string())
             .collect()
+    }
+
+    pub fn styled_lines(&mut self) -> Vec<Vec<StyledTerminalCell>> {
+        self.drain_output();
+        let screen = self.parser.screen();
+        let mut rows = Vec::with_capacity(self.size.rows as usize);
+
+        for row in 0..self.size.rows {
+            let mut cells = Vec::with_capacity(self.size.cols as usize);
+            for col in 0..self.size.cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let contents = if cell.has_contents() {
+                    cell.contents().to_string()
+                } else {
+                    " ".to_string()
+                };
+                cells.push(StyledTerminalCell {
+                    contents,
+                    fg: cell.fgcolor(),
+                    bg: cell.bgcolor(),
+                    bold: cell.bold(),
+                    dim: cell.dim(),
+                    italic: cell.italic(),
+                    underline: cell.underline(),
+                    inverse: cell.inverse(),
+                });
+            }
+
+            while cells
+                .last()
+                .is_some_and(|cell| cell.contents == " " && cell.bg == vt100::Color::Default)
+            {
+                cells.pop();
+            }
+            rows.push(cells);
+        }
+
+        rows
     }
 
     pub fn size(&self) -> TerminalSize {
