@@ -1,0 +1,16 @@
+[package]
+name = "rudder-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "rudder_native"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+portable-pty = "0.9.0"
+ratatui = "0.30"
+vt100 = "0.16.2"

@@ -295,19 +295,19 @@
         <section>
           <h1>Agent worktrees, without the mess.</h1>
           <p class="lede">
-            Rudder is a terminal command center for Claude Code and Codex. Start
-            tasks, watch agents, keep each run isolated, then merge the work when
-            it is ready.
+            Rudder is a native terminal command center for Claude Code and
+            Codex. Start tasks, watch agents, keep each run isolated, then merge
+            the work when it is ready.
           </p>
           <div class="install">
-            <code id="install-command">npm install -g @viraatdas/rudder</code>
+            <code id="install-command">npm install -g @viraatdas/rudder@latest</code>
             <button class="copy" type="button" data-copy="install-command">Copy</button>
           </div>
 
           <div class="points">
             <div class="point">
               <strong>Three panes, one flow</strong>
-              <span>Agents on the left, live worker on the right, task input at the bottom.</span>
+              <span>Agents on the left, a real PTY worker on the right, task input at the bottom.</span>
             </div>
             <div class="point">
               <strong>Native agents</strong>
@@ -319,7 +319,7 @@
             </div>
             <div class="point">
               <strong>Driven to completion</strong>
-              <span>When a pane exits, Rudder verifies the run, waits briefly, then restarts the agent with a focused follow-up if tests or cleanup are still missing.</span>
+              <span>When a worker exits with changes, Rudder waits briefly, then sends a focused verification follow-up so the task keeps moving toward done.</span>
             </div>
             <div class="point">
               <strong>Merge with one key</strong>

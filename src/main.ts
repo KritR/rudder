@@ -1,8 +1,10 @@
+import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import { findRepoRoot } from "./git.js";
+import { resolveNativeBinaryPath } from "./native-binary.js";
 import {
   cleanupRuns,
   deleteRun,
@@ -44,6 +46,7 @@ type Parsed = {
     help?: boolean;
     version?: boolean;
     noTmux?: boolean;
+    noNative?: boolean;
     headless?: boolean;
     tmuxSession?: string;
   };
@@ -75,16 +78,7 @@ export async function main(): Promise<void> {
     }
     if (!parsed.command && isTty() && !parsed.flags.help) {
       await maybeOnboard();
-      if (!parsed.flags.noTmux && !parsed.flags.headless && hasTmux()) {
-        await openTmuxDashboard(parsed);
-        return;
-      }
-      await runInteractiveTui({
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-        worktree: parsed.flags.worktree,
-        detach: parsed.flags.detach,
-      });
+      await openDashboard(parsed);
       return;
     }
     printHelp();
@@ -135,9 +129,12 @@ export async function main(): Promise<void> {
       return;
     }
     case "tmux":
-    case "dashboard":
       await maybeOnboard();
       await openTmuxDashboard(parsed);
+      return;
+    case "dashboard":
+      await maybeOnboard();
+      await openDashboard(parsed);
       return;
     case "tui":
       await maybeOnboard();
@@ -356,6 +353,10 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.noTmux = true;
       continue;
     }
+    if (arg === "--no-native") {
+      parsed.flags.noNative = true;
+      continue;
+    }
     if (arg === "--headless") {
       parsed.flags.headless = true;
       continue;
@@ -447,6 +448,52 @@ async function maybeOnboard(): Promise<void> {
   await runOnboard();
 }
 
+async function openDashboard(parsed: Parsed): Promise<void> {
+  if (parsed.flags.noTmux || parsed.flags.headless) {
+    await runInteractiveTui({
+      backend: parsed.flags.backend,
+      model: parsed.flags.model,
+      worktree: parsed.flags.worktree,
+      detach: parsed.flags.detach,
+    });
+    return;
+  }
+  if (!parsed.flags.noNative && process.env.RUDDER_LEGACY_TMUX !== "1" && await runNativeDashboard()) {
+    return;
+  }
+  if (hasTmux()) {
+    await openTmuxDashboard(parsed);
+    return;
+  }
+  await runInteractiveTui({
+    backend: parsed.flags.backend,
+    model: parsed.flags.model,
+    worktree: parsed.flags.worktree,
+    detach: parsed.flags.detach,
+  });
+}
+
+async function runNativeDashboard(): Promise<boolean> {
+  const nativeBinary = resolveNativeBinaryPath();
+  if (!nativeBinary) {
+    return false;
+  }
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const child = spawn(nativeBinary, process.argv.slice(2), {
+        stdio: "inherit",
+        env: process.env,
+      });
+      child.on("error", reject);
+      child.on("exit", (exitCode) => resolve(exitCode));
+    });
+    process.exitCode = code ?? 1;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function openTmuxDashboard(parsed: Parsed): Promise<void> {
   if (!hasTmux()) {
     await runInteractiveTui({
@@ -531,6 +578,7 @@ Options:
   -b, --backend <backend>         claude or codex
   -C, --cwd <dir>                 Run from another directory
       --no-tmux                   Use the legacy TUI for bare rudder
+      --no-native                 Use the tmux dashboard instead of native
       --headless                  Alias for --no-tmux on bare rudder
       --json                      Machine-readable output
   -v, --version                   Print version

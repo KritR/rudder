@@ -13,9 +13,9 @@
 [![Website](https://img.shields.io/badge/site-rudder.viraat.dev-111111.svg)](https://rudder.viraat.dev)
 
 Rudder is a Claude Code-style terminal command center for running coding agents
-without letting parallel tasks fight over the same checkout. It opens a tmux
-dashboard, creates one git worktree per task, and launches real Claude Code or
-Codex terminal panes so you keep the full native agent experience.
+without letting parallel tasks fight over the same checkout. It opens a native
+three-pane dashboard, creates one git worktree per task, and launches real
+Claude Code or Codex processes inside the worker pane.
 
 ## Quick Start
 
@@ -47,7 +47,6 @@ npx @viraatdas/rudder@latest --help
 
 - Node.js 20 or newer
 - Git, for run tracking and worktree isolation
-- tmux, for the native multi-pane dashboard
 - Claude Code and/or Codex installed and logged in
 
 Check your setup:
@@ -74,17 +73,16 @@ Detected auth sources:
 
 ## Run
 
-Open the tmux dashboard:
+Open the native dashboard:
 
 ```bash
 rudder
 ```
 
-The tmux UI has three real panes:
+The UI has three panes:
 
 - left: the Rudder agent list
-- right: the worker pane, respawned as a native `claude` or `codex` process for
-  the selected task
+- right: the worker pane, backed by a real PTY running `claude` or `codex`
 - bottom: the task input pane for creating new agents
 
 Focus the worker pane to use Claude Code or Codex directly, including their
@@ -94,19 +92,18 @@ terminal UI.
 | Key | Action |
 | --- | --- |
 | `Enter` | Start a task, or focus the selected worker if the task box is empty |
-| `Tab` | Move focus to the next tmux pane |
+| `Tab` | Move focus to the next pane |
 | `j` / `k` or arrows | Select an agent run |
-| `f` | Focus the selected native worker pane |
 | `/model` | Open the model picker |
 | `s` | Stop selected run |
 | `d` | Delete selected run, with an offer to merge first when there are changes |
 | `m` | Merge selected completed worktree run |
 | `Cmd+Backspace` / `Ctrl+U` | Clear the input line |
-| `q` or `Ctrl+C` | Detach from the tmux session |
+| `q` or `Ctrl+C` | Quit the dashboard |
 
 Inside a worker pane, Rudder is out of the way. You are in the real Claude Code
-or Codex process. Use tmux mouse support, your terminal copy mode, or native
-agent keybindings normally.
+or Codex process. Use the agent's slash commands and native keybindings
+normally.
 
 Slash commands:
 
@@ -116,8 +113,8 @@ Slash commands:
 /model <model-id>
 ```
 
-If tmux is not installed, or you pass `--no-tmux`, Rudder falls back to the
-legacy full-screen stream TUI.
+The older tmux dashboard is still available with `rudder tmux` or
+`RUDDER_LEGACY_TMUX=1 rudder`.
 
 ## Models
 
@@ -142,8 +139,8 @@ model_reasoning_effort="<value>"`.
 
 ## Worktrees And Merging
 
-Rudder enforces one active agent per checkout. If you start another task in the
-same repo, Rudder creates a separate git worktree and runs the agent there.
+Rudder creates a separate git worktree for each task in the native dashboard, so
+parallel agents do not edit the same checkout.
 
 ```bash
 rudder run --worktree "try the alternate implementation"
@@ -169,15 +166,14 @@ Before a task starts, Rudder writes `RUDDER.md` into the checkout and adds it to
 are working on, so new Claude Code or Codex workers can avoid stepping on the
 same work.
 
-For tmux-launched agents, the contract is injected into the native process at
-startup. The worker pane remains yours after the initial task, so you can keep
-typing into Claude Code or Codex directly. Headless one-shot runs still use
-Rudder's verifier and steering loop.
+For native dashboard agents, Rudder writes `RUDDER.md` before launch and asks the
+agent to read it first. The worker pane remains yours while the agent runs, so
+you can tab into it and type directly into Claude Code or Codex.
 
-When a headless run stops, Rudder checks whether the task looks complete and can
-send a follow-up prompt asking for the remaining work, tests, and cleanup. In the
-tmux dashboard, the native worker stays available for manual steering after the
-initial task.
+When a native worker exits successfully, Rudder waits 10 seconds, checks whether
+the worktree has changes, and can restart the same backend with a focused
+verification prompt. Headless one-shot runs still use Rudder's verifier and
+steering loop.
 
 ## One-Shot Commands
 
