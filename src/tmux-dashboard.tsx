@@ -214,7 +214,8 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [commandIndex, setCommandIndex] = useState(0);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelIndex, setModelIndex] = useState(0);
-  const [models, setModels] = useState<ModelOption[]>([]);
+  const [claudeModels, setClaudeModels] = useState<ModelOption[]>([]);
+  const [codexModels, setCodexModels] = useState<ModelOption[]>([]);
   const [taskPaneId, setTaskPaneId] = useState<string | undefined>();
 
   const refresh = useCallback(async () => {
@@ -238,10 +239,19 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
 
   const commandOptions = useMemo(() => filterSlashCommands(input), [input]);
   const commandMenuOpen = !modelPickerOpen && input.startsWith("/") && !isExactRunnableCommand(input) && commandOptions.length > 0;
-  const configuredDefault = modelForBackend(backend, config);
+  const claudeDefault = config?.backends.claude?.model;
+  const codexDefault = config?.backends.codex?.model;
   const modelOptions = useMemo(
-    () => models.length ? models : fallbackModelOptions(backend, configuredDefault),
-    [backend, configuredDefault, models],
+    () => {
+      const primary = backend === "claude"
+        ? withBackend(claudeModels.length ? claudeModels : fallbackModelOptions("claude", claudeDefault), "claude")
+        : withBackend(codexModels.length ? codexModels : fallbackModelOptions("codex", codexDefault), "codex");
+      const secondary = backend === "claude"
+        ? withBackend(codexModels.length ? codexModels : fallbackModelOptions("codex", codexDefault), "codex")
+        : withBackend(claudeModels.length ? claudeModels : fallbackModelOptions("claude", claudeDefault), "claude");
+      return [...primary, ...secondary];
+    },
+    [backend, claudeDefault, claudeModels, codexDefault, codexModels],
   );
 
   const setTaskInput = useCallback((next: string | ((current: string) => string)) => {
@@ -256,23 +266,20 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
 
   useEffect(() => {
     let cancelled = false;
-    void discoverModelOptions(backend, configuredDefault)
-      .then((options) => {
+    void Promise.all([
+      discoverModelOptions("claude", claudeDefault).catch(() => fallbackModelOptions("claude", claudeDefault)),
+      discoverModelOptions("codex", codexDefault).catch(() => fallbackModelOptions("codex", codexDefault)),
+    ]).then(([nextClaudeModels, nextCodexModels]) => {
         if (!cancelled) {
-          setModels(options);
-          setModelIndex(0);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setModels(fallbackModelOptions(backend, configuredDefault));
+          setClaudeModels(nextClaudeModels);
+          setCodexModels(nextCodexModels);
           setModelIndex(0);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [backend, configuredDefault]);
+  }, [claudeDefault, codexDefault]);
 
   useEffect(() => {
     if (!taskPaneId) {
@@ -284,6 +291,11 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const submit = useCallback(async (override?: string) => {
     const task = (override ?? inputRef.current).trim();
     if (!task || submitting) {
+      return;
+    }
+    const resolvedCommand = resolveSlashCommand(task);
+    if (resolvedCommand && resolvedCommand.value !== task && !resolvedCommand.complete) {
+      await submit(resolvedCommand.value);
       return;
     }
     if (task === "/model") {
@@ -376,9 +388,11 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       }
       if (key.return) {
         const option = modelOptions[modelIndex];
+        const nextBackend = toNativeBackend(option?.backend ?? backend);
         const nextModel = option?.value;
+        setBackend(nextBackend);
         setModel(nextModel);
-        void updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { model: nextModel });
+        void updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { backend: nextBackend, model: nextModel });
         setModelPickerOpen(false);
         setTaskInput("");
         setNotice("");
@@ -466,21 +480,23 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
 
 function CommandMenu({ commands, selected }: { commands: SlashCommand[]; selected: number }): React.ReactElement {
   const command = commands[Math.max(0, Math.min(selected, commands.length - 1))];
-  return <Text color="cyan">{command ? `${command.label}  ${command.detail}` : "No command"}</Text>;
+  return <Text color="cyan">{command ? `> ${command.label}  ${command.detail}` : "No command"}</Text>;
 }
 
 function ModelMenu({ options, selected, backend }: { options: ModelOption[]; selected: number; backend: NativeBackendId }): React.ReactElement {
   const start = Math.max(0, Math.min(selected - 2, Math.max(0, options.length - 7)));
   const visible = options.slice(start, start + 7);
-  const otherBackend = backend === "claude" ? "codex" : "claude";
   return (
     <Box flexDirection="column">
-      <Text color="gray">Pick a {backend} model. Use /backend {otherBackend} for {otherBackend} models.</Text>
+      <Text color="gray">Pick a model. Claude and Codex are both listed.</Text>
       {visible.map((option, index) => {
         const absoluteIndex = start + index;
+        const optionBackend = toNativeBackend(option.backend ?? backend);
         return (
-          <Text key={`${option.value ?? "default"}-${absoluteIndex}`} color={absoluteIndex === selected ? "cyan" : "gray"}>
-            {absoluteIndex === selected ? "> " : "  "}{option.label}{option.detail ? `  ${option.detail}` : ""}
+          <Text key={`${optionBackend}-${option.value ?? "default"}-${absoluteIndex}`} color={absoluteIndex === selected ? "cyan" : "gray"}>
+            {absoluteIndex === selected ? "> " : "  "}
+            <Text color={optionBackend === "claude" ? "cyan" : "green"}>{optionBackend}</Text>
+            {"  "}{option.label}{option.detail ? `  ${option.detail}` : ""}
           </Text>
         );
       })}
@@ -533,6 +549,10 @@ function modelForBackend(backend: NativeBackendId, config: RudderConfig | null):
   return backend === "claude" ? config?.backends.claude?.model : config?.backends.codex?.model;
 }
 
+function withBackend(options: ModelOption[], backend: NativeBackendId): ModelOption[] {
+  return options.map((option) => ({ ...option, backend }));
+}
+
 function filterSlashCommands(input: string): SlashCommand[] {
   if (!input.startsWith("/")) {
     return [];
@@ -545,6 +565,16 @@ function filterSlashCommands(input: string): SlashCommand[] {
 function isExactRunnableCommand(input: string): boolean {
   const trimmed = input.trim();
   return SLASH_COMMANDS.some((command) => !command.complete && command.value === trimmed);
+}
+
+function resolveSlashCommand(input: string): SlashCommand | undefined {
+  if (!input.startsWith("/") || input.startsWith("/model ")) {
+    return undefined;
+  }
+  if (isExactRunnableCommand(input)) {
+    return undefined;
+  }
+  return filterSlashCommands(input)[0];
 }
 
 function isLineClear(chunk: string, key: { ctrl?: boolean; meta?: boolean; backspace?: boolean; delete?: boolean }): boolean {

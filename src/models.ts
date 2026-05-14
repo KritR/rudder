@@ -12,6 +12,7 @@ export type ModelOption = {
   label: string;
   value?: string;
   detail?: string;
+  backend?: BackendId;
 };
 
 type CodexCache = {
