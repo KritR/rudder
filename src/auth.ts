@@ -13,7 +13,6 @@ import {
   commandExists,
   expandHome,
   pathExists,
-  promptConfirm,
   promptSelect,
   promptText,
   readJson,
@@ -148,24 +147,23 @@ export async function runOnboard(options?: { nonInteractive?: boolean; json?: bo
   const config = await loadConfig();
   let store = await syncExternalCredentials();
   const detection = await detectEnvironment();
+  const acpxBehind =
+    detection.acpxCommand &&
+    detection.acpxVersion &&
+    detection.npmAcpxLatest &&
+    detection.acpxVersion !== detection.npmAcpxLatest;
+
+  if (!detection.acpxCommand || acpxBehind) {
+    console.log(
+      detection.acpxCommand
+        ? `Updating acpx ${detection.acpxVersion} to latest ${detection.npmAcpxLatest}...`
+        : "Installing acpx@latest...",
+    );
+    await runCommand("npm", ["install", "-g", "acpx@latest"]);
+  }
 
   if (!options?.nonInteractive && process.stdin.isTTY) {
-    const acpxBehind =
-      detection.acpxCommand &&
-      detection.acpxVersion &&
-      detection.npmAcpxLatest &&
-      detection.acpxVersion !== detection.npmAcpxLatest;
-    if (!detection.acpxCommand || acpxBehind) {
-      const install = await promptConfirm(
-        detection.acpxCommand
-          ? `Update acpx ${detection.acpxVersion} to latest ${detection.npmAcpxLatest}?`
-          : "Install acpx globally with npm install -g acpx@latest?",
-        true,
-      );
-      if (install) {
-        await runCommand("npm", ["install", "-g", "acpx@latest"]);
-      }
-    }
+    printDetectedAgentAuth(detection);
     store = await configureAnthropic(store, config);
     store = await configureOpenAI(store, config);
   }
@@ -193,6 +191,22 @@ export async function runOnboard(options?: { nonInteractive?: boolean; json?: bo
   console.log('  try: rudder "fix the failing tests"');
 }
 
+function printDetectedAgentAuth(detection: Detection): void {
+  console.log("Agent auth");
+  console.log(
+    `  claude: ${detection.claudeCredentialSource ? `detected (${detection.claudeCredentialSource})` : detection.anthropicEnv ? "detected (ANTHROPIC_API_KEY)" : "not detected"}`,
+  );
+  console.log(
+    `  codex:  ${detection.codexCredentialSource ? `detected (${detection.codexCredentialSource})` : detection.openaiEnv ? "detected (OPENAI_API_KEY)" : "not detected"}`,
+  );
+  if (!detection.claudeCredentialSource && !detection.anthropicEnv) {
+    console.log("    Claude can be set up later from Claude Code or when choosing Claude models.");
+  }
+  if (!detection.codexCredentialSource && !detection.openaiEnv) {
+    console.log("    Codex can be set up later from Codex or when choosing Codex models.");
+  }
+}
+
 async function configureAnthropic(
   store: AuthProfileStore,
   config: RudderConfig,
@@ -217,7 +231,7 @@ async function configureAnthropic(
       { value: "api-key", label: "Anthropic API key", hint: "Direct API key" },
       { value: "skip", label: "Skip Anthropic for now" },
     ],
-    "setup-token",
+    "skip",
   );
   if (choice === "setup-token") {
     const token = await promptText("Paste Anthropic setup-token");
@@ -260,7 +274,7 @@ async function configureOpenAI(
       { value: "api-key", label: "OpenAI API key", hint: "Direct API key" },
       { value: "skip", label: "Skip OpenAI for now" },
     ],
-    "codex-login",
+    "skip",
   );
   if (choice === "codex-login") {
     await runCommand("codex", ["login"]);

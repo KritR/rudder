@@ -12,7 +12,8 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -41,6 +42,12 @@ enum FocusPane {
     Agents,
     Worker,
     Task,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerView {
+    Terminal,
+    Diff,
 }
 
 impl FocusPane {
@@ -127,6 +134,8 @@ impl AgentStatus {
 
 struct App {
     focus: FocusPane,
+    nav_mode: bool,
+    worker_view: WorkerView,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -139,6 +148,10 @@ struct App {
     notice: Option<String>,
     delete_pending: Option<String>,
     picker_index: usize,
+    diff_scroll: usize,
+    agents_area: Option<Rect>,
+    worker_area: Option<Rect>,
+    task_area: Option<Rect>,
 }
 
 struct AgentRun {
@@ -187,6 +200,8 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             focus: FocusPane::Task,
+            nav_mode: false,
+            worker_view: WorkerView::Terminal,
             cwd,
             branch: current_branch(),
             task_input: String::new(),
@@ -199,10 +214,53 @@ impl App {
             notice: None,
             delete_pending: None,
             picker_index: 0,
+            diff_scroll: 0,
+            agents_area: None,
+            worker_area: None,
+            task_area: None,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            self.nav_mode = !self.nav_mode;
+            self.notice = Some(if self.nav_mode {
+                "nav mode: 1 agents  2 worker  3 task  v diff  Esc exits".to_string()
+            } else {
+                "worker input restored".to_string()
+            });
+            return false;
+        }
+
+        if self.nav_mode {
+            return self.handle_nav_key(key);
+        }
+
+        if key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::META)
+        {
+            match key.code {
+                KeyCode::Char('1') => {
+                    self.focus = FocusPane::Agents;
+                    return false;
+                }
+                KeyCode::Char('2') => {
+                    self.focus = FocusPane::Worker;
+                    return false;
+                }
+                KeyCode::Char('3') => {
+                    self.focus = FocusPane::Task;
+                    return false;
+                }
+                KeyCode::Char('v') => {
+                    self.toggle_worker_view();
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         let worker_has_terminal = self.focus == FocusPane::Worker
             && self
                 .agents
@@ -235,21 +293,40 @@ impl App {
         }
     }
 
+    fn handle_nav_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.nav_mode = false;
+                self.notice = Some("worker input restored".to_string());
+            }
+            KeyCode::Tab => self.focus = self.focus.next(),
+            KeyCode::BackTab => self.focus = self.focus.previous(),
+            KeyCode::Char('1') => self.focus = FocusPane::Agents,
+            KeyCode::Char('2') => self.focus = FocusPane::Worker,
+            KeyCode::Char('3') => self.focus = FocusPane::Task,
+            KeyCode::Char('v') => self.toggle_worker_view(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
+            KeyCode::Char('m') => self.merge_selected_agent(),
+            KeyCode::Char('M') => self.merge_all_ready(),
+            KeyCode::Char('d') => self.delete_selected_agent(),
+            KeyCode::Char('q') => return true,
+            _ => {}
+        }
+        false
+    }
+
     fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => return true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.selected_agent = self.selected_agent.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let last = self.agents.len().saturating_sub(1);
-                self.selected_agent = (self.selected_agent + 1).min(last);
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Enter => {
                 if !self.agents.is_empty() {
                     self.focus = FocusPane::Worker;
                 }
             }
+            KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('M') => self.merge_all_ready(),
             KeyCode::Char('m') => self.merge_selected_agent(),
             KeyCode::Char('d') => self.delete_selected_agent(),
@@ -259,6 +336,20 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
+        if self.worker_view == WorkerView::Diff {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('v') => self.worker_view = WorkerView::Terminal,
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_diff(-3),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_diff(3),
+                KeyCode::PageUp => self.scroll_diff(-20),
+                KeyCode::PageDown => self.scroll_diff(20),
+                KeyCode::Home => self.diff_scroll = 0,
+                KeyCode::Char('m') => self.merge_selected_agent(),
+                _ => {}
+            }
+            return false;
+        }
+
         if key.code == KeyCode::Char('q') && self.selected_terminal_mut().is_none() {
             return true;
         }
@@ -273,6 +364,26 @@ impl App {
             }
         }
         false
+    }
+
+    fn select_previous_agent(&mut self) {
+        self.selected_agent = self.selected_agent.saturating_sub(1);
+        self.diff_scroll = 0;
+    }
+
+    fn select_next_agent(&mut self) {
+        let last = self.agents.len().saturating_sub(1);
+        self.selected_agent = (self.selected_agent + 1).min(last);
+        self.diff_scroll = 0;
+    }
+
+    fn toggle_worker_view(&mut self) {
+        self.worker_view = match self.worker_view {
+            WorkerView::Terminal => WorkerView::Diff,
+            WorkerView::Diff => WorkerView::Terminal,
+        };
+        self.diff_scroll = 0;
+        self.focus = FocusPane::Worker;
     }
 
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
@@ -455,6 +566,52 @@ impl App {
                 self.clamp_picker_index();
             }
             FocusPane::Agents => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => return,
+            _ => return,
+        };
+
+        if self
+            .agents_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+        {
+            if delta < 0 {
+                self.select_previous_agent();
+            } else {
+                self.select_next_agent();
+            }
+            return;
+        }
+
+        if self
+            .worker_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+        {
+            self.focus = FocusPane::Worker;
+            match self.worker_view {
+                WorkerView::Diff => self.scroll_diff(delta),
+                WorkerView::Terminal => self.scroll_worker(delta),
+            }
+        }
+    }
+
+    fn scroll_diff(&mut self, delta: isize) {
+        self.diff_scroll = if delta.is_negative() {
+            self.diff_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.diff_scroll.saturating_add(delta as usize)
+        };
+    }
+
+    fn scroll_worker(&mut self, delta: isize) {
+        if let Some(terminal) = self.selected_terminal_mut() {
+            terminal.scrollback_by(-delta);
         }
     }
 
@@ -899,6 +1056,7 @@ fn setup_terminal() -> Result<Tui> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -912,6 +1070,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -934,6 +1093,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 }
                 Event::Key(_) => {}
                 Event::Paste(text) => app.handle_paste(text),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
         }
@@ -964,6 +1124,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(rows[0]);
 
+    app.agents_area = Some(main[0]);
+    app.worker_area = Some(main[2]);
+    app.task_area = Some(rows[2]);
+
     render_agents(frame, main[0], app);
     render_gutter(frame, main[1], Gutter::Vertical);
     render_worker(frame, main[2], app);
@@ -990,26 +1154,24 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, gutter: Gutter) {
 }
 
 fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focused = app.focus == FocusPane::Agents;
     let mut lines = vec![
         ListItem::new(Line::from(Span::styled(
             "rudder",
-            Style::default().add_modifier(Modifier::BOLD),
+            pane_text_style(focused).add_modifier(Modifier::BOLD),
         ))),
         ListItem::new(Line::from(vec![
-            Span::raw(app.cwd.display().to_string()),
+            Span::styled(app.cwd.display().to_string(), pane_text_style(focused)),
             Span::raw(" "),
             Span::styled(
                 app.branch.as_deref().unwrap_or("no-branch"),
-                Style::default().fg(Color::Gray),
+                muted_style(focused),
             ),
         ])),
         ListItem::new(Line::from(vec![
-            Span::raw("agents "),
-            Span::styled(
-                app.agents.len().to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(" runs"),
+            Span::styled("agents ", pane_text_style(focused)),
+            Span::styled(app.agents.len().to_string(), accent_style(focused)),
+            Span::styled(" runs", pane_text_style(focused)),
         ])),
         ListItem::new(Line::default()),
     ];
@@ -1018,44 +1180,50 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let selected = index == app.selected_agent;
         let marker = if selected { "> " } else { "  " };
         let task_style = if selected {
-            Style::default().add_modifier(Modifier::BOLD)
+            pane_text_style(focused).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            pane_text_style(focused)
         };
 
         lines.push(ListItem::new(Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(marker, accent_style(focused)),
             Span::styled(short_task(&agent.task), task_style),
         ])));
         lines.push(ListItem::new(Line::from(vec![
             Span::raw("  "),
             Span::styled(agent.status.as_str(), status_style(agent.status)),
             Span::raw("  "),
-            Span::styled(agent.backend.as_str(), Style::default().fg(Color::Gray)),
+            Span::styled(agent.backend.as_str(), muted_style(focused)),
             Span::raw("  "),
-            Span::styled(agent.model.as_str(), Style::default().fg(Color::Magenta)),
+            Span::styled(agent.model.as_str(), model_style(focused)),
             Span::styled(
                 format!("({})", effort_label(agent.effort)),
-                Style::default().fg(Color::Magenta),
+                model_style(focused),
             ),
         ])));
+        if let Some(summary) = diff_short_summary(agent) {
+            lines.push(ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(summary, muted_style(focused)),
+            ])));
+        }
     }
 
     if app.agents.is_empty() {
         lines.push(ListItem::new(Line::from(Span::styled(
             "no agents yet",
-            Style::default().fg(Color::DarkGray),
+            muted_style(focused),
         ))));
     }
 
     lines.push(ListItem::new(Line::default()));
     lines.push(ListItem::new(Line::from(Span::styled(
-        "j/k move  Enter focus  d del",
-        Style::default().fg(Color::Gray),
+        "j/k move  Enter focus  v diff  m merge",
+        muted_style(focused),
     ))));
 
     frame.render_widget(
-        List::new(lines).block(pane_block("agents", app.focus == FocusPane::Agents)),
+        List::new(lines).block(pane_block("agents", focused, app.nav_mode)),
         area,
     );
 }
@@ -1077,14 +1245,24 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
     }
 
-    let lines = worker_lines(app, inner.height as usize);
+    let lines = match app.worker_view {
+        WorkerView::Terminal => worker_lines(app, inner.height as usize),
+        WorkerView::Diff => diff_lines(app, inner.height as usize),
+    };
     let paragraph = Paragraph::new(lines)
-        .block(pane_block("worker", focused))
+        .block(pane_block(
+            match app.worker_view {
+                WorkerView::Terminal => "worker",
+                WorkerView::Diff => "diff",
+            },
+            focused,
+            app.nav_mode,
+        ))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
 
-    if focused {
+    if focused && app.worker_view == WorkerView::Terminal {
         set_worker_cursor(frame, inner, app);
     }
 }
@@ -1147,35 +1325,95 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let input = if app.task_input.is_empty() {
-        Line::from(Span::styled(
-            "Type a task or /model",
-            Style::default().fg(Color::DarkGray),
-        ))
+fn diff_lines(app: &App, height: usize) -> Vec<Line<'static>> {
+    let Some(run) = app.agents.get(app.selected_agent) else {
+        return vec![Line::from(Span::styled(
+            "No agent selected.",
+            Style::default().fg(Color::Gray),
+        ))];
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("diff ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(short_task(&run.task), Style::default().fg(Color::Gray)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "v/Esc worker  j/k scroll  m merge",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::default());
+
+    match git_diff_text(&run.cwd) {
+        Ok(diff) if diff.trim().is_empty() => {
+            lines.push(Line::from(Span::styled(
+                "No diff against HEAD.",
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        Ok(diff) => {
+            for line in diff.lines() {
+                lines.push(diff_line(line));
+            }
+        }
+        Err(error) => lines.push(Line::from(Span::styled(
+            format!("diff unavailable: {error}"),
+            Style::default().fg(Color::Red),
+        ))),
+    }
+
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = app.diff_scroll.min(max_scroll);
+    lines.into_iter().skip(scroll).take(height).collect()
+}
+
+fn diff_line(value: &str) -> Line<'static> {
+    let style = if value.starts_with("+++") || value.starts_with("---") {
+        Style::default().fg(Color::Gray)
+    } else if value.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if value.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if value.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else if value.starts_with("diff --git") {
+        Style::default().add_modifier(Modifier::BOLD)
     } else {
-        Line::from(app.task_input.as_str())
+        Style::default()
+    };
+    Line::from(Span::styled(value.to_string(), style))
+}
+
+fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focused = app.focus == FocusPane::Task;
+    let input = if app.task_input.is_empty() {
+        Line::from(Span::styled("Type a task or /model", muted_style(focused)))
+    } else {
+        Line::from(Span::styled(
+            app.task_input.as_str(),
+            pane_text_style(focused),
+        ))
     };
 
     let hint = app
         .notice
         .as_deref()
-        .unwrap_or("Enter start  Tab focus pane  /model");
+        .unwrap_or("Enter start  Tab focus  Alt-1/2/3 pane  /model");
     let paragraph = Paragraph::new(vec![
         input,
         Line::from(vec![
-            Span::styled(hint.to_string(), Style::default().fg(Color::Gray)),
+            Span::styled(hint.to_string(), muted_style(focused)),
             Span::raw("  "),
-            Span::styled(app.backend.as_str(), Style::default().fg(Color::Cyan)),
+            Span::styled(app.backend.as_str(), accent_style(focused)),
             Span::raw(" "),
-            Span::styled(app.model.as_str(), Style::default().fg(Color::Magenta)),
+            Span::styled(app.model.as_str(), model_style(focused)),
             Span::styled(
                 format!("({})", effort_label(app.effort)),
-                Style::default().fg(Color::Magenta),
+                model_style(focused),
             ),
         ]),
     ])
-    .block(pane_block("task", app.focus == FocusPane::Task));
+    .block(pane_block("task", focused, app.nav_mode));
 
     frame.render_widget(paragraph, area);
 
@@ -1248,7 +1486,7 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
-fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
+fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default()
             .fg(Color::Cyan)
@@ -1264,11 +1502,55 @@ fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
     } else {
         Style::default().fg(Color::Gray)
     };
+    let active = if focused {
+        if nav_mode {
+            " NAV"
+        } else {
+            " ACTIVE"
+        }
+    } else {
+        ""
+    };
 
     Block::default()
-        .title(Line::from(Span::styled(format!(" {title} "), title_style)))
+        .title(Line::from(Span::styled(
+            format!(" {title}{active} "),
+            title_style,
+        )))
         .borders(Borders::ALL)
         .border_style(border_style)
+}
+
+fn pane_text_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn muted_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Gray)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn accent_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn model_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn block_inner(area: Rect) -> Rect {
@@ -1278,6 +1560,10 @@ fn block_inner(area: Rect) -> Rect {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     }
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
 
 fn status_style(status: AgentStatus) -> Style {
@@ -2065,6 +2351,19 @@ fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn git_output_args(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(if message.is_empty() {
+            "git command failed".to_string()
+        } else {
+            message
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git").args(args).current_dir(cwd).output()?;
     if output.status.success() {
@@ -2076,6 +2375,38 @@ fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     } else {
         message
     });
+}
+
+fn diff_short_summary(run: &AgentRun) -> Option<String> {
+    let status = git_output(&run.cwd, ["status", "--short"]).ok()?;
+    if status.trim().is_empty() {
+        return None;
+    }
+    let stat = git_output_args(&run.cwd, &["diff", "--shortstat", "HEAD"]).ok();
+    if let Some(stat) = stat
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(stat);
+    }
+    let files = status.lines().count();
+    Some(format!(
+        "{files} file{} changed",
+        if files == 1 { "" } else { "s" }
+    ))
+}
+
+fn git_diff_text(cwd: &Path) -> Result<String> {
+    let stat = git_output_args(cwd, &["diff", "--stat", "HEAD"])?;
+    let diff = git_output_args(cwd, &["diff", "--color=never", "HEAD"])?;
+    if stat.trim().is_empty() && diff.trim().is_empty() {
+        let status = git_output(cwd, ["status", "--short"])?;
+        if status.trim().is_empty() {
+            return Ok(String::new());
+        }
+        return Ok(format!("Untracked or staged-only changes:\n\n{status}"));
+    }
+    Ok(format!("{stat}\n{diff}"))
 }
 
 fn play_completion_sound() {

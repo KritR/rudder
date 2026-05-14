@@ -287,6 +287,24 @@ impl TerminalPane {
         self.size
     }
 
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    pub fn scrollback_by(&mut self, rows: isize) {
+        let current = self.parser.screen().scrollback();
+        let next = if rows.is_negative() {
+            current.saturating_sub(rows.unsigned_abs())
+        } else {
+            current.saturating_add(rows as usize)
+        };
+        self.parser.screen_mut().set_scrollback(next);
+    }
+
+    pub fn reset_scrollback(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
     pub fn cursor(&self) -> TerminalCursor {
         let (row, col) = self.parser.screen().cursor_position();
         TerminalCursor {
