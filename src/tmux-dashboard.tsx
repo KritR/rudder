@@ -75,6 +75,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   const [notice, setNotice] = useState("");
   const [deleteIntent, setDeleteIntent] = useState<{ runId: string; canMerge: boolean } | null>(null);
   const finishedRef = useRef<Set<string> | null>(null);
+  const agentSnapshotRef = useRef("");
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -85,12 +86,24 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
       listRuns(root),
       loadTmuxDashboardState(root, defaults.tmuxSessionName),
     ]);
+    const nextSelectedRunId = state?.selectedRunId ?? selectedRunId ?? nextRuns[0]?.id;
+    const nextSnapshot = JSON.stringify({
+      root,
+      branch: nextBranch,
+      config: dashboardConfigSnapshot(nextConfig),
+      runs: nextRuns.map(runSnapshot),
+      selectedRunId: nextSelectedRunId,
+    });
+    if (nextSnapshot === agentSnapshotRef.current) {
+      return;
+    }
+    agentSnapshotRef.current = nextSnapshot;
     setRepoRoot(root);
     setBranch(nextBranch);
     setConfig(nextConfig);
     setRuns(nextRuns);
-    setSelectedRunId((current) => state?.selectedRunId ?? current ?? nextRuns[0]?.id);
-  }, [defaults.tmuxSessionName]);
+    setSelectedRunId(nextSelectedRunId);
+  }, [defaults.tmuxSessionName, selectedRunId]);
 
   useEffect(() => {
     void refresh();
@@ -232,6 +245,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [claudeEfforts, setClaudeEfforts] = useState<EffortOption[]>([]);
   const [codexEfforts, setCodexEfforts] = useState<EffortOption[]>([]);
   const [taskPaneId, setTaskPaneId] = useState<string | undefined>();
+  const taskSnapshotRef = useRef("");
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -239,13 +253,28 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       loadConfig(),
       loadTmuxDashboardState(root, defaults.tmuxSessionName),
     ]);
+    const nextBackend = state?.backend ?? toNativeBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
+    const nextModel = state?.model ?? defaults.model;
+    const nextEffort = state?.effort ?? effortForBackend(nextBackend, nextConfig);
+    const nextTaskPaneId = state?.taskPaneId;
+    const nextSnapshot = JSON.stringify({
+      root,
+      config: dashboardConfigSnapshot(nextConfig),
+      backend: nextBackend,
+      model: nextModel,
+      effort: nextEffort,
+      taskPaneId: nextTaskPaneId,
+    });
+    if (nextSnapshot === taskSnapshotRef.current) {
+      return;
+    }
+    taskSnapshotRef.current = nextSnapshot;
     setRepoRoot(root);
     setConfig(nextConfig);
-    const nextBackend = state?.backend ?? toNativeBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
     setBackend(nextBackend);
-    setModel(state?.model ?? defaults.model);
-    setEffort(state?.effort ?? effortForBackend(nextBackend, nextConfig));
-    setTaskPaneId(state?.taskPaneId);
+    setModel(nextModel);
+    setEffort(nextEffort);
+    setTaskPaneId(nextTaskPaneId);
   }, [defaults.backend, defaults.model, defaults.tmuxSessionName]);
 
   useEffect(() => {
@@ -631,6 +660,39 @@ function notifyFinishedRuns(runs: RunRecord[], ref: React.MutableRefObject<Set<s
 
 function isTerminalRun(run: RunRecord): boolean {
   return ["completed", "failed", "cancelled", "merged", "merge-conflict"].includes(run.status);
+}
+
+function dashboardConfigSnapshot(config: RudderConfig | null): unknown {
+  if (!config) {
+    return null;
+  }
+  return {
+    defaultBackend: config.defaultBackend,
+    lastUsedBackend: config.lastUsedBackend,
+    claude: {
+      model: config.backends.claude?.model,
+      effort: config.backends.claude?.effort,
+    },
+    codex: {
+      model: config.backends.codex?.model,
+      effort: config.backends.codex?.effort,
+      reasoningEffort: config.backends.codex?.reasoningEffort,
+    },
+  };
+}
+
+function runSnapshot(run: RunRecord): unknown {
+  return {
+    id: run.id,
+    task: run.task,
+    status: run.status,
+    backend: run.backend,
+    model: run.model,
+    effort: run.effort,
+    paneId: run.terminal?.paneId,
+    worktree: run.worktree.path,
+    updatedAt: run.updatedAt,
+  };
 }
 
 function playCompletionSound(): void {
