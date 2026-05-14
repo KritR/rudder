@@ -79,6 +79,7 @@ const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
 const configuredProviders = {
   google: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
   github: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
+  githubDevice: Boolean(githubDeviceClientId),
 };
 const s3 = new S3Client({ region: awsRegion });
 
