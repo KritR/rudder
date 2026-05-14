@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Box, Text, render, useInput, useWindowSize } from "ink";
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { startNativeRun, deleteRun, mergeRun, stopRun } from "./run-manager.js";
@@ -17,6 +17,23 @@ type PaneDefaults = {
   backend?: BackendId;
   model?: string;
 };
+
+type SlashCommand = {
+  label: string;
+  detail: string;
+  value: string;
+  complete?: string;
+};
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  { label: "/backend claude", detail: "use Claude Code for new tasks", value: "/backend claude" },
+  { label: "/backend codex", detail: "use Codex for new tasks", value: "/backend codex" },
+  { label: "/model", detail: "show model usage", value: "/model" },
+  { label: "/model <id>", detail: "set model for new tasks", value: "/model ", complete: "/model " },
+  { label: "/clear", detail: "clear the task input", value: "/clear" },
+  { label: "/help", detail: "show available task commands", value: "/help" },
+  { label: "/detach", detail: "detach the tmux session", value: "/detach" },
+];
 
 export async function runTmuxAgentPane(defaults: PaneDefaults): Promise<void> {
   const instance = render(<AgentPane defaults={defaults} />, {
@@ -189,6 +206,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [input, setInput] = useState("");
   const [notice, setNotice] = useState("Type a task. Tab moves focus between panes.");
   const [submitting, setSubmitting] = useState(false);
+  const [commandIndex, setCommandIndex] = useState(0);
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -208,8 +226,15 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     return () => clearInterval(timer);
   }, [refresh]);
 
-  const submit = useCallback(async () => {
-    const task = input.trim();
+  const commandOptions = useMemo(() => filterSlashCommands(input), [input]);
+  const commandMenuOpen = input.startsWith("/") && commandOptions.length > 0;
+
+  useEffect(() => {
+    setCommandIndex(0);
+  }, [input]);
+
+  const submit = useCallback(async (override?: string) => {
+    const task = (override ?? input).trim();
     if (!task || submitting) {
       return;
     }
@@ -235,6 +260,24 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setNotice(`backend ${nextBackend}`);
       return;
     }
+    if (task === "/clear") {
+      setInput("");
+      setNotice("cleared");
+      return;
+    }
+    if (task === "/help") {
+      setInput("");
+      setNotice("/backend claude|codex, /model <id>, /clear, /detach");
+      return;
+    }
+    if (task === "/detach") {
+      await detachClient(defaults.tmuxSessionName);
+      return;
+    }
+    if (task.startsWith("/")) {
+      setNotice("Unknown command. Type / to see commands.");
+      return;
+    }
     const state = await loadTmuxDashboardState(repoRoot, defaults.tmuxSessionName);
     if (!state) {
       setNotice("Rudder tmux state is missing. Reopen rudder.");
@@ -253,7 +296,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       });
       await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model });
       setInput("");
-      setNotice(`started ${shortId(run.id)} in worker pane`);
+      setNotice("started in worker pane");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
@@ -266,7 +309,34 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       void detachClient(defaults.tmuxSessionName);
       return;
     }
+    if (commandMenuOpen) {
+      if (key.upArrow || chunk === "k") {
+        setCommandIndex((current) => Math.max(0, current - 1));
+        return;
+      }
+      if (key.downArrow || chunk === "j") {
+        setCommandIndex((current) => Math.min(commandOptions.length - 1, current + 1));
+        return;
+      }
+      if (key.escape) {
+        setInput("");
+        setNotice("cancelled command");
+        return;
+      }
+    }
     if (key.return) {
+      if (commandMenuOpen) {
+        const command = commandOptions[commandIndex];
+        if (command?.complete) {
+          setInput(command.complete);
+          setNotice(command.detail);
+          return;
+        }
+        if (command) {
+          void submit(command.value);
+          return;
+        }
+      }
       void submit();
       return;
     }
@@ -295,7 +365,28 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         <Text color="cyan" bold>TASK</Text> {input}<Text color="cyan">_</Text>
         <Text color="gray">  {submitting ? "starting..." : notice}</Text>
       </Text>
-      <Text color="gray">Enter start  Tab focus pane  /backend claude|codex  /model &lt;id&gt;  {backend} {configured}</Text>
+      {commandMenuOpen ? (
+        <CommandMenu commands={commandOptions} selected={commandIndex} />
+      ) : (
+        <Text color="gray">Enter start  Tab focus pane  / commands  {backend} {configured}</Text>
+      )}
+    </Box>
+  );
+}
+
+function CommandMenu({ commands, selected }: { commands: SlashCommand[]; selected: number }): React.ReactElement {
+  const start = Math.max(0, Math.min(selected - 1, Math.max(0, commands.length - 3)));
+  const visible = commands.slice(start, start + 3);
+  return (
+    <Box flexDirection="column">
+      {visible.map((command, index) => {
+        const absoluteIndex = start + index;
+        return (
+        <Text key={command.label} color={absoluteIndex === selected ? "cyan" : "gray"}>
+          {absoluteIndex === selected ? "> " : "  "}{command.label}  {command.detail}
+        </Text>
+        );
+      })}
     </Box>
   );
 }
@@ -342,6 +433,15 @@ function modelLabel(run: RunRecord, config: RudderConfig | null): string {
       : config?.backends.codex?.model)
     ?? "default";
   return summarize(model, 18);
+}
+
+function filterSlashCommands(input: string): SlashCommand[] {
+  if (!input.startsWith("/")) {
+    return [];
+  }
+  const query = input.toLowerCase();
+  const matches = SLASH_COMMANDS.filter((command) => command.label.toLowerCase().startsWith(query));
+  return matches.length ? matches : SLASH_COMMANDS.filter((command) => command.label.toLowerCase().includes(query.slice(1)));
 }
 
 function shortId(id: string): string {
