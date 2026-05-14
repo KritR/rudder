@@ -12,6 +12,7 @@ export type TmuxDashboardState = {
   agentPaneId: string;
   workerPaneId: string;
   taskPaneId: string;
+  gapPaneIds?: string[];
   selectedRunId?: string;
   backend: NativeBackendId;
   model?: string;
