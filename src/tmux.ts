@@ -30,6 +30,7 @@ export async function ensureTmuxDashboardSession(params: {
   model?: string;
 }): Promise<void> {
   if (await tmuxSessionExists(params.sessionName) && await loadTmuxDashboardState(params.repoRoot, params.sessionName)) {
+    await configureRudderSession(params.sessionName);
     return;
   }
   if (await tmuxSessionExists(params.sessionName)) {
@@ -108,10 +109,10 @@ export async function configureRudderSession(sessionName: string): Promise<void>
     "-t",
     sessionName,
     "pane-border-format",
-    "#{?pane_active,#[fg=black,bg=cyan,bold] FOCUS #[default] #[fg=cyan,bold],#[fg=colour245]}#{pane_title} ",
+    "#{?pane_active,#[fg=black,bg=brightcyan,bold]  FOCUS  #[default] #[fg=brightcyan,bold]━━━━ ,#[fg=colour244]}#{pane_title} ",
   ], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=cyan,bold"], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour240"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=brightcyan,bold"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour238"], true);
   await runTmux(["bind-key", "-T", "root", "Tab", "select-pane", "-t", ":.+"], true);
   await runTmux(["bind-key", "-T", "root", "BTab", "select-pane", "-t", ":.-"], true);
 }
