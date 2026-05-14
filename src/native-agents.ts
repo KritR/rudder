@@ -1,15 +1,20 @@
 import type { RunRecord } from "./types.js";
 import { normalizeEffortForBackend } from "./effort.js";
+import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { shellQuote } from "./util.js";
 
 export function nativeAgentCommand(params: {
   run: RunRecord;
   prompt: string;
   contract: string;
+  mode?: "execute" | "plan";
 }): string {
-  const args = params.run.backend === "codex"
-    ? codexArgs(params.run, params.prompt, params.contract)
-    : claudeArgs(params.run, params.prompt, params.contract);
+  const mode = params.mode ?? params.run.mode ?? "execute";
+  const args = mode === "plan"
+    ? planArgs(params.run, params.prompt)
+    : params.run.backend === "codex"
+      ? codexArgs(params.run, params.prompt, params.contract)
+      : claudeArgs(params.run, params.prompt, params.contract);
   return args.map(shellQuote).join(" ");
 }
 
@@ -62,6 +67,61 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
   ].filter((value): value is string => Boolean(value));
 }
 
+function planArgs(run: RunRecord, prompt: string): string[] {
+  return run.backend === "codex"
+    ? codexPlanArgs(run, prompt)
+    : claudePlanArgs(run, prompt);
+}
+
+function claudePlanArgs(run: RunRecord, prompt: string): string[] {
+  const model = run.model || "sonnet";
+  const effort = normalizeEffortForBackend("claude", run.effort);
+  return compact([
+    "claude",
+    "--model",
+    model,
+    effort ? "--effort" : undefined,
+    effort,
+    "--permission-mode",
+    "default",
+    "--tools",
+    CLAUDE_PLAN_TOOLS.join(","),
+    "--allowedTools",
+    CLAUDE_PLAN_TOOLS.join(","),
+    "--disallowedTools",
+    CLAUDE_PLAN_DISALLOWED_TOOLS.join(","),
+    "--append-system-prompt",
+    PLAN_MODE_CONTRACT,
+    "--name",
+    `plan:${paneTitle(run)}`,
+    prompt,
+  ]);
+}
+
+function codexPlanArgs(run: RunRecord, prompt: string): string[] {
+  const model = run.model || "gpt-5.5";
+  const effort = normalizeEffortForBackend("codex", run.effort);
+  return compact([
+    "codex",
+    "--model",
+    model,
+    "--sandbox",
+    "read-only",
+    "--ask-for-approval",
+    "never",
+    "--search",
+    effort ? "-c" : undefined,
+    effort ? `model_reasoning_effort="${effort}"` : undefined,
+    "-c",
+    'model_reasoning_summary="detailed"',
+    "-c",
+    "model_supports_reasoning_summaries=true",
+    "--cd",
+    run.worktree.path,
+    `${PLAN_MODE_CONTRACT}\n\nUSER TASK:\n${prompt}`,
+  ]);
+}
+
 function paneTitle(run: RunRecord): string {
   const words = run.task.replace(/\s+/g, " ").trim().slice(0, 34);
   return `${run.backend}:${words || run.id.slice(0, 12)}`;
@@ -70,3 +130,41 @@ function paneTitle(run: RunRecord): string {
 function compact(values: Array<string | undefined>): string[] {
   return values.filter((value): value is string => Boolean(value));
 }
+
+const CLAUDE_PLAN_TOOLS = [
+  "Read",
+  "Grep",
+  "Glob",
+  "LS",
+  "WebSearch",
+  "WebFetch",
+];
+
+const CLAUDE_PLAN_DISALLOWED_TOOLS = [
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
+  "Bash",
+  "Bash(rm *)",
+  "Bash(mv *)",
+  "Bash(cp *)",
+  "Bash(mkdir *)",
+  "Bash(touch *)",
+  "Bash(chmod *)",
+  "Bash(chown *)",
+  "Bash(git add*)",
+  "Bash(git commit*)",
+  "Bash(git checkout*)",
+  "Bash(git switch*)",
+  "Bash(git reset*)",
+  "Bash(git clean*)",
+  "Bash(git merge*)",
+  "Bash(git rebase*)",
+  "Bash(git push*)",
+  "Bash(fly deploy*)",
+  "Bash(fly secrets set*)",
+  "Bash(fly secrets unset*)",
+  "Bash(fly scale*)",
+  "Bash(fly apps destroy*)",
+];

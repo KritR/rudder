@@ -87,6 +87,8 @@ export type BackendId = "claude" | "codex" | "acpx";
 
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
+export type RunMode = "execute" | "plan";
+
 export type BackendConfig = {
   profileId?: string;
   model?: string;
@@ -108,6 +110,7 @@ export type RunStatus =
 export type RunRecord = {
   id: string;
   status: RunStatus;
+  mode?: RunMode;
   task: string;
   backend: BackendId;
   model?: string;

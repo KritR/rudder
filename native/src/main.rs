@@ -151,6 +151,29 @@ impl AgentStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentMode {
+    Execute,
+    Plan,
+}
+
+impl AgentMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Plan => "plan",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "execute" | "run" | "task" => Some(Self::Execute),
+            "plan" | "planning" => Some(Self::Plan),
+            _ => None,
+        }
+    }
+}
+
 struct App {
     focus: FocusPane,
     nav_mode: bool,
@@ -162,6 +185,7 @@ struct App {
     task_history: Vec<String>,
     task_history_index: Option<usize>,
     task_history_draft: String,
+    plan_mode: bool,
     agents: Vec<AgentRun>,
     selected_agent: usize,
     backend: Backend,
@@ -195,6 +219,7 @@ struct MergeConflictPrompt {
 struct AgentRun {
     id: String,
     created_at: String,
+    mode: AgentMode,
     task: String,
     backend: Backend,
     model: String,
@@ -273,6 +298,7 @@ impl App {
             task_history: Vec::new(),
             task_history_index: None,
             task_history_draft: String::new(),
+            plan_mode: false,
             agents,
             selected_agent: 0,
             backend: selection.backend,
@@ -614,7 +640,8 @@ impl App {
                 self.task_input.push('/');
                 self.task_cursor = 1;
                 self.picker_index = 0;
-                self.notice = Some("type /model, /login, /cloud, or /sail".to_string());
+                self.notice =
+                    Some("type /plan, /run, /model, /login, /cloud, or /sail".to_string());
             }
             KeyCode::Char(ch) => {
                 self.reset_task_history_navigation();
@@ -963,7 +990,15 @@ impl App {
         }
         self.notice = None;
 
-        let worktree = match prepare_worktree(&self.cwd, &input) {
+        if self.plan_mode {
+            self.start_plan_task(&input);
+        } else {
+            self.start_execute_task(&input);
+        }
+    }
+
+    fn start_execute_task(&mut self, input: &str) {
+        let worktree = match prepare_worktree(&self.cwd, input) {
             Ok(worktree) => worktree,
             Err(error) => {
                 self.notice = Some(format!("worktree failed: {error}"));
@@ -980,7 +1015,7 @@ impl App {
         let model = self.model.clone();
         let backend = self.backend;
         let effort = self.effort;
-        let command = agent_command(backend, &model, effort, &input);
+        let command = agent_command(backend, &model, effort, input, AgentMode::Execute);
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -990,7 +1025,8 @@ impl App {
         let mut run = AgentRun {
             id: worktree.id.clone(),
             created_at: now_stamp(),
-            task: input.clone(),
+            mode: AgentMode::Execute,
+            task: input.to_string(),
             backend,
             model,
             effort,
@@ -1033,6 +1069,67 @@ impl App {
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
+    fn start_plan_task(&mut self, input: &str) {
+        let model = self.model.clone();
+        let backend = self.backend;
+        let effort = self.effort;
+        let command = agent_command(backend, &model, effort, input, AgentMode::Plan);
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        let mut run = AgentRun {
+            id: new_run_id(input),
+            created_at: now_stamp(),
+            mode: AgentMode::Plan,
+            task: input.to_string(),
+            backend,
+            model,
+            effort,
+            status: AgentStatus::Running,
+            cwd: self.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: true,
+            needs_permission: false,
+            permission_notified: false,
+            last_error: None,
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                self.notice = Some("read-only planner started".to_string());
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!(
+                    "failed to start {} planner: {error}",
+                    backend.as_str()
+                ));
+            }
+        }
+
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+    }
+
     fn restart_selected_agent(&mut self) {
         let Some(run) = self.agents.get_mut(self.selected_agent) else {
             self.notice = Some("no agent selected".to_string());
@@ -1044,7 +1141,7 @@ impl App {
         }
 
         let prompt = run.task.clone();
-        let command = agent_command(run.backend, &run.model, run.effort, &prompt);
+        let command = agent_command(run.backend, &run.model, run.effort, &prompt, run.mode);
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(run.cwd.clone()),
@@ -1058,7 +1155,7 @@ impl App {
                 run.status = AgentStatus::Running;
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
-                run.autosteered = false;
+                run.autosteered = run.mode == AgentMode::Plan;
                 run.needs_permission = false;
                 run.permission_notified = false;
                 run.last_error = None;
@@ -1137,9 +1234,34 @@ impl App {
                 }
                 true
             }
+            Some("/plan") => {
+                let task = parts.collect::<Vec<_>>().join(" ");
+                if task.trim().is_empty() {
+                    self.plan_mode = !self.plan_mode;
+                    self.notice = Some(if self.plan_mode {
+                        "plan mode on: Enter starts a read-only planner".to_string()
+                    } else {
+                        "plan mode off".to_string()
+                    });
+                } else {
+                    self.start_plan_task(task.trim());
+                }
+                true
+            }
+            Some("/run") => {
+                let task = parts.collect::<Vec<_>>().join(" ");
+                if task.trim().is_empty() {
+                    self.notice = Some("usage: /run <task>".to_string());
+                } else {
+                    self.start_execute_task(task.trim());
+                }
+                true
+            }
             Some("/help") => {
-                self.notice =
-                    Some("Tab focus  Enter start/focus  /model  /login  /cloud  /sail  m/M merge  dd delete".to_string());
+                self.notice = Some(
+                    "Tab focus  Enter start/focus  /plan  /run  /model  /login  /cloud  m/M merge"
+                        .to_string(),
+                );
                 true
             }
             Some("/login") => {
@@ -1194,6 +1316,7 @@ impl App {
         let mut run = AgentRun {
             id,
             created_at: now_stamp(),
+            mode: AgentMode::Execute,
             task: label.to_string(),
             backend: self.backend,
             model: self.model.clone(),
@@ -1498,7 +1621,13 @@ impl App {
         self.conflict_prompt = None;
 
         let id = new_run_id("resolve merge conflicts");
-        let command = agent_command(self.backend, &self.model, self.effort, &prompt);
+        let command = agent_command(
+            self.backend,
+            &self.model,
+            self.effort,
+            &prompt,
+            AgentMode::Execute,
+        );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(self.cwd.clone()),
@@ -1508,6 +1637,7 @@ impl App {
         let mut run = AgentRun {
             id,
             created_at: now_stamp(),
+            mode: AgentMode::Execute,
             task: "Resolve merge conflicts".to_string(),
             backend: self.backend,
             model: self.model.clone(),
@@ -1688,7 +1818,13 @@ impl App {
                 "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first. Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.\n[END RUDDER PROMPT INJECTION]",
                 run.task
             );
-            let command = agent_command(run.backend, &run.model, run.effort, &prompt);
+            let command = agent_command(
+                run.backend,
+                &run.model,
+                run.effort,
+                &prompt,
+                AgentMode::Execute,
+            );
             let size = run.terminal_size.unwrap_or_default();
             let options = TerminalPaneOptions {
                 size,
@@ -2046,6 +2182,51 @@ mod app_tests {
     }
 
     #[test]
+    fn plan_commands_use_read_only_backend_profiles() {
+        let codex = agent_command(
+            Backend::Codex,
+            "gpt-5.5",
+            Some(EffortLevel::High),
+            "plan the work",
+            AgentMode::Plan,
+        );
+        assert_eq!(codex.program, "codex");
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--sandbox" && window[1] == "read-only"));
+        assert!(codex.args.iter().any(|arg| arg == "--search"));
+        assert!(!codex
+            .args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+
+        let claude = agent_command(
+            Backend::Claude,
+            "sonnet",
+            None,
+            "plan the work",
+            AgentMode::Plan,
+        );
+        assert_eq!(claude.program, "claude");
+        assert!(claude
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--permission-mode" && window[1] == "default"));
+        assert!(claude
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--tools" && window[1].contains("WebSearch")));
+        assert!(claude.args.iter().any(|arg| arg.contains("WebSearch")));
+        assert!(!claude
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--allowedTools" && window[1].contains("Bash")));
+        assert!(claude.args.iter().any(|arg| arg.contains("Write")));
+        assert!(claude.args.iter().any(|arg| arg.contains("Bash")));
+    }
+
+    #[test]
     fn task_history_walks_backward_forward_and_restores_draft() {
         let history = vec![
             "first task".to_string(),
@@ -2115,6 +2296,7 @@ mod app_tests {
         app.agents.push(AgentRun {
             id: "run-1".to_string(),
             created_at: now_stamp(),
+            mode: AgentMode::Execute,
             task: "test task".to_string(),
             backend: Backend::Claude,
             model: "sonnet".to_string(),
@@ -2348,6 +2530,12 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled(agent_status_label(agent), agent_status_style(agent)),
             Span::raw("  "),
+            if agent.mode == AgentMode::Plan {
+                Span::styled("plan", accent_style(focused))
+            } else {
+                Span::styled("run", muted_style(focused))
+            },
+            Span::raw("  "),
             Span::styled(agent.backend.as_str(), muted_style(focused)),
             Span::raw("  "),
             Span::styled(agent.model.as_str(), model_style(focused)),
@@ -2498,7 +2686,11 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "Press r to restart this agent in its worktree.",
+                if run.mode == AgentMode::Plan {
+                    "Press r to restart this read-only planner."
+                } else {
+                    "Press r to restart this agent in its worktree."
+                },
                 muted_style(true),
             )),
             Line::from(Span::styled(
@@ -2563,10 +2755,12 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
-    let hint = app
-        .notice
-        .as_deref()
-        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model  /cloud");
+    let default_hint = if app.plan_mode {
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+    } else {
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+    };
+    let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
     let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width);
     let (cursor_line, cursor_column) =
@@ -2587,7 +2781,11 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .take(max_input_lines)
         .map(|line| {
             let display = if app.task_input.is_empty() {
-                "Type a task or /model"
+                if app.plan_mode {
+                    "Type a task to plan or /run"
+                } else {
+                    "Type a task or /plan"
+                }
             } else {
                 line.as_str()
             };
@@ -2608,6 +2806,11 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let first_hint = wrapped_hint.first().cloned().unwrap_or_default();
         lines.push(Line::from(vec![
             Span::styled(first_hint, muted_style(focused)),
+            Span::raw("  "),
+            Span::styled(
+                if app.plan_mode { "plan" } else { "run" },
+                accent_style(focused),
+            ),
             Span::raw("  "),
             Span::styled(app.backend.as_str(), accent_style(focused)),
             Span::raw(" "),
@@ -2640,10 +2843,12 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
-    let hint = app
-        .notice
-        .as_deref()
-        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model  /cloud");
+    let default_hint = if app.plan_mode {
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+    } else {
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+    };
+    let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
     let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width)
         .len()
@@ -3057,6 +3262,8 @@ fn status_style(status: AgentStatus) -> Style {
 fn agent_status_label(agent: &AgentRun) -> &'static str {
     if agent.needs_permission {
         "needs permission"
+    } else if agent.mode == AgentMode::Plan && agent.status == AgentStatus::Running {
+        "planning"
     } else {
         agent.status.as_str()
     }
@@ -3541,6 +3748,21 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
 fn command_suggestions() -> Vec<Suggestion> {
     vec![
         Suggestion {
+            label: "/plan".to_string(),
+            detail: "toggle Rudder read-only planning".to_string(),
+            action: SuggestionAction::Insert("/plan".to_string()),
+        },
+        Suggestion {
+            label: "/plan <task>".to_string(),
+            detail: "plan one task without toggling".to_string(),
+            action: SuggestionAction::Insert("/plan ".to_string()),
+        },
+        Suggestion {
+            label: "/run <task>".to_string(),
+            detail: "start implementation even when plan mode is on".to_string(),
+            action: SuggestionAction::Insert("/run ".to_string()),
+        },
+        Suggestion {
             label: "/model".to_string(),
             detail: "pick Claude or Codex model".to_string(),
             action: SuggestionAction::Insert("/model ".to_string()),
@@ -3830,16 +4052,34 @@ fn agent_command(
     model: &str,
     effort: Option<EffortLevel>,
     task: &str,
+    mode: AgentMode,
 ) -> TerminalCommand {
-    let prompt = format!(
-        "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo. If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n[END RUDDER PROMPT INJECTION]\n\nUSER TASK:\n{task}"
-    );
+    let prompt = match mode {
+        AgentMode::Execute => execution_prompt(task),
+        AgentMode::Plan => plan_prompt(task),
+    };
     match backend {
         Backend::Claude => {
-            let mut args = vec![
-                "--permission-mode".to_string(),
-                "bypassPermissions".to_string(),
-            ];
+            let mut args = match mode {
+                AgentMode::Execute => vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ],
+                AgentMode::Plan => vec![
+                    "--permission-mode".to_string(),
+                    "default".to_string(),
+                    "--tools".to_string(),
+                    claude_plan_tools().join(","),
+                    "--allowedTools".to_string(),
+                    claude_plan_tools().join(","),
+                    "--disallowedTools".to_string(),
+                    claude_plan_disallowed_tools().join(","),
+                    "--append-system-prompt".to_string(),
+                    plan_mode_contract(),
+                    "--name".to_string(),
+                    format!("plan:{}", short_task(task)),
+                ],
+            };
             if !model.trim().is_empty() {
                 args.push("--model".to_string());
                 args.push(model.to_string());
@@ -3852,16 +4092,22 @@ fn agent_command(
             TerminalCommand::with_args("claude", args)
         }
         Backend::Codex => {
-            let mut args = vec![
-                "--ask-for-approval".to_string(),
-                "never".to_string(),
-                "--sandbox".to_string(),
-                "danger-full-access".to_string(),
-                "-c".to_string(),
-                "model_reasoning_summary=\"detailed\"".to_string(),
-                "-c".to_string(),
-                "model_supports_reasoning_summaries=true".to_string(),
-            ];
+            let mut args = vec!["--ask-for-approval".to_string(), "never".to_string()];
+            match mode {
+                AgentMode::Execute => {
+                    args.push("--sandbox".to_string());
+                    args.push("danger-full-access".to_string());
+                }
+                AgentMode::Plan => {
+                    args.push("--sandbox".to_string());
+                    args.push("read-only".to_string());
+                    args.push("--search".to_string());
+                }
+            }
+            args.push("-c".to_string());
+            args.push("model_reasoning_summary=\"detailed\"".to_string());
+            args.push("-c".to_string());
+            args.push("model_supports_reasoning_summaries=true".to_string());
             if let Some(effort) = effort {
                 args.push("-c".to_string());
                 args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
@@ -3874,6 +4120,72 @@ fn agent_command(
             TerminalCommand::with_args("codex", args)
         }
     }
+}
+
+fn execution_prompt(task: &str) -> String {
+    format!(
+        "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo. If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n[END RUDDER PROMPT INJECTION]\n\nUSER TASK:\n{task}"
+    )
+}
+
+fn plan_prompt(task: &str) -> String {
+    format!(
+        "{}\n\nUSER TASK:\nPlan this task before implementation:\n{}\n\nFirst inspect the repository and relevant external/read-only context. Ask follow-up questions if the plan cannot be made decision-complete from inspection alone.",
+        plan_mode_contract(),
+        task
+    )
+}
+
+fn plan_mode_contract() -> String {
+    [
+        "[RUDDER PLAN MODE]",
+        "You are running inside Rudder's own plan mode, not the backend's native implementation mode.",
+        "Your job is to investigate and produce a decision-complete implementation plan.",
+        "",
+        "Rules:",
+        "- Do not write, edit, create, delete, move, rename, install, commit, merge, deploy, migrate, or otherwise mutate local or remote state.",
+        "- Use only read-only inspection. It is OK to read files, search the repo, inspect git state or read-only CLI state when the active tool profile permits it, and use web search/fetch when it improves the plan.",
+        "- If secrets or environment state matter, inspect only what is needed and do not print secret values. Mention presence, absence, names, or configuration shape instead.",
+        "- Ask concise follow-up questions when important product or implementation choices cannot be discovered from the environment.",
+        "- When the plan is ready, put the final answer in a single <proposed_plan>...</proposed_plan> block.",
+        "[END RUDDER PLAN MODE]",
+    ]
+    .join("\n")
+}
+
+fn claude_plan_tools() -> Vec<&'static str> {
+    vec!["Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch"]
+}
+
+fn claude_plan_disallowed_tools() -> Vec<&'static str> {
+    vec![
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+        "Bash(rm *)",
+        "Bash(mv *)",
+        "Bash(cp *)",
+        "Bash(mkdir *)",
+        "Bash(touch *)",
+        "Bash(chmod *)",
+        "Bash(chown *)",
+        "Bash(git add*)",
+        "Bash(git commit*)",
+        "Bash(git checkout*)",
+        "Bash(git switch*)",
+        "Bash(git reset*)",
+        "Bash(git clean*)",
+        "Bash(git merge*)",
+        "Bash(git rebase*)",
+        "Bash(git push*)",
+        "Bash(fly deploy*)",
+        "Bash(fly secrets set*)",
+        "Bash(fly secrets unset*)",
+        "Bash(fly scale*)",
+        "Bash(fly apps destroy*)",
+    ]
 }
 
 fn short_task(task: &str) -> String {
@@ -4196,6 +4508,11 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(now_stamp);
+    let mode = record
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .and_then(AgentMode::parse)
+        .unwrap_or(AgentMode::Execute);
     let worktree = record.get("worktree");
     let worktree_enabled = worktree
         .and_then(|value| value.get("enabled"))
@@ -4215,6 +4532,7 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
     Some(AgentRun {
         id,
         created_at,
+        mode,
         task,
         backend,
         model,
@@ -4270,6 +4588,7 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
     let record = serde_json::json!({
         "id": run.id,
         "status": run_record_status(run.status),
+        "mode": run.mode.as_str(),
         "task": run.task,
         "backend": run.backend.as_str(),
         "model": run.model,
