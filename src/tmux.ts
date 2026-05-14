@@ -185,6 +185,10 @@ export async function selectNextPane(sessionName: string): Promise<void> {
   await runTmux(["select-pane", "-t", `${sessionName}:0.+`], true);
 }
 
+export async function resizePane(paneId: string, height: number): Promise<void> {
+  await runTmux(["resize-pane", "-t", paneId, "-y", String(height)], true);
+}
+
 export async function killPane(paneId: string): Promise<void> {
   await runTmux(["kill-pane", "-t", paneId], true);
 }

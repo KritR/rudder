@@ -106,12 +106,33 @@
       .install {
         display: inline-flex;
         align-items: center;
+        gap: 12px;
         margin-top: 34px;
-        padding: 12px 14px;
+        padding: 8px;
         border: 1px solid #111;
+        white-space: nowrap;
+      }
+
+      .install code {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 14px;
-        white-space: nowrap;
+        padding: 4px 6px;
+      }
+
+      .copy {
+        appearance: none;
+        border: 1px solid #111;
+        background: #111;
+        color: #fff;
+        padding: 8px 11px;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      .copy:focus-visible {
+        outline: 2px solid #111;
+        outline-offset: 3px;
       }
 
       .points {
@@ -213,6 +234,15 @@
         font-size: 12px;
       }
 
+      .merge-button {
+        display: inline-block;
+        margin-top: 18px;
+        border: 1px solid #111;
+        padding: 8px 10px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+
       footer {
         margin-top: 72px;
         padding-top: 24px;
@@ -269,7 +299,10 @@
             tasks, watch agents, keep each run isolated, then merge the work when
             it is ready.
           </p>
-          <div class="install">npm install -g @viraatdas/rudder</div>
+          <div class="install">
+            <code id="install-command">npm install -g @viraatdas/rudder</code>
+            <button class="copy" type="button" data-copy="install-command">Copy</button>
+          </div>
 
           <div class="points">
             <div class="point">
@@ -284,14 +317,23 @@
               <strong>Clean isolation</strong>
               <span>Each prompt runs in its own git worktree so parallel tasks do not collide.</span>
             </div>
+            <div class="point">
+              <strong>Driven to completion</strong>
+              <span>Rudder checks finished agents and nudges them with a follow-up when the work still needs testing or cleanup.</span>
+            </div>
+            <div class="point">
+              <strong>Merge with one key</strong>
+              <span>When an agent is done, press m from the agent list to merge that worktree back into your branch.</span>
+            </div>
           </div>
         </section>
 
         <section class="terminal" aria-label="Rudder terminal layout mockup">
           <div class="pane agents">
             <div class="label">agents</div>
-            <div class="run active">› tm claude sonnet<br />  fix auth callback<br />  running %6</div>
-            <div class="run muted">  ok codex gpt-5.5<br />  add parser tests<br />  completed %5</div>
+            <div class="run active">› fix auth callback<br />  running 60%  claude sonnet</div>
+            <div class="run muted">  add parser tests<br />  done 95%  codex gpt-5.5</div>
+            <div class="merge-button">m merge selected</div>
           </div>
           <div class="pane worker">
             <span class="focus">FOCUS worker</span>
@@ -314,5 +356,19 @@ Enter start   Tab focus pane   / commands   claude sonnet</pre>
         Built for local coding agents, tmux panes, and git worktrees.
       </footer>
     </div>
+    <script>
+      document.querySelectorAll("[data-copy]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const target = document.getElementById(button.dataset.copy);
+          if (!target) return;
+          await navigator.clipboard.writeText(target.textContent.trim());
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1200);
+        });
+      });
+    </script>
   </body>
 </html>

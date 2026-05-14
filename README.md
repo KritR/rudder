@@ -97,7 +97,7 @@ terminal UI.
 | `Tab` | Move focus to the next tmux pane |
 | `j` / `k` or arrows | Select an agent run |
 | `f` | Focus the selected native worker pane |
-| `o` or `/model` | Open the model picker |
+| `/model` | Open the model picker |
 | `s` | Stop selected run |
 | `d` | Delete selected run, with an offer to merge first when there are changes |
 | `m` | Merge selected completed worktree run |
@@ -164,6 +164,11 @@ For tmux-launched agents, the contract is injected into the native process at
 startup. The worker pane remains yours after the initial task, so you can keep
 typing into Claude Code or Codex directly. Headless one-shot runs still use
 Rudder's verifier and steering loop.
+
+When a headless run stops, Rudder checks whether the task looks complete and can
+send a follow-up prompt asking for the remaining work, tests, and cleanup. In the
+tmux dashboard, the native worker stays available for manual steering after the
+initial task.
 
 ## One-Shot Commands
 
