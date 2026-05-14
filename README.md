@@ -108,9 +108,11 @@ normally.
 Slash commands:
 
 ```text
-/backend claude|codex
 /model
-/model <model-id>
+/model claude
+/model codex
+/model claude|codex <model-id> [effort]
+/help
 ```
 
 The older tmux dashboard is still available with `rudder tmux` or
@@ -118,12 +120,11 @@ The older tmux dashboard is still available with `rudder tmux` or
 
 ## Models
 
-`/model` opens a bounded picker for Claude and Codex models. Pick a model, then
-pick effort. The default is `auto`, which means Rudder does not pass an effort
-override and lets the selected backend/model choose its own default. Explicit
-effort values are discovered from the installed CLI when available. If you pick
-one, Rudder passes it through: Claude uses `claude --model <value> --effort
-<value>`, and Codex uses `codex --model <value> -c
+`/model` opens a provider-first picker. Choose `claude` or `codex`, pick a
+model, then pick the effort level supported by that model. `auto` means Rudder
+does not pass an effort override and lets the selected backend/model choose its
+own default. If you pick one, Rudder passes it through: Claude uses `claude
+--model <value> --effort <value>`, and Codex uses `codex --model <value> -c
 model_reasoning_effort="<value>"`.
 
 - Claude is alias-first like Claude Code itself: `sonnet`, `sonnet[1m]`,

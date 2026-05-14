@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import { findRepoRoot } from "./git.js";
+import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
 import {
   cleanupRuns,
@@ -458,6 +459,7 @@ async function openDashboard(parsed: Parsed): Promise<void> {
     });
     return;
   }
+  await refreshModelCache();
   if (!parsed.flags.noNative && process.env.RUDDER_LEGACY_TMUX !== "1" && await runNativeDashboard()) {
     return;
   }
@@ -471,6 +473,13 @@ async function openDashboard(parsed: Parsed): Promise<void> {
     worktree: parsed.flags.worktree,
     detach: parsed.flags.detach,
   });
+}
+
+async function refreshModelCache(): Promise<void> {
+  await Promise.all([
+    discoverModelOptions("claude").catch(() => []),
+    discoverModelOptions("codex").catch(() => []),
+  ]);
 }
 
 async function runNativeDashboard(): Promise<boolean> {
@@ -548,7 +557,7 @@ function printHelp(): void {
   console.log(`rudder
 
 Usage:
-  rudder                         Open tmux dashboard with native agent panes
+  rudder                         Open native dashboard with real agent panes
   rudder tmux                    Open tmux dashboard with native agent panes
   rudder tui                     Open legacy full-screen stream TUI
   rudder "task"

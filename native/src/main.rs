@@ -76,6 +76,38 @@ impl Backend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl EffortLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentStatus {
     Running,
     Done,
@@ -101,6 +133,7 @@ struct App {
     selected_agent: usize,
     backend: Backend,
     model: String,
+    effort: Option<EffortLevel>,
     notice: Option<String>,
     delete_pending: Option<String>,
     picker_index: usize,
@@ -111,6 +144,7 @@ struct AgentRun {
     task: String,
     backend: Backend,
     model: String,
+    effort: Option<EffortLevel>,
     status: AgentStatus,
     cwd: PathBuf,
     worktree_branch: Option<String>,
@@ -134,7 +168,15 @@ struct Suggestion {
 enum SuggestionAction {
     Insert(String),
     ChooseModelProvider(Backend),
-    SetModel { backend: Backend, model: String },
+    ChooseModel {
+        backend: Backend,
+        model: String,
+    },
+    SetModel {
+        backend: Backend,
+        model: String,
+        effort: Option<EffortLevel>,
+    },
     ShowHelp,
 }
 
@@ -150,6 +192,7 @@ impl App {
             selected_agent: 0,
             backend: Backend::Claude,
             model: default_model_for(Backend::Claude).to_string(),
+            effort: default_effort_for(Backend::Claude, default_model_for(Backend::Claude)),
             notice: None,
             delete_pending: None,
             picker_index: 0,
@@ -316,12 +359,27 @@ impl App {
                 self.picker_index = 0;
                 self.notice = Some(format!("pick a {} model", backend.as_str()));
             }
-            SuggestionAction::SetModel { backend, model } => {
+            SuggestionAction::ChooseModel { backend, model } => {
+                self.task_input = format!("/model {} {} ", backend.as_str(), model);
+                self.picker_index = 0;
+                self.notice = Some(format!("pick effort for {model}"));
+            }
+            SuggestionAction::SetModel {
+                backend,
+                model,
+                effort,
+            } => {
                 self.backend = backend;
                 self.model = model;
+                self.effort = effort;
                 self.task_input.clear();
                 self.picker_index = 0;
-                self.notice = Some(format!("{} {}", self.backend.as_str(), self.model));
+                self.notice = Some(format!(
+                    "{} {}({})",
+                    self.backend.as_str(),
+                    self.model,
+                    effort_label(self.effort)
+                ));
             }
             SuggestionAction::ShowHelp => {
                 self.task_input.clear();
@@ -379,7 +437,8 @@ impl App {
 
         let model = self.model.clone();
         let backend = self.backend;
-        let command = agent_command(backend, &model, &input);
+        let effort = self.effort;
+        let command = agent_command(backend, &model, effort, &input);
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -391,6 +450,7 @@ impl App {
             task: input.clone(),
             backend,
             model,
+            effort,
             status: AgentStatus::Running,
             cwd: worktree.path.clone(),
             worktree_branch: worktree.branch.clone(),
@@ -427,14 +487,58 @@ impl App {
         let mut parts = input.split_whitespace();
         match parts.next() {
             Some("/model") => {
-                let model = parts.collect::<Vec<_>>().join(" ");
-                if model.is_empty() {
-                    self.notice = Some("usage: /model <model-id-or-alias>".to_string());
-                } else {
-                    self.backend = backend_for_model(&model);
-                    self.model = model;
-                    self.notice = Some(format!("{} {}", self.backend.as_str(), self.model));
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [] => {
+                        self.notice =
+                            Some("usage: /model claude|codex <model> [effort]".to_string());
+                    }
+                    [provider] if provider_backend(provider).is_some() => {
+                        self.notice = Some(format!("usage: /model {provider} <model> [effort]"));
+                    }
+                    [provider, model] if provider_backend(provider).is_some() => {
+                        let backend = provider_backend(provider).unwrap();
+                        self.backend = backend;
+                        self.model = (*model).to_string();
+                        self.effort = default_effort_for(backend, model);
+                        self.notice = Some(format!(
+                            "{} {}({})",
+                            self.backend.as_str(),
+                            self.model,
+                            effort_label(self.effort)
+                        ));
+                    }
+                    [provider, model, effort, ..] if provider_backend(provider).is_some() => {
+                        let backend = provider_backend(provider).unwrap();
+                        let parsed_effort = parse_effort_arg(effort);
+                        self.backend = backend;
+                        self.model = (*model).to_string();
+                        self.effort = parsed_effort;
+                        self.notice = Some(format!(
+                            "{} {}({})",
+                            self.backend.as_str(),
+                            self.model,
+                            effort_label(self.effort)
+                        ));
+                    }
+                    _ => {
+                        let model = args.join(" ");
+                        self.backend = backend_for_model(&model);
+                        self.model = model;
+                        self.effort = default_effort_for(self.backend, &self.model);
+                        self.notice = Some(format!(
+                            "{} {}({})",
+                            self.backend.as_str(),
+                            self.model,
+                            effort_label(self.effort)
+                        ));
+                    }
                 }
+                true
+            }
+            Some("/help") => {
+                self.notice =
+                    Some("Tab focus  Enter start/focus  /model  m/M merge  d delete".to_string());
                 true
             }
             _ => false,
@@ -603,7 +707,7 @@ impl App {
                 "Read RUDDER.md first. Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.",
                 run.task
             );
-            let command = agent_command(run.backend, &run.model, &prompt);
+            let command = agent_command(run.backend, &run.model, run.effort, &prompt);
             let size = run.terminal_size.unwrap_or_default();
             let options = TerminalPaneOptions {
                 size,
@@ -776,24 +880,14 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])));
         lines.push(ListItem::new(Line::from(vec![
             Span::raw("  "),
-            Span::styled(
-                if agent.worktree_path.is_some() {
-                    "wt"
-                } else {
-                    "co"
-                },
-                Style::default().fg(Color::Gray),
-            ),
-            Span::raw("  "),
             Span::styled(agent.status.as_str(), status_style(agent.status)),
             Span::raw("  "),
             Span::styled(agent.backend.as_str(), Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(agent.model.as_str(), Style::default().fg(Color::Magenta)),
-            Span::raw("  "),
             Span::styled(
-                agent.worktree_branch.as_deref().unwrap_or("current"),
-                Style::default().fg(Color::DarkGray),
+                format!("({})", effort_label(agent.effort)),
+                Style::default().fg(Color::Magenta),
             ),
         ])));
     }
@@ -905,6 +999,10 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(app.backend.as_str(), Style::default().fg(Color::Cyan)),
             Span::raw(" "),
             Span::styled(app.model.as_str(), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format!("({})", effort_label(app.effort)),
+                Style::default().fg(Color::Magenta),
+            ),
         ]),
     ])
     .block(pane_block("task", app.focus == FocusPane::Task));
@@ -950,8 +1048,7 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
             let marker = if selected { "> " } else { "  " };
             let style = if selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::LightBlue)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -974,7 +1071,7 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::LightBlue)),
+            .border_style(Style::default().fg(Color::Cyan)),
     );
 
     frame.render_widget(Clear, area);
@@ -984,7 +1081,7 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
 fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default()
-            .fg(Color::LightBlue)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -992,8 +1089,7 @@ fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
 
     let title_style = if focused {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightBlue)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
@@ -1099,6 +1195,97 @@ fn default_model_for(backend: Backend) -> &'static str {
     }
 }
 
+fn default_effort_for(backend: Backend, model: &str) -> Option<EffortLevel> {
+    let options = effort_options_for(backend, model);
+    if options.contains(&Some(EffortLevel::XHigh)) {
+        Some(EffortLevel::XHigh)
+    } else {
+        options.into_iter().next().flatten()
+    }
+}
+
+fn effort_label(effort: Option<EffortLevel>) -> &'static str {
+    effort.map(EffortLevel::as_str).unwrap_or("auto")
+}
+
+fn parse_effort_arg(value: &str) -> Option<EffortLevel> {
+    if value.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        EffortLevel::parse(value)
+    }
+}
+
+fn provider_backend(provider: &str) -> Option<Backend> {
+    match provider.to_ascii_lowercase().as_str() {
+        "claude" | "anthropic" => Some(Backend::Claude),
+        "codex" | "openai" => Some(Backend::Codex),
+        _ => None,
+    }
+}
+
+fn effort_options_for(backend: Backend, model: &str) -> Vec<Option<EffortLevel>> {
+    if !model_supports_reasoning(backend, model) {
+        return vec![None];
+    }
+
+    let mut options = vec![
+        None,
+        Some(EffortLevel::Low),
+        Some(EffortLevel::Medium),
+        Some(EffortLevel::High),
+        Some(EffortLevel::XHigh),
+    ];
+    if backend == Backend::Claude {
+        options.push(Some(EffortLevel::Max));
+    }
+    options
+}
+
+fn effort_detail(backend: Backend, effort: Option<EffortLevel>) -> &'static str {
+    match (backend, effort) {
+        (_, None) => "let the agent decide",
+        (_, Some(EffortLevel::Low)) => "fastest",
+        (_, Some(EffortLevel::Medium)) => "balanced",
+        (_, Some(EffortLevel::High)) => "deeper reasoning",
+        (_, Some(EffortLevel::XHigh)) => "extended reasoning",
+        (Backend::Claude, Some(EffortLevel::Max)) => "maximum reasoning",
+        (Backend::Codex, Some(EffortLevel::Max)) => "not used",
+    }
+}
+
+fn model_supports_reasoning(backend: Backend, model: &str) -> bool {
+    if is_reasoning_alias(backend, model) {
+        return true;
+    }
+    cached_model_reasoning(backend, model).unwrap_or_else(|| match backend {
+        Backend::Claude => model.contains("opus") || model.contains("sonnet"),
+        Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
+    })
+}
+
+fn is_reasoning_alias(backend: Backend, model: &str) -> bool {
+    match backend {
+        Backend::Claude => matches!(model, "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]"),
+        Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
+    }
+}
+
+fn cached_model_reasoning(backend: Backend, model_id: &str) -> Option<bool> {
+    let cache_path = models_dev_cache_path()?;
+    let raw = fs::read_to_string(cache_path).ok()?;
+    let data = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let provider = match backend {
+        Backend::Claude => "anthropic",
+        Backend::Codex => "openai",
+    };
+    data.get(provider)?
+        .get("models")?
+        .get(model_id)?
+        .get("reasoning")?
+        .as_bool()
+}
+
 fn suggestions_for(app: &App) -> Vec<Suggestion> {
     let input = app.task_input.trim_start();
     if !input.starts_with('/') {
@@ -1107,7 +1294,7 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
 
     if input.starts_with("/model") {
         return model_provider_or_model_suggestions(
-            input.strip_prefix("/model").unwrap_or_default().trim(),
+            input.strip_prefix("/model").unwrap_or_default(),
         );
     }
 
@@ -1138,14 +1325,29 @@ fn command_suggestions() -> Vec<Suggestion> {
 }
 
 fn model_provider_or_model_suggestions(rest: &str) -> Vec<Suggestion> {
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let provider_or_query = parts.next().unwrap_or_default().to_ascii_lowercase();
-    let model_query = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return provider_suggestions("");
+    }
 
-    match provider_or_query.as_str() {
-        "claude" => model_suggestions_for(Backend::Claude, &model_query),
-        "codex" => model_suggestions_for(Backend::Codex, &model_query),
-        query => provider_suggestions(query),
+    let trailing_space = rest.ends_with(char::is_whitespace);
+    let parts = rest.split_whitespace().collect::<Vec<_>>();
+    let Some(backend) = parts
+        .first()
+        .and_then(|provider| provider_backend(provider))
+    else {
+        return provider_suggestions(parts.first().copied().unwrap_or_default());
+    };
+
+    match parts.as_slice() {
+        [provider] if !trailing_space => provider_suggestions(provider),
+        [_provider] => model_suggestions_for(backend, ""),
+        [_provider, model] if trailing_space => effort_suggestions_for(backend, model, ""),
+        [_provider, model] => model_suggestions_for(backend, model),
+        [_provider, model, effort_query, ..] => {
+            effort_suggestions_for(backend, model, effort_query)
+        }
+        _ => provider_suggestions(""),
     }
 }
 
@@ -1193,19 +1395,41 @@ fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec<Suggestion
         .collect()
 }
 
+fn effort_suggestions_for(backend: Backend, model: &str, query: &str) -> Vec<Suggestion> {
+    effort_options_for(backend, model)
+        .into_iter()
+        .filter(|effort| {
+            let label = effort_label(*effort);
+            query.is_empty() || label.starts_with(&query.to_ascii_lowercase())
+        })
+        .map(|effort| {
+            let label = effort_label(effort).to_string();
+            Suggestion {
+                detail: effort_detail(backend, effort).to_string(),
+                label,
+                action: SuggestionAction::SetModel {
+                    backend,
+                    model: model.to_string(),
+                    effort,
+                },
+            }
+        })
+        .collect()
+}
+
 fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)> {
     vec![
-        (Backend::Claude, "sonnet", "Claude"),
-        (Backend::Claude, "sonnet[1m]", "Claude large context"),
-        (Backend::Claude, "opus", "Claude"),
-        (Backend::Claude, "opus[1m]", "Claude large context"),
-        (Backend::Claude, "haiku", "Claude"),
-        (Backend::Claude, "claude-sonnet-4-6", "Claude explicit id"),
-        (Backend::Codex, "gpt-5.5", "Codex"),
-        (Backend::Codex, "gpt-5.4-codex", "Codex"),
-        (Backend::Codex, "gpt-5.4", "Codex"),
-        (Backend::Codex, "gpt-5.3-codex", "Codex"),
-        (Backend::Codex, "gpt-5.3-codex-spark", "Codex fast"),
+        (Backend::Claude, "sonnet", "default strong model"),
+        (Backend::Claude, "sonnet[1m]", "large context"),
+        (Backend::Claude, "opus", "strongest reasoning"),
+        (Backend::Claude, "opus[1m]", "large context"),
+        (Backend::Claude, "haiku", "fast model"),
+        (Backend::Claude, "claude-sonnet-4-6", "explicit id"),
+        (Backend::Codex, "gpt-5.5", "latest"),
+        (Backend::Codex, "gpt-5.4-codex", "coding"),
+        (Backend::Codex, "gpt-5.4", "general"),
+        (Backend::Codex, "gpt-5.3-codex", "coding"),
+        (Backend::Codex, "gpt-5.3-codex-spark", "fast"),
     ]
 }
 
@@ -1222,8 +1446,8 @@ fn push_model_suggestion(
     }
     suggestions.push(Suggestion {
         label: model.to_string(),
-        detail: format!("{} {}", backend.as_str(), detail),
-        action: SuggestionAction::SetModel {
+        detail: detail.to_string(),
+        action: SuggestionAction::ChooseModel {
             backend,
             model: model.to_string(),
         },
@@ -1357,7 +1581,12 @@ fn backend_for_model(model: &str) -> Backend {
     }
 }
 
-fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
+fn agent_command(
+    backend: Backend,
+    model: &str,
+    effort: Option<EffortLevel>,
+    task: &str,
+) -> TerminalCommand {
     let prompt = format!("Read RUDDER.md first if it exists.\n\n{task}");
     match backend {
         Backend::Claude => {
@@ -1369,13 +1598,15 @@ fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
                 args.push("--model".to_string());
                 args.push(model.to_string());
             }
+            if let Some(effort) = effort {
+                args.push("--effort".to_string());
+                args.push(effort.as_str().to_string());
+            }
             args.push(prompt);
             TerminalCommand::with_args("claude", args)
         }
         Backend::Codex => {
             let mut args = vec![
-                "-c".to_string(),
-                "model_reasoning_effort=\"xhigh\"".to_string(),
                 "--ask-for-approval".to_string(),
                 "never".to_string(),
                 "--sandbox".to_string(),
@@ -1385,6 +1616,10 @@ fn agent_command(backend: Backend, model: &str, task: &str) -> TerminalCommand {
                 "-c".to_string(),
                 "model_supports_reasoning_summaries=true".to_string(),
             ];
+            if let Some(effort) = effort {
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
+            }
             if !model.trim().is_empty() {
                 args.push("-m".to_string());
                 args.push(model.to_string());
