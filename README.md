@@ -184,11 +184,19 @@ hunk diff --watch
 ```
 
 Hunk provides the multi-file review UI, sidebar navigation, mouse support,
-watch mode, and untracked-file handling. If `hunk` is not installed, Rudder
-installs it with `npm install -g hunkdiff@latest` before opening the review.
+watch mode, inline agent notes, and untracked-file handling. Rudder writes a
+per-worktree `.hunk/config.toml` with the light `paper` theme and ignores that
+config through git's local info exclude, so it does not get merged.
 
-While focused in the review pane, keys go to Hunk. Press `Ctrl-G`, then `v`, to
-return to the live Claude Code or Codex worker.
+If `hunk` is not installed, Rudder uses `npx --yes hunkdiff@latest` before
+opening the review. While focused in the review pane, keyboard and mouse events
+go to Hunk. Press `Ctrl-G`, then `v`, to return to the live Claude Code or Codex
+worker.
+
+Rudder also injects Hunk review guidance into `RUDDER.md` and the worker prompt.
+Agents are told to run `hunk skill path`, load the Hunk review skill, and use
+`hunk session review --repo . --json` plus `hunk session comment ...` commands
+against the live review.
 
 ## One-Shot Commands
 

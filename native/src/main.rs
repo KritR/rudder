@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -585,6 +585,25 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self
+            .worker_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+            && self.worker_view == WorkerView::Diff
+        {
+            self.focus = FocusPane::Worker;
+            if let Some(worker_area) = self.worker_area {
+                let inner = block_inner(worker_area);
+                if let Some(bytes) = mouse_event_to_sgr(mouse, inner) {
+                    if let Some(review) = self.selected_review_terminal_mut() {
+                        if let Err(error) = review.write_input(&bytes) {
+                            self.set_selected_review_error(error.to_string());
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         let delta = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -649,6 +668,9 @@ impl App {
         };
         if let Err(error) = write_rudder_context(&self.cwd, &self.agents, Some(&worktree)) {
             self.notice = Some(format!("context warning: {error}"));
+        }
+        if let Err(error) = ensure_hunk_config(&worktree.path) {
+            self.notice = Some(format!("hunk config warning: {error}"));
         }
 
         let model = self.model.clone();
@@ -804,6 +826,10 @@ impl App {
                 "if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch; fi; exec npx --yes hunkdiff@latest diff --watch",
             ],
         );
+        if let Err(error) = ensure_hunk_config(&run.cwd) {
+            run.review_error = Some(error.to_string());
+            self.notice = Some(format!("hunk config warning: {error}"));
+        }
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(run.cwd.clone()),
@@ -1111,6 +1137,27 @@ mod app_tests {
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| line.chars().count() <= 28));
         assert_eq!(lines[0], "merge stopped: error:");
+    }
+
+    #[test]
+    fn converts_mouse_events_to_review_terminal_coordinates() {
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert_eq!(
+            mouse_event_to_sgr(event, area),
+            Some(b"\x1b[<0;3;4M".to_vec())
+        );
     }
 }
 
@@ -2206,7 +2253,9 @@ fn agent_command(
     effort: Option<EffortLevel>,
     task: &str,
 ) -> TerminalCommand {
-    let prompt = format!("Read RUDDER.md first if it exists.\n\n{task}");
+    let prompt = format!(
+        "Read RUDDER.md first if it exists. If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n\n{task}"
+    );
     match backend {
         Backend::Claude => {
             let mut args = vec![
@@ -2380,6 +2429,44 @@ fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(bytes)
+}
+
+fn mouse_event_to_sgr(mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
+    if !rect_contains(area, mouse.column, mouse.row) {
+        return None;
+    }
+
+    let x = mouse.column.saturating_sub(area.x).saturating_add(1);
+    let y = mouse.row.saturating_sub(area.y).saturating_add(1);
+    let (button, press) = match mouse.kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button), true),
+        MouseEventKind::Up(_) => (3, false),
+        MouseEventKind::Drag(button) => (mouse_button_code(button) + 32, true),
+        MouseEventKind::Moved => (35, true),
+        MouseEventKind::ScrollUp => (64, true),
+        MouseEventKind::ScrollDown => (65, true),
+        MouseEventKind::ScrollLeft => (66, true),
+        MouseEventKind::ScrollRight => (67, true),
+    };
+
+    Some(
+        format!(
+            "\x1b[<{};{};{}{}",
+            button,
+            x,
+            y,
+            if press { "M" } else { "m" }
+        )
+        .into_bytes(),
+    )
+}
+
+fn mouse_button_code(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
 }
 
 fn control_char_bytes(ch: char) -> Option<Vec<u8>> {
@@ -2662,12 +2749,60 @@ fn write_rudder_context(
     body.push_str(
         "\nRead this file before making changes so you know what other Rudder agents are doing.\n",
     );
+    body.push_str(
+        "\nHunk review: Rudder opens `hunk diff --watch` in the review pane. If a live Hunk review is open, run `hunk skill path`, load that skill, then use `hunk session review --repo . --json` to inspect the review and `hunk session comment add/apply --repo .` to leave inline notes for the user.\n",
+    );
     fs::write(repo_root.join("RUDDER.md"), body.as_bytes())?;
     if let Some(worktree) = pending {
         if worktree.path_is_worktree {
             fs::write(worktree.path.join("RUDDER.md"), body.as_bytes())?;
         }
     }
+    Ok(())
+}
+
+fn ensure_hunk_config(cwd: &Path) -> Result<()> {
+    ensure_git_info_exclude_contains(cwd, ".hunk/")?;
+    let dir = cwd.join(".hunk");
+    fs::create_dir_all(&dir)?;
+    let config = dir.join("config.toml");
+    let contents = [
+        "theme = \"paper\"",
+        "mode = \"auto\"",
+        "vcs = \"git\"",
+        "exclude_untracked = false",
+        "line_numbers = true",
+        "wrap_lines = false",
+        "agent_notes = true",
+        "",
+    ]
+    .join("\n");
+    fs::write(config, contents)?;
+    Ok(())
+}
+
+fn ensure_git_info_exclude_contains(cwd: &Path, line: &str) -> Result<()> {
+    let path = git_output(cwd, ["rev-parse", "--git-path", "info/exclude"])?;
+    let trimmed = path.trim();
+    let path = if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        cwd.join(trimmed)
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|existing| existing.trim() == line) {
+        return Ok(());
+    }
+    let mut next = existing;
+    if !next.ends_with('\n') && !next.is_empty() {
+        next.push('\n');
+    }
+    next.push_str(line);
+    next.push('\n');
+    fs::write(path, next)?;
     Ok(())
 }
 
