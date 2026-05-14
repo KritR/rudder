@@ -64,6 +64,19 @@ it with GitHub and stores only a hashed Rudder Cloud token. The hosted
 `/cli/login` page also exposes a GitHub device-login path so browser login does
 not dead-end while Google/GitHub Better Auth provider secrets are missing.
 
+GitHub browser OAuth can be configured from the hosted setup page without
+copying secrets by hand:
+
+```text
+https://mpd2pmnpep.us-east-1.awsapprunner.com/setup/github
+https://mpd2pmnpep.us-east-1.awsapprunner.com/setup/github?org=exla
+```
+
+That page uses GitHub's App Manifest flow to create a GitHub App, receives the
+generated OAuth client ID and secret at `/setup/github/callback`, stores them in
+Rudder Cloud's persisted state, and rebuilds Better Auth dynamically. The normal
+GitHub browser login button appears on `/cli/login` immediately after setup.
+
 OAuth callback URLs:
 
 ```text

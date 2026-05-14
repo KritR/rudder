@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import os from "node:os";
@@ -76,11 +76,6 @@ const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
 const githubDeviceClientId = process.env.RUDDER_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
 const deviceLogins = new Map<string, DeviceLogin>();
 const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
-const configuredProviders = {
-  google: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
-  github: Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET),
-  githubDevice: Boolean(githubDeviceClientId),
-};
 const s3 = new S3Client({ region: awsRegion });
 
 await fs.mkdir(dataDir, { recursive: true });
@@ -110,6 +105,11 @@ database.exec(`
     worker_token_hash text,
     last_heartbeat_at text,
     created_at text not null,
+    updated_at text not null
+  );
+  create table if not exists rudder_settings (
+    key text primary key,
+    value text not null,
     updated_at text not null
   );
 `);
@@ -151,15 +151,16 @@ const updateHeartbeat = database.prepare(`
       updated_at = @updatedAt
   where id = @id
 `);
+const getSetting = database.prepare("select value from rudder_settings where key = ?");
+const upsertSetting = database.prepare(`
+  insert into rudder_settings (key, value, updated_at)
+  values (@key, @value, @updatedAt)
+  on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
+`);
 
-const auth = betterAuth({
-  baseURL,
-  secret: requiredEnv("BETTER_AUTH_SECRET"),
-  database,
-  socialProviders: socialProviders(),
-});
-
-const authHandler = toNodeHandler(auth.handler);
+let authProviderFingerprint = providerFingerprint();
+let auth: ReturnType<typeof createBetterAuth> = createBetterAuth();
+let authHandler = toNodeHandler(auth.handler);
 
 const server = http.createServer(async (req, res) => {
   res.once("finish", () => {
@@ -168,6 +169,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", baseURL);
     if (url.pathname.startsWith("/api/auth")) {
+      refreshAuthHandler();
       authHandler(req, res);
       return;
     }
@@ -177,8 +179,16 @@ const server = http.createServer(async (req, res) => {
         s3: Boolean(snapshotBucket),
         fly: Boolean(flyApiToken && flyAppName && flyWorkerImage),
         state: Boolean(snapshotBucket && persistStateToS3),
-        auth: configuredProviders,
+        auth: configuredProviders(),
       });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/setup/github") {
+      renderGithubAppSetup(url, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/setup/github/callback") {
+      await handleGithubAppSetupCallback(url, res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/cli/login") {
@@ -403,11 +413,12 @@ function issueRudderToken(accountId: string, email?: string): { token: string; a
 function renderLoginPage(url: URL, res: ServerResponse): void {
   const deviceCode = url.searchParams.get("device_code") || "";
   const callbackURL = `/cli/approve?device_code=${encodeURIComponent(deviceCode)}`;
+  const providers = configuredProviders();
   const links = [
-    configuredProviders.google
+    providers.google
       ? `<a href="/api/auth/sign-in/social?provider=google&callbackURL=${encodeURIComponent(callbackURL)}">Continue with Google</a>`
       : "",
-    configuredProviders.github
+    providers.github
       ? `<a href="/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}">Continue with GitHub</a>`
       : "",
     deviceCode
@@ -420,6 +431,69 @@ function renderLoginPage(url: URL, res: ServerResponse): void {
 <style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}a{display:block;margin:12px 0;color:#111}code{background:#f2f2f2;padding:2px 5px}</style></head>
 <body><h1>Rudder Cloud</h1><p>Choose a provider to finish CLI login.</p>
 ${body}
+</body></html>`);
+}
+
+function renderGithubAppSetup(url: URL, res: ServerResponse): void {
+  const org = url.searchParams.get("org")?.trim();
+  const state = createSetupState();
+  const action = org
+    ? `https://github.com/organizations/${encodeURIComponent(org)}/settings/apps/new?state=${encodeURIComponent(state)}`
+    : `https://github.com/settings/apps/new?state=${encodeURIComponent(state)}`;
+  const manifest = {
+    name: org ? `Rudder Cloud (${org})` : "Rudder Cloud",
+    url: "https://rudder.viraat.dev",
+    hook_attributes: {
+      url: `${baseURL}/api/github/events`,
+      active: false,
+    },
+    redirect_url: `${baseURL}/setup/github/callback`,
+    callback_urls: [
+      `${baseURL}/api/auth/callback/github`,
+    ],
+    setup_url: `${baseURL}/setup/github`,
+    description: "Rudder Cloud login and coding-agent orchestration.",
+    public: false,
+    request_oauth_on_install: false,
+    default_permissions: {},
+    default_events: [],
+  };
+  sendHtml(res, `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up Rudder GitHub OAuth</title>
+<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}button{font:inherit;padding:8px 12px;border:1px solid #111;background:#fff}code{background:#f2f2f2;padding:2px 5px}</style></head>
+<body><h1>Set up Rudder GitHub OAuth</h1>
+<p>This creates a GitHub App from a manifest and stores its OAuth client ID and secret in Rudder Cloud's persisted state.</p>
+<p>Callback URL: <code>${escapeHtml(`${baseURL}/api/auth/callback/github`)}</code></p>
+<form action="${escapeHtml(action)}" method="post">
+  <input type="hidden" name="manifest" value="${escapeHtml(JSON.stringify(manifest))}">
+  <button type="submit">Create GitHub App</button>
+</form>
+</body></html>`);
+}
+
+async function handleGithubAppSetupCallback(url: URL, res: ServerResponse): Promise<void> {
+  const code = url.searchParams.get("code") || "";
+  const state = url.searchParams.get("state") || "";
+  if (!code || !verifySetupState(state)) {
+    sendHtml(res, "<p>GitHub setup expired. Open <code>/setup/github</code> and try again.</p>", 400);
+    return;
+  }
+  const app = await githubManifestConversion(code);
+  const clientId = typeof app.client_id === "string" ? app.client_id : undefined;
+  const clientSecret = typeof app.client_secret === "string" ? app.client_secret : undefined;
+  if (!clientId || !clientSecret) {
+    throw new Error("GitHub manifest conversion did not return OAuth client credentials");
+  }
+  setSetting("github_client_id", clientId);
+  setSetting("github_client_secret", clientSecret);
+  refreshAuthHandler(true);
+  schedulePersistDatabase();
+  sendHtml(res, `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rudder GitHub OAuth Ready</title>
+<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}code{background:#f2f2f2;padding:2px 5px}</style></head>
+<body><h1>GitHub OAuth is ready</h1>
+<p>Rudder Cloud saved the GitHub App OAuth credentials. <code>/cli/login</code> can now show the normal GitHub browser login button.</p>
+<p><a href="/health">Check health</a></p>
 </body></html>`);
 }
 
@@ -527,6 +601,57 @@ async function githubOAuthRequest<T>(url: string, body: Record<string, string>):
     throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `${response.status} ${response.statusText}`);
   }
   return parsed as T;
+}
+
+async function githubManifestConversion(code: string): Promise<JsonRecord> {
+  const response = await fetch(`https://api.github.com/app-manifests/${encodeURIComponent(code)}/conversions`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "rudder-cloud",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  const text = await response.text();
+  const parsed = text ? parseJson(text) : null;
+  if (!response.ok) {
+    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `GitHub manifest conversion failed: ${response.status}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("GitHub manifest conversion returned an unexpected response");
+  }
+  return parsed;
+}
+
+function createSetupState(): string {
+  const payload = Buffer.from(JSON.stringify({
+    exp: Date.now() + 10 * 60 * 1000,
+    nonce: randomBytes(16).toString("base64url"),
+  })).toString("base64url");
+  return `${payload}.${setupStateSignature(payload)}`;
+}
+
+function verifySetupState(state: string): boolean {
+  const [payload, signature] = state.split(".");
+  if (!payload || !signature) {
+    return false;
+  }
+  const expected = setupStateSignature(payload);
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (signatureBuffer.length !== expectedBuffer.length || !timingSafeEqual(signatureBuffer, expectedBuffer)) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof parsed.exp === "number" && parsed.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function setupStateSignature(payload: string): string {
+  return createHmac("sha256", requiredEnv("BETTER_AUTH_SECRET")).update(payload).digest("base64url");
 }
 
 function renderGithubDevicePage(res: ServerResponse, deviceCode: string, githubLogin: GithubBrowserLogin): void {
@@ -975,12 +1100,43 @@ function requireWorkerBearer(req: IncomingMessage, sailRow: Record<string, unkno
   }
 }
 
+function createBetterAuth() {
+  return betterAuth({
+    baseURL,
+    secret: requiredEnv("BETTER_AUTH_SECRET"),
+    database,
+    socialProviders: socialProviders(),
+  });
+}
+
+function refreshAuthHandler(force = false): void {
+  const nextFingerprint = providerFingerprint();
+  if (!force && nextFingerprint === authProviderFingerprint) {
+    return;
+  }
+  authProviderFingerprint = nextFingerprint;
+  auth = createBetterAuth();
+  authHandler = toNodeHandler(auth.handler);
+}
+
+function providerFingerprint(): string {
+  return JSON.stringify(configuredProviders());
+}
+
+function configuredProviders(): JsonRecord {
+  return {
+    google: Boolean(oauthValue("GOOGLE_CLIENT_ID", "google_client_id") && oauthValue("GOOGLE_CLIENT_SECRET", "google_client_secret")),
+    github: Boolean(oauthValue("GITHUB_CLIENT_ID", "github_client_id") && oauthValue("GITHUB_CLIENT_SECRET", "github_client_secret")),
+    githubDevice: Boolean(githubDeviceClientId),
+  };
+}
+
 function socialProviders(): JsonRecord {
   const providers: JsonRecord = {};
-  const googleClientId = process.env.GOOGLE_CLIENT_ID;
-  const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const githubClientId = process.env.GITHUB_CLIENT_ID;
-  const githubClientSecret = process.env.GITHUB_CLIENT_SECRET;
+  const googleClientId = oauthValue("GOOGLE_CLIENT_ID", "google_client_id");
+  const googleClientSecret = oauthValue("GOOGLE_CLIENT_SECRET", "google_client_secret");
+  const githubClientId = oauthValue("GITHUB_CLIENT_ID", "github_client_id");
+  const githubClientSecret = oauthValue("GITHUB_CLIENT_SECRET", "github_client_secret");
   if (googleClientId && googleClientSecret) {
     providers.google = {
       clientId: googleClientId,
@@ -994,6 +1150,19 @@ function socialProviders(): JsonRecord {
     };
   }
   return providers;
+}
+
+function oauthValue(envName: string, settingKey: string): string | undefined {
+  return process.env[envName] || settingValue(settingKey);
+}
+
+function settingValue(key: string): string | undefined {
+  const row = getSetting.get(key) as Record<string, unknown> | undefined;
+  return typeof row?.value === "string" && row.value.length > 0 ? row.value : undefined;
+}
+
+function setSetting(key: string, value: string): void {
+  upsertSetting.run({ key, value, updatedAt: new Date().toISOString() });
 }
 
 function ensureColumn(table: string, column: string, definition: string): void {
