@@ -1,0 +1,30 @@
+{
+  "ServiceName": "rudder-cloud",
+  "SourceConfiguration": {
+    "AuthenticationConfiguration": {},
+    "ImageRepository": {
+      "ImageIdentifier": "public.ecr.aws/docker/library/node:22-slim",
+      "ImageRepositoryType": "ECR_PUBLIC",
+      "ImageConfiguration": {
+        "Port": "3000",
+        "RuntimeEnvironmentVariables": {
+          "NODE_ENV": "production",
+          "PORT": "3000"
+        }
+      }
+    },
+    "AutoDeploymentsEnabled": false
+  },
+  "InstanceConfiguration": {
+    "Cpu": "0.25 vCPU",
+    "Memory": "0.5 GB"
+  },
+  "HealthCheckConfiguration": {
+    "Protocol": "HTTP",
+    "Path": "/health",
+    "Interval": 10,
+    "Timeout": 5,
+    "HealthyThreshold": 1,
+    "UnhealthyThreshold": 5
+  }
+}

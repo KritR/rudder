@@ -257,7 +257,11 @@ impl App {
             .map(|path| repo_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
-        let agents = load_persisted_agents(&cwd);
+        let agents = if cfg!(test) {
+            Vec::new()
+        } else {
+            load_persisted_agents(&cwd)
+        };
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
@@ -610,7 +614,7 @@ impl App {
                 self.task_input.push('/');
                 self.task_cursor = 1;
                 self.picker_index = 0;
-                self.notice = Some("type /model".to_string());
+                self.notice = Some("type /model, /login, /cloud, or /sail".to_string());
             }
             KeyCode::Char(ch) => {
                 self.reset_task_history_navigation();
@@ -1107,11 +1111,97 @@ impl App {
             }
             Some("/help") => {
                 self.notice =
-                    Some("Tab focus  Enter start/focus  /model  m/M merge  dd delete".to_string());
+                    Some("Tab focus  Enter start/focus  /model  /login  /cloud  /sail  m/M merge  dd delete".to_string());
+                true
+            }
+            Some("/login") => {
+                self.start_rudder_cli_command("cloud login", vec!["login".to_string()]);
+                true
+            }
+            Some("/cloud") => {
+                let args = self.cloud_command_args(parts.collect::<Vec<_>>());
+                self.start_rudder_cli_command("cloud", args);
+                true
+            }
+            Some("/sail") => {
+                let mut args = vec!["cloud".to_string(), "sail".to_string()];
+                args.extend(parts.map(ToString::to_string));
+                self.start_rudder_cli_command("sail", args);
                 true
             }
             _ => false,
         }
+    }
+
+    fn cloud_command_args(&self, args: Vec<&str>) -> Vec<String> {
+        if args.is_empty() {
+            return vec!["cloud".to_string()];
+        }
+        if args[0] == "onload" && args.len() == 1 {
+            if let Some(run) = self.agents.get(self.selected_agent) {
+                return vec!["cloud".to_string(), "onload".to_string(), run.id.clone()];
+            }
+        }
+        let known = [
+            "list", "onload", "sail", "pause", "resume", "status", "stop", "logs",
+        ];
+        let mut command = vec!["cloud".to_string()];
+        if known.contains(&args[0]) {
+            command.extend(args.into_iter().map(ToString::to_string));
+        } else {
+            command.push("sail".to_string());
+            command.extend(args.into_iter().map(ToString::to_string));
+        }
+        command
+    }
+
+    fn start_rudder_cli_command(&mut self, label: &str, args: Vec<String>) {
+        let id = new_run_id(label);
+        let command = TerminalCommand::with_args("rudder", args);
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        let mut run = AgentRun {
+            id,
+            created_at: now_stamp(),
+            task: label.to_string(),
+            backend: self.backend,
+            model: self.model.clone(),
+            effort: self.effort,
+            status: AgentStatus::Running,
+            cwd: self.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: true,
+            needs_permission: false,
+            permission_notified: false,
+            last_error: None,
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                self.notice = Some(format!("opened {label}"));
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("{label} failed: {error}"));
+            }
+        }
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
     }
 
     fn selected_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
@@ -2445,7 +2535,7 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let hint = app
         .notice
         .as_deref()
-        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model");
+        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model  /cloud");
     let inner_width = area.width.saturating_sub(2).max(1);
     let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width);
     let (cursor_line, cursor_column) =
@@ -2522,7 +2612,7 @@ fn task_pane_height(app: &App, width: u16) -> u16 {
     let hint = app
         .notice
         .as_deref()
-        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model");
+        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model  /cloud");
     let inner_width = width.saturating_sub(2).max(1);
     let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width)
         .len()
@@ -3419,6 +3509,21 @@ fn command_suggestions() -> Vec<Suggestion> {
             label: "/model".to_string(),
             detail: "pick Claude or Codex model".to_string(),
             action: SuggestionAction::Insert("/model ".to_string()),
+        },
+        Suggestion {
+            label: "/login".to_string(),
+            detail: "authenticate Rudder Cloud in the browser".to_string(),
+            action: SuggestionAction::Insert("/login".to_string()),
+        },
+        Suggestion {
+            label: "/cloud".to_string(),
+            detail: "list, start, pause, resume, or onload cloud workers".to_string(),
+            action: SuggestionAction::Insert("/cloud ".to_string()),
+        },
+        Suggestion {
+            label: "/sail".to_string(),
+            detail: "short alias for starting a cloud worker".to_string(),
+            action: SuggestionAction::Insert("/sail ".to_string()),
         },
         Suggestion {
             label: "/help".to_string(),

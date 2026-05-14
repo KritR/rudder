@@ -28,6 +28,10 @@ export function authStorePath(): string {
   return path.join(rudderHome(), "auth-profiles.json");
 }
 
+export function cloudAuthPath(): string {
+  return path.join(rudderHome(), "cloud.json");
+}
+
 export function projectStateDir(repoRoot: string): string {
   return path.join(repoRoot, ".rudder");
 }

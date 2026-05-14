@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
+import { runCloudCommand } from "./cloud.js";
 import { findRepoRoot } from "./git.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
@@ -50,6 +51,7 @@ type Parsed = {
     noNative?: boolean;
     headless?: boolean;
     tmuxSession?: string;
+    homePaths?: string[];
   };
 };
 
@@ -182,6 +184,19 @@ export async function main(): Promise<void> {
       return;
     case "doctor":
       await runDoctor({ json: parsed.flags.json });
+      return;
+    case "login":
+      await runCloudCommand("cloud", ["login", ...parsed.args], {
+        json: parsed.flags.json,
+        homePaths: parsed.flags.homePaths,
+      });
+      return;
+    case "cloud":
+    case "sail":
+      await runCloudCommand(parsed.command, parsed.args, {
+        json: parsed.flags.json,
+        homePaths: parsed.flags.homePaths,
+      });
       return;
     case "run": {
       await maybeOnboard();
@@ -386,6 +401,10 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.tmuxSession = readValue(argv, ++i, arg);
       continue;
     }
+    if (takesValue(arg, "--home-path")) {
+      parsed.flags.homePaths = [...(parsed.flags.homePaths ?? []), readValue(argv, ++i, arg)];
+      continue;
+    }
     if (arg.startsWith("--model=")) {
       parsed.flags.model = arg.slice("--model=".length);
       continue;
@@ -408,6 +427,10 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--tmux-session=")) {
       parsed.flags.tmuxSession = arg.slice("--tmux-session=".length);
+      continue;
+    }
+    if (arg.startsWith("--home-path=")) {
+      parsed.flags.homePaths = [...(parsed.flags.homePaths ?? []), arg.slice("--home-path=".length)];
       continue;
     }
     if (!parsed.command && !arg.startsWith("-")) {
@@ -592,6 +615,11 @@ Usage:
   rudder run [options] "task"
   rudder claude [options] "task"
   rudder codex [options] "task"
+  rudder login
+  rudder cloud <name or task>
+  rudder cloud list
+  rudder cloud onload <runId>
+  rudder sail <name or task>
 
 Run management:
   rudder watch [run]              Attach to live output
@@ -607,6 +635,14 @@ Setup:
   rudder onboard
   rudder doctor [--json]
 
+Cloud:
+  rudder login                    Open browser login and store cloud token
+  rudder cloud list               List cloud workers/runs
+  rudder cloud onload <runId>     Move a local Rudder run to cloud
+  rudder cloud pause <id>         Pause an idle cloud worker
+  rudder cloud resume <id>        Resume a cloud worker
+  rudder sail <name or task>      Alias for starting a cloud worker
+
 Options:
   -d, --detach                    Start in background
       --worktree                  Always isolate in a git worktree
@@ -617,6 +653,7 @@ Options:
       --no-tmux                   Use the legacy TUI for bare rudder
       --no-native                 Use the tmux dashboard instead of native
       --headless                  Alias for --no-tmux on bare rudder
+      --home-path <path>          Include extra HOME path in cloud snapshot
       --json                      Machine-readable output
   -v, --version                   Print version
       --allow-dirty               Allow merge into dirty target branch

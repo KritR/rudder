@@ -222,3 +222,23 @@ export type VerificationResult = {
   notes: string;
   shouldContinue: boolean;
 };
+
+export type CloudAuthState = {
+  version: 1;
+  token: string;
+  cloudUrl: string;
+  accountId?: string;
+  email?: string;
+  expiresAt?: string;
+  updatedAt: string;
+};
+
+export type CloudSail = {
+  id: string;
+  status?: string;
+  url?: string;
+  branch?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: JsonValue | undefined;
+};
