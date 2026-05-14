@@ -74,6 +74,10 @@ const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 15 * 60 * 1000);
 const stateKey = process.env.RUDDER_CLOUD_STATE_KEY || "control-plane/rudder-cloud.sqlite";
 const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
 const githubDeviceClientId = process.env.RUDDER_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
+const adminEmails = new Set((process.env.RUDDER_ADMIN_EMAILS || "viraat.laldas@gmail.com,viraat@exla.ai")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean));
 const deviceLogins = new Map<string, DeviceLogin>();
 const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
 const s3 = new S3Client({ region: awsRegion });
@@ -189,6 +193,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/setup/github/callback") {
       await handleGithubAppSetupCallback(url, res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/rudder/setup/github") {
+      await handleGithubCredentialSetup(req, res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/cli/login") {
@@ -495,6 +503,25 @@ async function handleGithubAppSetupCallback(url: URL, res: ServerResponse): Prom
 <p>Rudder Cloud saved the GitHub App OAuth credentials. <code>/cli/login</code> can now show the normal GitHub browser login button.</p>
 <p><a href="/health">Check health</a></p>
 </body></html>`);
+}
+
+async function handleGithubCredentialSetup(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const authContext = requireBearer(req);
+  requireAdmin(authContext);
+  const body = await readJsonBody(req);
+  const clientId = stringField(body, "clientId") || stringField(body, "client_id");
+  const clientSecret = stringField(body, "clientSecret") || stringField(body, "client_secret");
+  if (!clientId || !clientSecret) {
+    throw badRequest("clientId and clientSecret are required");
+  }
+  setSetting("github_client_id", clientId.trim());
+  setSetting("github_client_secret", clientSecret.trim());
+  refreshAuthHandler(true);
+  await persistDatabaseToS3();
+  sendJson(res, 200, {
+    ok: true,
+    auth: configuredProviders(),
+  });
 }
 
 async function handleCliGithubStart(url: URL, res: ServerResponse): Promise<void> {
@@ -1089,6 +1116,13 @@ function requireBearer(req: IncomingMessage): { accountId: string; email?: strin
     accountId: String(row.account_id),
     email: optionalString(row.email),
   };
+}
+
+function requireAdmin(authContext: { email?: string }): void {
+  const email = authContext.email?.toLowerCase();
+  if (!email || !adminEmails.has(email)) {
+    throw unauthorized();
+  }
 }
 
 function requireWorkerBearer(req: IncomingMessage, sailRow: Record<string, unknown>): void {

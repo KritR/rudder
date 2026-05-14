@@ -77,6 +77,19 @@ generated OAuth client ID and secret at `/setup/github/callback`, stores them in
 Rudder Cloud's persisted state, and rebuilds Better Auth dynamically. The normal
 GitHub browser login button appears on `/cli/login` immediately after setup.
 
+If the GitHub App already exists, generate a fresh client secret from the app
+settings page and install the existing app credentials from a logged-in admin
+CLI:
+
+```bash
+rudder cloud login
+rudder cloud setup-github <client-id> <client-secret>
+```
+
+The setup endpoint is restricted to `RUDDER_ADMIN_EMAILS` (defaults to
+`viraat.laldas@gmail.com,viraat@exla.ai`) and persists the credentials to S3
+before returning.
+
 OAuth callback URLs:
 
 ```text

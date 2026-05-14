@@ -121,6 +121,9 @@ export async function runCloudCommand(command: string, args: string[], options: 
     case "resume":
       await mutateSail("resume", rest, options);
       return;
+    case "setup-github":
+      await setupGithub(rest, options);
+      return;
     default:
       await launch(command === "sail" ? args : [subcommand, ...rest], options);
       return;
@@ -381,6 +384,27 @@ async function mutateSail(action: "onload" | "pause" | "resume", args: string[],
   const result = await client.request<JsonValue>(`/api/rudder/sail/${encodeURIComponent(sailId)}/${action}`, {
     method: "POST",
     body: args.length > 1 ? { args: args.slice(1) } : {},
+  });
+  printResult(result, options);
+}
+
+async function setupGithub(args: string[], options: CloudCommandOptions): Promise<void> {
+  const clientId = args[0]?.trim() || process.env.RUDDER_GITHUB_CLIENT_ID?.trim();
+  const clientSecret = args[1]?.trim() || process.env.RUDDER_GITHUB_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret) {
+    throw new Error([
+      "Missing GitHub OAuth credentials.",
+      "Usage: rudder cloud setup-github <client-id> <client-secret>",
+      "Or set RUDDER_GITHUB_CLIENT_ID and RUDDER_GITHUB_CLIENT_SECRET.",
+    ].join("\n"));
+  }
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<JsonValue>("/api/rudder/setup/github", {
+    method: "POST",
+    body: {
+      clientId,
+      clientSecret,
+    },
   });
   printResult(result, options);
 }
@@ -715,9 +739,12 @@ Usage:
   rudder sail list
   rudder sail pause <id>
   rudder sail resume <id>
+  rudder cloud setup-github <client-id> <client-secret>
 
 Environment:
   RUDDER_CLOUD_URL              Cloud control plane URL (defaults to ${DEFAULT_CLOUD_URL})
   RUDDER_CLOUD_HOME_PATHS       Extra comma-separated HOME paths to include in snapshots
+  RUDDER_GITHUB_CLIENT_ID       GitHub App OAuth client ID for setup-github
+  RUDDER_GITHUB_CLIENT_SECRET   GitHub App OAuth client secret for setup-github
 `);
 }
