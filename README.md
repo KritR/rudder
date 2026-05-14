@@ -103,7 +103,8 @@ dashboard from any pane.
 | `Ctrl-C` | Leave Rudder from any pane |
 | `/model` | Open the provider-first model picker |
 | `/help` | Show the short command hint |
-| `v` | Open the selected agent's Hunk review view |
+| `v` | Toggle the selected agent's review view |
+| `Esc` | Leave the review view when it is focused |
 | `m` | Merge the selected completed worktree |
 | `M` | Merge all completed worktrees |
 | `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
@@ -184,7 +185,7 @@ or fails, Rudder plays the bundled completion sound.
 
 ## Review
 
-Press `v` on an agent to open Hunk against that agent's worktree:
+Press `v` on an agent to toggle a review view for that agent's worktree:
 
 ```bash
 hunk diff --watch
@@ -192,15 +193,17 @@ hunk diff --watch
 
 Hunk provides the multi-file review UI, sidebar navigation, mouse support,
 watch mode, inline agent notes, and untracked-file handling. Rudder forwards
-keyboard and mouse input into Hunk while the review pane is focused.
+keyboard and accelerated mouse-wheel input into Hunk while the review pane is
+focused. Press `v` or `Esc` to return to the live Claude Code or Codex worker.
 
 Rudder writes a per-worktree `.hunk/config.toml` in Hunk's light mode and
 ignores that config through git's local info exclude, so it does not get merged.
 Set `RUDDER_HUNK_THEME=paper` or another Hunk theme name to override it.
 
-If `hunk` is not installed, Rudder uses `npx --yes hunkdiff@latest` before
-opening the review. Press `Ctrl-G`, then `v`, to return to the live Claude Code
-or Codex worker.
+On dashboard startup, Rudder installs `hunkdiff@latest` automatically if neither
+`hunk` nor `hunkdiff` is available. If the install fails, or if you set
+`RUDDER_REVIEW_TOOL=git`, the review pane falls back to a live `git diff` view
+instead of downloading anything when you first press `v`.
 
 Rudder also injects Hunk review guidance into `RUDDER.md` and the worker prompt.
 Agents are told to run `hunk skill path`, load the Hunk review skill, and use

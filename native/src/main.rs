@@ -36,8 +36,15 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const TICK_RATE: Duration = Duration::from_millis(50);
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
-const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
-const INACTIVE_COLOR: Color = Color::DarkGray;
+const BACKGROUND_COLOR: Color = Color::White;
+const TEXT_COLOR: Color = Color::Rgb(24, 28, 39);
+const MUTED_COLOR: Color = Color::Rgb(100, 108, 128);
+const INACTIVE_COLOR: Color = Color::Rgb(166, 173, 190);
+const FOCUS_COLOR: Color = Color::Rgb(0, 176, 89);
+const MODEL_COLOR: Color = Color::Rgb(188, 75, 205);
+const RUNNING_COLOR: Color = Color::Rgb(178, 103, 0);
+const DONE_COLOR: Color = Color::Rgb(45, 128, 82);
+const FAILED_COLOR: Color = Color::Rgb(198, 36, 54);
 const MIN_WHEEL_SCROLL_ROWS: u16 = 6;
 const MAX_WHEEL_SCROLL_ROWS: u16 = 18;
 const TASK_HISTORY_LIMIT: usize = 100;
@@ -411,12 +418,20 @@ impl App {
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
         if self.worker_view == WorkerView::Diff {
-            if self.selected_review_terminal_mut().is_none() {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('v') => self.worker_view = WorkerView::Terminal,
-                    KeyCode::Char('m') => self.request_merge_selected_agent(),
-                    _ => {}
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('v') => {
+                    self.worker_view = WorkerView::Terminal;
+                    self.notice = None;
+                    return false;
                 }
+                KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.request_merge_selected_agent();
+                    return false;
+                }
+                _ => {}
+            }
+
+            if self.selected_review_terminal_mut().is_none() {
                 return false;
             }
 
@@ -476,7 +491,10 @@ impl App {
                 self.ensure_hunk_review();
                 WorkerView::Diff
             }
-            WorkerView::Diff => WorkerView::Terminal,
+            WorkerView::Diff => {
+                self.notice = None;
+                WorkerView::Terminal
+            }
         };
         self.focus = FocusPane::Worker;
     }
@@ -764,11 +782,15 @@ impl App {
         let inner = block_inner(worker_area);
 
         if self.worker_view == WorkerView::Diff {
-            if self.write_mouse_to_selected_review(mouse, inner) {
+            if is_scroll_mouse_event(mouse.kind) {
+                if self.write_scroll_to_selected_review(mouse, inner) {
+                    return;
+                }
+                self.scroll_review(mouse_scrollback_delta(mouse, inner.height));
                 return;
             }
-            if is_scroll_mouse_event(mouse.kind) {
-                self.scroll_review(mouse_scrollback_delta(mouse, inner.height));
+            if self.write_mouse_to_selected_review(mouse, inner) {
+                return;
             }
             return;
         }
@@ -805,9 +827,38 @@ impl App {
             return false;
         };
         let result = match self.selected_review_terminal_mut() {
-            Some(review) => review.write_input(&bytes),
+            Some(review) => {
+                if !review.wants_sgr_mouse_events() {
+                    return false;
+                }
+                review.write_input(&bytes)
+            }
             None => return false,
         };
+        if let Err(error) = result {
+            self.set_selected_review_error(error.to_string());
+        }
+        true
+    }
+
+    fn write_scroll_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
+            return false;
+        };
+        let steps = review_scroll_steps(area.height, mouse.modifiers);
+        let Some(review) = self.selected_review_terminal_mut() else {
+            return false;
+        };
+        if !review.wants_sgr_mouse_events() {
+            return false;
+        }
+        let mut result: Result<()> = Ok(());
+        for _ in 0..steps {
+            if let Err(error) = review.write_input(&bytes) {
+                result = Err(error);
+                break;
+            }
+        }
         if let Err(error) = result {
             self.set_selected_review_error(error.to_string());
         }
@@ -1032,7 +1083,7 @@ impl App {
             "sh",
             [
                 "-lc",
-                "theme=\"${RUDDER_HUNK_THEME:-paper}\"; if [ \"$theme\" = light ]; then theme=paper; fi; if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch --theme \"$theme\"; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch --theme \"$theme\"; fi; exec npx --yes hunkdiff@latest diff --watch --theme \"$theme\"",
+                "theme=\"${RUDDER_HUNK_THEME:-paper}\"; if [ \"$theme\" = light ]; then theme=paper; fi; if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch --theme \"$theme\"; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch --theme \"$theme\"; fi; while :; do printf '\\033[2J\\033[H'; git status --short; printf '\\n'; git diff --stat HEAD; printf '\\n'; git diff --color=always HEAD; sleep 2; done",
             ],
         );
         if let Err(error) = ensure_hunk_config(&run.cwd) {
@@ -1050,8 +1101,7 @@ impl App {
                 let _ = terminal.drain_output();
                 run.review_terminal = Some(terminal);
                 run.review_error = None;
-                self.notice =
-                    Some("opening Hunk review; first run may download hunkdiff".to_string());
+                self.notice = Some("opening review".to_string());
             }
             Err(error) => {
                 run.review_error = Some(error.to_string());
@@ -1744,6 +1794,9 @@ mod app_tests {
         assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 10);
         assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 18);
         assert_eq!(wheel_scroll_rows(30, KeyModifiers::CONTROL), 29);
+        assert_eq!(review_scroll_steps(30, KeyModifiers::empty()), 3);
+        assert_eq!(review_scroll_steps(90, KeyModifiers::empty()), 8);
+        assert_eq!(review_scroll_steps(30, KeyModifiers::ALT), 24);
 
         let down = MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -1879,6 +1932,20 @@ mod app_tests {
         app.focus = FocusPane::Task;
         assert!(app.handle_key(key));
     }
+
+    #[test]
+    fn v_and_escape_leave_review_view() {
+        let mut app = App::new();
+        app.worker_view = WorkerView::Diff;
+        app.focus = FocusPane::Worker;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty())));
+        assert_eq!(app.worker_view, WorkerView::Terminal);
+
+        app.worker_view = WorkerView::Diff;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
+        assert_eq!(app.worker_view, WorkerView::Terminal);
+    }
 }
 
 fn main() -> Result<()> {
@@ -1948,6 +2015,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(app_style()), area);
     let task_height = task_pane_height(app, area.width);
 
     let rows = Layout::default()
@@ -1988,14 +2056,14 @@ enum Gutter {
 }
 
 fn render_gutter(frame: &mut Frame<'_>, area: Rect, gutter: Gutter) {
-    let style = Style::default().fg(Color::DarkGray);
+    let style = muted_style(false);
     let line = match gutter {
         Gutter::Horizontal => " ".repeat(area.width as usize),
         Gutter::Vertical => " ".to_string(),
     };
 
     let lines = vec![Line::from(Span::styled(line, style)); area.height as usize];
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines).style(app_style()), area);
 }
 
 fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2076,7 +2144,9 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     frame.render_widget(
-        List::new(lines).block(pane_block("agents", focused, app.nav_mode)),
+        List::new(lines)
+            .style(app_style())
+            .block(pane_block("agents", focused, app.nav_mode)),
         area,
     );
 }
@@ -2110,6 +2180,7 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         WorkerView::Diff => review_lines(app, inner.height as usize),
     };
     let paragraph = Paragraph::new(lines)
+        .style(app_style())
         .block(pane_block(
             match app.worker_view {
                 WorkerView::Terminal => "worker",
@@ -2172,25 +2243,22 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     let Some(run) = app.agents.get_mut(app.selected_agent) else {
         return vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "No worker is running yet.",
-                Style::default().fg(Color::Gray),
-            )),
+            Line::from(Span::styled("No worker is running yet.", muted_style(true))),
             Line::from(""),
-            Line::from("Enter a task below to start Claude Code or Codex in this pane."),
+            Line::from(Span::styled(
+                "Enter a task below to start Claude Code or Codex in this pane.",
+                pane_text_style(true),
+            )),
         ];
     };
 
     if let Some(error) = &run.last_error {
         return vec![
             Line::from(vec![
-                Span::styled("failed ", Style::default().fg(Color::Red)),
-                Span::styled(
-                    run.cwd.display().to_string(),
-                    Style::default().fg(Color::Gray),
-                ),
+                Span::styled("failed ", error_style()),
+                Span::styled(run.cwd.display().to_string(), muted_style(true)),
             ]),
-            Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))),
+            Line::from(Span::styled(error.clone(), error_style())),
         ];
     }
 
@@ -2213,33 +2281,30 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     let Some(run) = app.agents.get_mut(app.selected_agent) else {
         return vec![Line::from(Span::styled(
             "No agent selected.",
-            Style::default().fg(Color::Gray),
+            muted_style(true),
         ))];
     };
 
     if let Some(error) = &run.review_error {
         return vec![
-            Line::from(Span::styled(
-                "Hunk review failed",
-                Style::default().fg(Color::Red),
-            )),
-            Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))),
+            Line::from(Span::styled("Hunk review failed", error_style())),
+            Line::from(Span::styled(error.clone(), error_style())),
             Line::from(""),
             Line::from(Span::styled(
                 "Press Ctrl-G then v to return to the worker.",
-                Style::default().fg(Color::Gray),
+                muted_style(true),
             )),
         ];
     }
 
     let Some(review) = run.review_terminal.as_mut() else {
         return vec![
-            Line::from(Span::styled(
-                "Opening Hunk review...",
-                Style::default().fg(Color::Gray),
-            )),
+            Line::from(Span::styled("Opening Hunk review...", muted_style(true))),
             Line::from(""),
-            Line::from("If Hunk is not installed, Rudder will run npm install -g hunkdiff@latest."),
+            Line::from(Span::styled(
+                "If Hunk is unavailable, Rudder falls back to a live git diff.",
+                pane_text_style(true),
+            )),
         ];
     };
 
@@ -2315,7 +2380,10 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
-    let paragraph = Paragraph::new(lines).block(pane_block("task", focused, app.nav_mode));
+    let paragraph =
+        Paragraph::new(lines)
+            .style(app_style())
+            .block(pane_block("task", focused, app.nav_mode));
 
     frame.render_widget(paragraph, area);
 
@@ -2374,17 +2442,15 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
             let selected = index + offset == selected_index;
             let marker = if selected { "> " } else { "  " };
             let style = if selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                accent_style(true)
             } else {
-                Style::default()
+                app_style()
             };
             ListItem::new(Line::from(vec![
                 Span::styled(marker, style),
                 Span::styled(suggestion.label.clone(), style),
                 Span::raw("  "),
-                Span::styled(suggestion.detail.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(suggestion.detail.clone(), muted_style(true)),
             ]))
         })
         .collect::<Vec<_>>();
@@ -2394,15 +2460,17 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
     } else {
         " commands "
     };
-    let list = List::new(items).block(
+    let list = List::new(items).style(app_style()).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_style(
                 Style::default()
                     .fg(FOCUS_COLOR)
+                    .bg(BACKGROUND_COLOR)
                     .add_modifier(Modifier::BOLD),
-            ),
+            )
+            .style(app_style()),
     );
 
     frame.render_widget(Clear, area);
@@ -2428,7 +2496,7 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 "This will run git merge into the current branch.".to_string(),
                 "Press y to merge, n to cancel.".to_string(),
             ],
-            Color::Yellow,
+            RUNNING_COLOR,
         )
     } else if let Some(prompt) = &app.conflict_prompt {
         let files = prompt.conflicted_files.join(", ");
@@ -2451,7 +2519,7 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 },
                 "Press y to start an AI resolver, n to handle manually.".to_string(),
             ],
-            Color::Red,
+            FAILED_COLOR,
         )
     } else {
         return;
@@ -2462,7 +2530,7 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = body
         .into_iter()
         .flat_map(|line| wrap_text(&line, inner_width))
-        .map(|line| Line::from(Span::styled(line, Style::default())))
+        .map(|line| Line::from(Span::styled(line, app_style())))
         .collect::<Vec<_>>();
     let block = Block::default()
         .title(title)
@@ -2470,9 +2538,14 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .border_style(
             Style::default()
                 .fg(border_color)
+                .bg(BACKGROUND_COLOR)
                 .add_modifier(Modifier::BOLD),
-        );
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+        )
+        .style(app_style());
+    let paragraph = Paragraph::new(lines)
+        .style(app_style())
+        .block(block)
+        .wrap(Wrap { trim: true });
     frame.render_widget(Clear, modal);
     frame.render_widget(paragraph, modal);
 }
@@ -2492,18 +2565,19 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
     let border_style = if focused {
         Style::default()
             .fg(FOCUS_COLOR)
+            .bg(BACKGROUND_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(INACTIVE_COLOR)
+        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
     };
 
     let title_style = if focused {
         Style::default()
-            .fg(Color::Black)
+            .fg(BACKGROUND_COLOR)
             .bg(FOCUS_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        muted_style(true)
     };
     let _ = nav_mode;
 
@@ -2511,6 +2585,7 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
         .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .borders(Borders::ALL)
         .border_style(border_style)
+        .style(app_style())
 }
 
 fn task_input_lines(value: &str, cursor: usize, width: u16) -> Vec<String> {
@@ -2620,21 +2695,17 @@ fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, 
 
 fn pane_text_style(focused: bool) -> Style {
     if focused {
-        Style::default()
+        app_style()
     } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
     }
 }
 
 fn muted_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(MUTED_COLOR).bg(BACKGROUND_COLOR)
     } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
     }
 }
 
@@ -2642,22 +2713,30 @@ fn accent_style(focused: bool) -> Style {
     if focused {
         Style::default()
             .fg(FOCUS_COLOR)
+            .bg(BACKGROUND_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
     }
 }
 
 fn model_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Magenta)
+        Style::default().fg(MODEL_COLOR).bg(BACKGROUND_COLOR)
     } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(INACTIVE_COLOR).bg(BACKGROUND_COLOR)
     }
+}
+
+fn app_style() -> Style {
+    Style::default().fg(TEXT_COLOR).bg(BACKGROUND_COLOR)
+}
+
+fn error_style() -> Style {
+    Style::default()
+        .fg(FAILED_COLOR)
+        .bg(BACKGROUND_COLOR)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn block_inner(area: Rect) -> Rect {
@@ -2708,13 +2787,25 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
         .max(1)
 }
 
+fn review_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
+    let page = viewport_height.saturating_sub(1).max(1) as usize;
+    if modifiers.intersects(
+        KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::META | KeyModifiers::SUPER,
+    ) {
+        return page.clamp(8, 24);
+    }
+    ((viewport_height / 8).max(3).min(8)) as usize
+}
+
 fn page_scroll_rows(area: Option<Rect>) -> isize {
     let height = area.map(block_inner).map(|inner| inner.height).unwrap_or(1);
     height.saturating_sub(1).max(1) as isize
 }
 
 fn status_style(status: AgentStatus) -> Style {
-    Style::default().fg(status_color(status))
+    Style::default()
+        .fg(status_color(status))
+        .bg(BACKGROUND_COLOR)
 }
 
 fn agent_status_label(agent: &AgentRun) -> &'static str {
@@ -2728,7 +2819,8 @@ fn agent_status_label(agent: &AgentRun) -> &'static str {
 fn agent_status_style(agent: &AgentRun) -> Style {
     if agent.needs_permission {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(RUNNING_COLOR)
+            .bg(BACKGROUND_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
         status_style(agent.status)
@@ -2737,9 +2829,9 @@ fn agent_status_style(agent: &AgentRun) -> Style {
 
 fn status_color(status: AgentStatus) -> Color {
     match status {
-        AgentStatus::Running => Color::Yellow,
-        AgentStatus::Done => Color::Gray,
-        AgentStatus::Failed => Color::Red,
+        AgentStatus::Running => RUNNING_COLOR,
+        AgentStatus::Done => DONE_COLOR,
+        AgentStatus::Failed => FAILED_COLOR,
     }
 }
 
@@ -2760,7 +2852,7 @@ fn terminal_cell_style(cell: &StyledTerminalCell) -> Style {
     } else {
         (cell.fg, cell.bg)
     };
-    let mut style = Style::default();
+    let mut style = app_style();
     if let Some(color) = map_vt100_color(fg) {
         style = style.fg(color);
     }
