@@ -487,7 +487,7 @@ async function handleGithubAppSetupCallback(url: URL, res: ServerResponse): Prom
   setSetting("github_client_id", clientId);
   setSetting("github_client_secret", clientSecret);
   refreshAuthHandler(true);
-  schedulePersistDatabase();
+  await persistDatabaseToS3();
   sendHtml(res, `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rudder GitHub OAuth Ready</title>
 <style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}code{background:#f2f2f2;padding:2px 5px}</style></head>
