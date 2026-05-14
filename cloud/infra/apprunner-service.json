@@ -3,13 +3,24 @@
   "SourceConfiguration": {
     "AuthenticationConfiguration": {},
     "ImageRepository": {
-      "ImageIdentifier": "public.ecr.aws/docker/library/node:22-slim",
+      "ImageIdentifier": "public.ecr.aws/exla/rudder-cloud-control:latest",
       "ImageRepositoryType": "ECR_PUBLIC",
       "ImageConfiguration": {
         "Port": "3000",
         "RuntimeEnvironmentVariables": {
           "NODE_ENV": "production",
-          "PORT": "3000"
+          "PORT": "3000",
+          "AWS_REGION": "us-east-1",
+          "RUDDER_S3_BUCKET": "rudder-cloud-snapshots-597088032164-us-east-1",
+          "RUDDER_CLOUD_DATA_DIR": "/data",
+          "FLY_APP_NAME": "rudder-workers-exla",
+          "FLY_REGION": "iad",
+          "RUDDER_WORKER_IMAGE": "public.ecr.aws/exla/rudder-worker:latest",
+          "RUDDER_IDLE_PAUSE_MS": "900000"
+        },
+        "RuntimeEnvironmentSecrets": {
+          "BETTER_AUTH_SECRET": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/better-auth-secret-LGW1vG",
+          "FLY_API_TOKEN": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/fly-api-token-fss6y8"
         }
       }
     },

@@ -339,7 +339,7 @@
             Claude Code or Codex worker in its own git worktree. Watch the
             agent live, review the diff, steer it when needed, then merge the
             finished work back into your branch. Use Rudder Cloud when a run
-            should keep going away from your laptop.
+            should keep going away from your laptop on a Fly worker.
           </p>
           <div class="install">
             <code id="install-command">npm install -g @viraatdas/rudder@latest
@@ -373,11 +373,11 @@ rudder</code>
           </div>
           <div class="point">
             <strong>Designed for long runs</strong>
-            <span>Rudder keeps run state, lets you restart stopped agents, and is adding cloud workers for offloaded tasks.</span>
+            <span>Rudder keeps run state, lets you restart stopped agents, and can hand work to cloud workers.</span>
           </div>
           <div class="point">
             <strong>Rudder Cloud</strong>
-            <span>Run `rudder login`, then use `/cloud` or `/sail` to list, start, pause, resume, or onload a worktree to a cloud worker.</span>
+            <span>Run `rudder login`, then use `/cloud` or `/sail` to start, pause, resume, or onload a worktree to a Fly Machine.</span>
           </div>
         </section>
       </main>

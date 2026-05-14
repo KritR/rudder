@@ -17,9 +17,9 @@ runs real Claude Code or Codex processes in the worker pane.
 
 ![Rudder dashboard running Codex in a worker pane](site/rudder-dashboard.svg)
 
-Rudder Cloud is now scaffolded behind `/login`, `/cloud`, and `/sail`. It keeps
-the same local dashboard and worktree flow, with an optional cloud worker path
-for tasks that should continue away from your laptop.
+Rudder Cloud lives behind `/login`, `/cloud`, and `/sail`. It keeps the same
+local dashboard and worktree flow, with an optional Fly Machines worker path for
+tasks that should continue away from your laptop.
 
 ## Install
 
@@ -112,8 +112,10 @@ filters obvious high-risk material such as AWS credentials, `.env` files, SSH
 keys, Docker auth, kube config, and private key directories.
 
 The cloud control plane code lives in `cloud/`. It uses Better Auth for
-Google/GitHub login and is designed to deploy as a separate AWS container
-service, so the local CLI package stays small.
+Google/GitHub login, stores launch snapshots in an encrypted S3 bucket, and
+starts Fly Machines workers with one-hour presigned snapshot URLs. The local CLI
+package stays small; cloud state and worker orchestration run in the separate
+control plane.
 
 ## Dashboard
 

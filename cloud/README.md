@@ -16,7 +16,38 @@ GOOGLE_CLIENT_SECRET=<google oauth client secret>
 GITHUB_CLIENT_ID=<github oauth client id>
 GITHUB_CLIENT_SECRET=<github oauth client secret>
 RUDDER_CLOUD_DATA_DIR=/data
+RUDDER_S3_BUCKET=<snapshot bucket>
+AWS_REGION=us-east-1
+FLY_API_TOKEN=<fly token>
+FLY_APP_NAME=<existing fly machines app>
+FLY_REGION=iad
+RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
 ```
+
+Current Exla defaults:
+
+```bash
+RUDDER_S3_BUCKET=rudder-cloud-snapshots-597088032164-us-east-1
+AWS_REGION=us-east-1
+FLY_APP_NAME=rudder-workers-exla
+FLY_REGION=iad
+RUDDER_WORKER_IMAGE=public.ecr.aws/exla/rudder-worker:latest
+```
+
+The current control-plane image is:
+
+```text
+public.ecr.aws/exla/rudder-cloud-control:latest
+```
+
+Generated AWS secrets:
+
+- `rudder/better-auth-secret`
+- `rudder/fly-api-token`
+
+Google/GitHub OAuth client IDs and client secrets still need to be created in
+the provider consoles and added as App Runner secrets before the hosted login
+flow can go live.
 
 OAuth callback URLs:
 
@@ -43,14 +74,37 @@ rudder cloud list
 
 ## AWS
 
+The AWS role of the control plane is S3 snapshot storage. The service stores
+uploaded launch/onload snapshots in `RUDDER_S3_BUCKET` using server-side
+encryption and gives each Fly Machine a one-hour presigned URL. Fly workers do
+not receive AWS credentials.
+
 The intended AWS shape is:
 
 - container image in ECR
 - App Runner service for the control plane
-- encrypted persistent storage or managed database for production state
+- S3 bucket for encrypted snapshot objects
+- encrypted persistent storage or managed database for production state; the
+  current service uses SQLite at `RUDDER_CLOUD_DB`
 - secrets stored in AWS Secrets Manager or App Runner environment secrets
 
 Build and push the image, then create or update the App Runner service with the
 environment above. The sample App Runner shape lives in
-`infra/apprunner-service.json`; use it as a starting point after replacing the
-image identifier with your ECR image.
+`infra/apprunner-service.json`.
+
+## Fly Machines
+
+Rudder Cloud creates one Fly Machine per sail through the Fly Machines API.
+`FLY_APP_NAME` must point at an existing Fly app, and `RUDDER_WORKER_IMAGE`
+should be an image built from `worker/Dockerfile`.
+
+```bash
+docker buildx build --platform linux/amd64 \
+  -f cloud/worker/Dockerfile \
+  -t public.ecr.aws/exla/rudder-worker:latest \
+  --push .
+```
+
+The worker image installs Rudder, acpx, and Hunk at startup, downloads the
+snapshot from S3, restores selected HOME config, and starts `rudder run
+--worktree "$RUDDER_TASK"` inside the unpacked repo.
