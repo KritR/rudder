@@ -133,6 +133,7 @@ struct Suggestion {
 #[derive(Clone)]
 enum SuggestionAction {
     Insert(String),
+    ChooseModelProvider(Backend),
     SetModel { backend: Backend, model: String },
     ShowHelp,
 }
@@ -309,6 +310,11 @@ impl App {
             SuggestionAction::Insert(value) => {
                 self.task_input = value;
                 self.picker_index = 0;
+            }
+            SuggestionAction::ChooseModelProvider(backend) => {
+                self.task_input = format!("/model {} ", backend.as_str());
+                self.picker_index = 0;
+                self.notice = Some(format!("pick a {} model", backend.as_str()));
             }
             SuggestionAction::SetModel { backend, model } => {
                 self.backend = backend;
@@ -1098,19 +1104,9 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
     }
 
     if input.starts_with("/model") {
-        let query = input
-            .strip_prefix("/model")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        return model_suggestions()
-            .into_iter()
-            .filter(|suggestion| {
-                query.is_empty()
-                    || suggestion.label.to_ascii_lowercase().contains(&query)
-                    || suggestion.detail.to_ascii_lowercase().contains(&query)
-            })
-            .collect();
+        return model_provider_or_model_suggestions(
+            input.strip_prefix("/model").unwrap_or_default().trim(),
+        );
     }
 
     let query = input.trim_start_matches('/').to_ascii_lowercase();
@@ -1139,18 +1135,60 @@ fn command_suggestions() -> Vec<Suggestion> {
     ]
 }
 
-fn model_suggestions() -> Vec<Suggestion> {
+fn model_provider_or_model_suggestions(rest: &str) -> Vec<Suggestion> {
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let provider_or_query = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let model_query = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+
+    match provider_or_query.as_str() {
+        "claude" => model_suggestions_for(Backend::Claude, &model_query),
+        "codex" => model_suggestions_for(Backend::Codex, &model_query),
+        query => provider_suggestions(query),
+    }
+}
+
+fn provider_suggestions(query: &str) -> Vec<Suggestion> {
+    [
+        (Backend::Claude, "Claude Code models"),
+        (Backend::Codex, "Codex models"),
+    ]
+    .into_iter()
+    .filter(|(backend, detail)| {
+        query.is_empty()
+            || backend.as_str().starts_with(query)
+            || detail.to_ascii_lowercase().contains(query)
+    })
+    .map(|(backend, detail)| Suggestion {
+        label: backend.as_str().to_string(),
+        detail: detail.to_string(),
+        action: SuggestionAction::ChooseModelProvider(backend),
+    })
+    .collect()
+}
+
+fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec<Suggestion> {
     let mut seen = HashSet::new();
     let mut suggestions = Vec::new();
 
     for (backend, model, detail) in fallback_model_rows() {
-        push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
+        if backend == backend_filter {
+            push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
+        }
     }
     for (backend, model, detail) in cached_models_dev_rows() {
-        push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
+        if backend == backend_filter {
+            push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
+        }
     }
 
     suggestions
+        .into_iter()
+        .filter(|suggestion| {
+            query.is_empty()
+                || suggestion.label.to_ascii_lowercase().contains(query)
+                || suggestion.detail.to_ascii_lowercase().contains(query)
+        })
+        .collect()
 }
 
 fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)> {
