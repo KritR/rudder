@@ -44,6 +44,15 @@ type DeletePrompt = {
   canMerge: boolean;
 };
 
+type MergePrompt =
+  | { kind: "selected"; runId: string; label: string; allowDirty: boolean }
+  | { kind: "all"; runIds: string[]; allowDirty: boolean };
+
+type MergeConflictPrompt = {
+  runId: string;
+  files: string[];
+};
+
 type AlertState = {
   terminal: Set<string>;
   permission: Set<string>;
@@ -107,6 +116,8 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
   const [commandMenuIndex, setCommandMenuIndex] = useState(0);
   const [discoveredModels, setDiscoveredModels] = useState<ModelOption[]>([]);
   const [deletePrompt, setDeletePrompt] = useState<DeletePrompt | null>(null);
+  const [mergePrompt, setMergePrompt] = useState<MergePrompt | null>(null);
+  const [conflictPrompt, setConflictPrompt] = useState<MergeConflictPrompt | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
   const notifiedAlerts = useRef<AlertState | null>(null);
@@ -254,6 +265,109 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
   }, [deletePrompt, refresh]);
 
+  const requestMergeRun = useCallback((runOverride?: UiRun, allowDirty = false) => {
+    const run = runOverride ?? selectedRun;
+    if (!run) {
+      setNotice("No agent selected");
+      return;
+    }
+    if (!canMerge(run)) {
+      setNotice(`${shortId(run.id)} is not ready to merge`);
+      return;
+    }
+    setDeletePrompt(null);
+    setConflictPrompt(null);
+    setMergePrompt({
+      kind: "selected",
+      runId: run.id,
+      label: truncate(run.task, 48),
+      allowDirty,
+    });
+    setNotice(`Merge ${shortId(run.id)}? press y to confirm or n to cancel`);
+  }, [selectedRun]);
+
+  const requestMergeAll = useCallback((allowDirty = false) => {
+    const ready = runs.filter(canMerge);
+    if (ready.length === 0) {
+      setNotice("No completed worktree runs ready to merge");
+      return;
+    }
+    setDeletePrompt(null);
+    setConflictPrompt(null);
+    setMergePrompt({ kind: "all", runIds: ready.map((run) => run.id), allowDirty });
+    setNotice(`Merge ${ready.length} run${ready.length === 1 ? "" : "s"}? press y to confirm or n to cancel`);
+  }, [runs]);
+
+  const confirmMerge = useCallback(async () => {
+    if (!mergePrompt) {
+      return;
+    }
+    const prompt = mergePrompt;
+    setMergePrompt(null);
+    try {
+      if (prompt.kind === "selected") {
+        const merged = await mergeRun(prompt.runId, prompt.allowDirty, { silent: true });
+        if (merged.merge?.status === "conflict") {
+          const files = merged.merge.conflictedFiles ?? [];
+          setConflictPrompt({ runId: prompt.runId, files });
+          setNotice(`Merge conflict in ${files.length || "unknown"} file${files.length === 1 ? "" : "s"}; press y for AI help or n for manual`);
+        } else {
+          setNotice(`Merged ${shortId(prompt.runId)}`);
+        }
+        await refresh();
+        return;
+      }
+
+      let mergedCount = 0;
+      for (const runId of prompt.runIds) {
+        const merged = await mergeRun(runId, prompt.allowDirty, { silent: true });
+        if (merged.merge?.status === "conflict") {
+          const files = merged.merge.conflictedFiles ?? [];
+          setConflictPrompt({ runId, files });
+          setNotice(`Merge all stopped after ${mergedCount}: conflict in ${shortId(runId)}; press y for AI help or n for manual`);
+          await refresh();
+          return;
+        }
+        mergedCount += 1;
+      }
+      setNotice(`Merged ${mergedCount} run${mergedCount === 1 ? "" : "s"}`);
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+      await refresh();
+    }
+  }, [mergePrompt, refresh]);
+
+  const startConflictResolver = useCallback(async () => {
+    if (!conflictPrompt) {
+      return;
+    }
+    const files = conflictPrompt.files.length ? conflictPrompt.files.join("\n") : "(git did not report conflicted files)";
+    const task = [
+      "Read RUDDER.md first. A git merge stopped with conflicts in this checkout.",
+      `Conflicted files:\n${files}`,
+      "Resolve the merge conflicts, keep the intended changes from both sides where appropriate, run relevant checks if possible, and report what changed. Do not abort the merge unless resolving is impossible.",
+    ].join("\n\n");
+    try {
+      const run = await startRun({
+        task,
+        backend,
+        model,
+        detach: true,
+        worktree: false,
+        silent: true,
+        view: "shell",
+      });
+      setConflictPrompt(null);
+      setSelectedRunId(run.id);
+      setExpandedRunIds((current) => new Set(current).add(run.id));
+      setNotice(`Started AI merge-conflict resolver ${shortId(run.id)}`);
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }, [backend, conflictPrompt, model, refresh]);
+
   const copySelectedTranscript = useCallback(async (runOverride?: UiRun) => {
     const run = runOverride ?? selectedRun;
     if (!run) {
@@ -348,11 +462,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setInput("");
         return;
       case "merge":
-        await runAction(args[0] ?? selectedRun?.id, async (id) => mergeRun(id, args.includes("--allow-dirty"), { silent: true }), "Merged", setNotice, refresh);
+        requestMergeRun(resolveUiRun(runs, args[0] ?? selectedRun?.id), args.includes("--allow-dirty"));
         setInput("");
         return;
       case "merge-all":
-        await mergeReadyRuns(runs, args.includes("--allow-dirty"), setNotice, refresh);
+        requestMergeAll(args.includes("--allow-dirty"));
         setInput("");
         return;
       case "clear":
@@ -364,7 +478,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setNotice(`Unknown command: /${command}`);
         setInput("");
     }
-  }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, runs, selectedRun?.id]);
+  }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, requestMergeAll, requestMergeRun, runs, selectedRun?.id]);
 
   const selectModelOption = useCallback((index: number) => {
     const option = modelOptions[index];
@@ -419,6 +533,30 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       } else {
         setTargetRunId(undefined);
         setNotice("Task focus: type a new task");
+      }
+      return;
+    }
+    if (mergePrompt) {
+      if (key.escape || value === "n" || value === "N") {
+        setMergePrompt(null);
+        setNotice("Merge cancelled");
+        return;
+      }
+      if (value === "y" || value === "Y") {
+        void confirmMerge();
+        return;
+      }
+      return;
+    }
+    if (conflictPrompt) {
+      if (key.escape || value === "n" || value === "N") {
+        setConflictPrompt(null);
+        setNotice("Resolve the merge conflicts manually, then commit");
+        return;
+      }
+      if (value === "y" || value === "Y") {
+        void startConflictResolver();
+        return;
       }
       return;
     }
@@ -593,11 +731,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       return;
     }
     if (input.length === 0 && value === "m" && selectedRun) {
-      void runAction(selectedRun.id, async (id) => mergeRun(id, false, { silent: true }), "Merged", setNotice, refresh);
+      requestMergeRun(selectedRun);
       return;
     }
     if (input.length === 0 && value === "M") {
-      void mergeReadyRuns(runs, false, setNotice, refresh);
+      requestMergeAll();
       return;
     }
     if (input.length === 0 && value === "d") {
@@ -649,6 +787,8 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       {helpOpen ? <Help /> : null}
       {modelMenuOpen ? <ModelMenu backend={backend} options={modelOptions} selectedIndex={modelMenuIndex} currentModel={model} width={width} /> : null}
       {commandMenuOpen ? <CommandMenu options={commandOptions} selectedIndex={commandMenuIndex} width={width} /> : null}
+      {mergePrompt ? <MergePromptBox prompt={mergePrompt} width={width} /> : null}
+      {conflictPrompt ? <MergeConflictPromptBox prompt={conflictPrompt} width={width} /> : null}
       {deletePrompt ? <DeletePromptBox prompt={deletePrompt} width={width} /> : null}
       {focusPane === "worker"
         ? <StatusDock notice={notice} />
@@ -873,6 +1013,31 @@ function DeletePromptBox(props: { prompt: DeletePrompt; width: number }): React.
   return (
     <Box width={props.width} borderStyle="double" borderColor="yellow" paddingX={1}>
       <Text color="yellow" bold>{fitLine(`delete ${shortId(props.prompt.runId)}?  ${action}`, contentWidth)}</Text>
+    </Box>
+  );
+}
+
+function MergePromptBox(props: { prompt: MergePrompt; width: number }): React.ReactElement {
+  const contentWidth = Math.max(24, props.width - 4);
+  const subject = props.prompt.kind === "selected"
+    ? `merge ${shortId(props.prompt.runId)}  ${props.prompt.label}`
+    : `merge ${props.prompt.runIds.length} completed run${props.prompt.runIds.length === 1 ? "" : "s"}`;
+  return (
+    <Box width={props.width} borderStyle="double" borderColor="yellow" paddingX={1} flexDirection="column">
+      <Text color="yellow" bold>{fitLine(subject, contentWidth)}</Text>
+      <Text color="gray">{fitLine("press y to merge, n to cancel", contentWidth)}</Text>
+    </Box>
+  );
+}
+
+function MergeConflictPromptBox(props: { prompt: MergeConflictPrompt; width: number }): React.ReactElement {
+  const contentWidth = Math.max(24, props.width - 4);
+  const files = props.prompt.files.length ? props.prompt.files.join(", ") : "unknown files";
+  return (
+    <Box width={props.width} borderStyle="double" borderColor="red" paddingX={1} flexDirection="column">
+      <Text color="red" bold>{fitLine(`merge conflict ${shortId(props.prompt.runId)}`, contentWidth)}</Text>
+      <Text color="gray">{fitLine(files, contentWidth)}</Text>
+      <Text color="gray">{fitLine("press y for AI help, n to handle manually", contentWidth)}</Text>
     </Box>
   );
 }
