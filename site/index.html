@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rudder</title>
+    <meta
+      name="description"
+      content="Rudder is a terminal command center for running Claude Code and Codex agents in isolated worktrees."
+    />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta property="og:title" content="Rudder" />
+    <meta
+      property="og:description"
+      content="Run Claude Code and Codex agents side by side without letting them fight over the same checkout."
+    />
+    <meta name="theme-color" content="#ffffff" />
+    <style>
+      :root {
+        color: #111;
+        background: #fff;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        font-weight: 300;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: #fff;
+        color: #111;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-thickness: 1px;
+        text-underline-offset: 4px;
+      }
+
+      .page {
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 32px 24px 72px;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding-bottom: 72px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 15px;
+        letter-spacing: 0;
+      }
+
+      .brand img {
+        width: 28px;
+        height: 28px;
+      }
+
+      nav {
+        display: flex;
+        gap: 18px;
+        color: #555;
+        font-size: 14px;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(420px, 1.08fr);
+        gap: 48px;
+        align-items: start;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(48px, 8vw, 104px);
+        line-height: 0.94;
+        font-weight: 300;
+        letter-spacing: 0;
+      }
+
+      .lede {
+        margin: 28px 0 0;
+        max-width: 560px;
+        font-size: clamp(18px, 2vw, 24px);
+        line-height: 1.35;
+        color: #333;
+        font-weight: 300;
+      }
+
+      .install {
+        display: inline-flex;
+        align-items: center;
+        margin-top: 34px;
+        padding: 12px 14px;
+        border: 1px solid #111;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 14px;
+        white-space: nowrap;
+      }
+
+      .points {
+        display: grid;
+        gap: 16px;
+        margin-top: 44px;
+        max-width: 520px;
+      }
+
+      .point {
+        border-top: 1px solid #ddd;
+        padding-top: 16px;
+      }
+
+      .point strong {
+        display: block;
+        font-weight: 450;
+        margin-bottom: 5px;
+      }
+
+      .point span {
+        color: #555;
+        line-height: 1.5;
+      }
+
+      .terminal {
+        border: 1px solid #111;
+        min-height: 520px;
+        display: grid;
+        grid-template-columns: 32% 68%;
+        grid-template-rows: 1fr 88px;
+        background: #fff;
+        box-shadow: 12px 12px 0 #111;
+      }
+
+      .pane {
+        padding: 18px;
+        border-color: #111;
+        overflow: hidden;
+      }
+
+      .agents {
+        border-right: 1px solid #111;
+      }
+
+      .worker {
+        border: 3px double #111;
+        margin: 12px;
+        padding: 14px;
+      }
+
+      .task {
+        grid-column: 1 / -1;
+        border-top: 1px solid #111;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+
+      .label {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        color: #666;
+        margin-bottom: 16px;
+        text-transform: uppercase;
+      }
+
+      .run {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.55;
+        margin-bottom: 18px;
+      }
+
+      .run.active {
+        color: #000;
+      }
+
+      .run.muted {
+        color: #777;
+      }
+
+      .worker pre,
+      .task pre {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+      }
+
+      .focus {
+        display: inline-block;
+        padding: 2px 7px;
+        margin-bottom: 14px;
+        background: #111;
+        color: #fff;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+
+      footer {
+        margin-top: 72px;
+        padding-top: 24px;
+        border-top: 1px solid #ddd;
+        color: #666;
+        font-size: 14px;
+      }
+
+      @media (max-width: 860px) {
+        header {
+          padding-bottom: 44px;
+        }
+
+        main {
+          grid-template-columns: 1fr;
+        }
+
+        .terminal {
+          min-height: 440px;
+          grid-template-columns: 1fr;
+          grid-template-rows: 150px 1fr 82px;
+          box-shadow: 8px 8px 0 #111;
+        }
+
+        .agents {
+          border-right: 0;
+          border-bottom: 1px solid #111;
+        }
+
+        .worker {
+          margin: 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+        </nav>
+      </header>
+
+      <main>
+        <section>
+          <h1>Agent worktrees, without the mess.</h1>
+          <p class="lede">
+            Rudder is a terminal command center for Claude Code and Codex. Start
+            tasks, watch agents, keep each run isolated, then merge the work when
+            it is ready.
+          </p>
+          <div class="install">npm install -g @viraatdas/rudder</div>
+
+          <div class="points">
+            <div class="point">
+              <strong>Three panes, one flow</strong>
+              <span>Agents on the left, live worker on the right, task input at the bottom.</span>
+            </div>
+            <div class="point">
+              <strong>Native agents</strong>
+              <span>The worker pane is the real Claude Code or Codex process, not a fake transcript.</span>
+            </div>
+            <div class="point">
+              <strong>Clean isolation</strong>
+              <span>Each prompt runs in its own git worktree so parallel tasks do not collide.</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="terminal" aria-label="Rudder terminal layout mockup">
+          <div class="pane agents">
+            <div class="label">agents</div>
+            <div class="run active">› tm claude sonnet<br />  fix auth callback<br />  running %6</div>
+            <div class="run muted">  ok codex gpt-5.5<br />  add parser tests<br />  completed %5</div>
+          </div>
+          <div class="pane worker">
+            <span class="focus">FOCUS worker</span>
+            <pre>$ claude --model sonnet
+
+Reading auth routes...
+Editing callback handler...
+Running npm test -- auth
+
+All checks passed.</pre>
+          </div>
+          <div class="pane task">
+            <pre><strong>TASK</strong> fix the redirect after magic link verification_
+Enter start   Tab focus pane   / commands   claude sonnet</pre>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        Built for local coding agents, tmux panes, and git worktrees.
+      </footer>
+    </div>
+  </body>
+</html>

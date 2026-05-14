@@ -309,6 +309,15 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       void detachClient(defaults.tmuxSessionName);
       return;
     }
+    if (isLineClear(chunk, key)) {
+      setInput("");
+      setNotice("");
+      return;
+    }
+    if (isWordDelete(chunk, key)) {
+      setInput((current) => deletePreviousWord(current));
+      return;
+    }
     if (commandMenuOpen) {
       if (key.upArrow || chunk === "k") {
         setCommandIndex((current) => Math.max(0, current - 1));
@@ -340,16 +349,8 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       void submit();
       return;
     }
-    if (key.backspace || key.delete) {
+    if (key.backspace || key.delete || chunk === "\u007f" || chunk === "\b") {
       setInput((current) => current.slice(0, -1));
-      return;
-    }
-    if ((key.ctrl && chunk === "u") || chunk === "\u0015") {
-      setInput("");
-      return;
-    }
-    if ((key.ctrl && chunk === "w") || chunk === "\u0017" || (key.meta && (key.backspace || key.delete))) {
-      setInput((current) => current.trimEnd().replace(/\s*\S+$/, ""));
       return;
     }
     if (chunk && !key.ctrl && !key.meta) {
@@ -376,20 +377,8 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
 }
 
 function CommandMenu({ commands, selected }: { commands: SlashCommand[]; selected: number }): React.ReactElement {
-  const start = Math.max(0, Math.min(selected - 1, Math.max(0, commands.length - 3)));
-  const visible = commands.slice(start, start + 3);
-  return (
-    <Box flexDirection="column">
-      {visible.map((command, index) => {
-        const absoluteIndex = start + index;
-        return (
-        <Text key={command.label} color={absoluteIndex === selected ? "cyan" : "gray"}>
-          {absoluteIndex === selected ? "> " : "  "}{command.label}  {command.detail}
-        </Text>
-        );
-      })}
-    </Box>
-  );
+  const command = commands[Math.max(0, Math.min(selected, commands.length - 1))];
+  return <Text color="cyan">{command ? `${command.label}  ${command.detail}` : "No command"}</Text>;
 }
 
 function WorkerIdle(_props: { defaults: PaneDefaults }): React.ReactElement {
@@ -424,6 +413,24 @@ function filterSlashCommands(input: string): SlashCommand[] {
   const query = input.toLowerCase();
   const matches = SLASH_COMMANDS.filter((command) => command.label.toLowerCase().startsWith(query));
   return matches.length ? matches : SLASH_COMMANDS.filter((command) => command.label.toLowerCase().includes(query.slice(1)));
+}
+
+function isLineClear(chunk: string, key: { ctrl?: boolean; meta?: boolean; backspace?: boolean; delete?: boolean }): boolean {
+  return (key.ctrl && chunk === "u") || chunk === "\u0015" || chunk === "\u001b\u0015";
+}
+
+function isWordDelete(chunk: string, key: { ctrl?: boolean; meta?: boolean; backspace?: boolean; delete?: boolean }): boolean {
+  return Boolean(
+    (key.ctrl && chunk === "w") ||
+    chunk === "\u0017" ||
+    chunk === "\u001b\u007f" ||
+    chunk === "\u001b\b" ||
+    (key.meta && (key.backspace || key.delete || chunk === "\u007f" || chunk === "\b"))
+  );
+}
+
+function deletePreviousWord(value: string): string {
+  return value.trimEnd().replace(/\s*\S+$/, "");
 }
 
 function shortId(id: string): string {

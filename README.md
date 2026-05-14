@@ -1,9 +1,16 @@
 # rudder
 
+<p>
+  <a href="https://rudder.viraat.dev">
+    <img src="https://rudder.viraat.dev/favicon.svg" width="36" height="36" alt="Rudder logo" />
+  </a>
+</p>
+
 [![npm version](https://img.shields.io/npm/v/@viraatdas/rudder.svg)](https://www.npmjs.com/package/@viraatdas/rudder)
 [![npm downloads](https://img.shields.io/npm/dm/@viraatdas/rudder.svg)](https://www.npmjs.com/package/@viraatdas/rudder)
 [![Node >=20](https://img.shields.io/badge/node-%3E%3D20-43853d.svg)](https://nodejs.org/)
 [![CLI](https://img.shields.io/badge/interface-terminal-111827.svg)](#run)
+[![Website](https://img.shields.io/badge/site-rudder.viraat.dev-111111.svg)](https://rudder.viraat.dev)
 
 Rudder is a Claude Code-style terminal command center for running coding agents
 without letting parallel tasks fight over the same checkout. It opens a tmux
