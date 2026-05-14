@@ -12,8 +12,9 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -764,7 +765,7 @@ impl App {
                     }
                 } else if let Some(terminal) = self.selected_terminal_mut() {
                     terminal.reset_scrollback();
-                    if let Err(error) = terminal.write_input(text.as_bytes()) {
+                    if let Err(error) = terminal.write_input(&bracketed_paste_bytes(&text)) {
                         self.set_selected_error(error.to_string());
                     }
                 }
@@ -2030,6 +2031,14 @@ mod app_tests {
     }
 
     #[test]
+    fn wraps_worker_paste_as_single_bracketed_paste_payload() {
+        assert_eq!(
+            bracketed_paste_bytes("hello\nworld"),
+            b"\x1b[200~hello\nworld\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
     fn maps_page_keys_for_terminal_passthrough() {
         assert_eq!(
             terminal_bytes_for_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty())),
@@ -2194,6 +2203,7 @@ fn setup_terminal() -> Result<Tui> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -2207,6 +2217,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -4049,6 +4060,14 @@ fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(bytes)
+}
+
+fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + "\x1b[200~\x1b[201~".len());
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 fn mouse_event_to_sgr(mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
