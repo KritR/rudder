@@ -36,6 +36,8 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const TICK_RATE: Duration = Duration::from_millis(50);
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
+const FOCUS_COLOR: Color = Color::LightCyan;
+const INACTIVE_COLOR: Color = Color::DarkGray;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -1502,7 +1504,11 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(
+                Style::default()
+                    .fg(FOCUS_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
     );
 
     frame.render_widget(Clear, area);
@@ -1512,15 +1518,16 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
 fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(FOCUS_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(INACTIVE_COLOR)
     };
 
     let title_style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(Color::Black)
+            .bg(FOCUS_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
@@ -1576,7 +1583,9 @@ fn pane_text_style(focused: bool) -> Style {
     if focused {
         Style::default()
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -1584,15 +1593,21 @@ fn muted_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Gray)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
 fn accent_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default()
+            .fg(FOCUS_COLOR)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -1600,7 +1615,9 @@ fn model_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Magenta)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default()
+            .fg(INACTIVE_COLOR)
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -2450,14 +2467,80 @@ fn diff_short_summary(run: &AgentRun) -> Option<String> {
 fn git_diff_text(cwd: &Path) -> Result<String> {
     let stat = git_output_args(cwd, &["diff", "--stat", "HEAD"])?;
     let diff = git_output_args(cwd, &["diff", "--color=never", "HEAD"])?;
-    if stat.trim().is_empty() && diff.trim().is_empty() {
+    let untracked = git_untracked_files(cwd)?;
+    let untracked_diff = git_untracked_diff_text(cwd, &untracked);
+
+    if stat.trim().is_empty() && diff.trim().is_empty() && untracked_diff.trim().is_empty() {
         let status = git_output(cwd, ["status", "--short"])?;
         if status.trim().is_empty() {
             return Ok(String::new());
         }
         return Ok(format!("Untracked or staged-only changes:\n\n{status}"));
     }
-    Ok(format!("{stat}\n{diff}"))
+
+    Ok(
+        [stat.trim_end(), diff.trim_end(), untracked_diff.trim_end()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+fn git_untracked_files(cwd: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(if message.is_empty() {
+            "git command failed".to_string()
+        } else {
+            message
+        });
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect())
+}
+
+fn git_untracked_diff_text(cwd: &Path, files: &[String]) -> String {
+    let mut sections = Vec::new();
+    for file in files.iter().take(25) {
+        let output = Command::new("git")
+            .args(["diff", "--no-index", "--color=never", "--", "/dev/null"])
+            .arg(file)
+            .current_dir(cwd)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() || output.status.code() == Some(1) => {
+                let stdout = String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string();
+                if stdout.is_empty() {
+                    sections.push(format!("untracked file: {file}"));
+                } else {
+                    sections.push(stdout);
+                }
+            }
+            _ => sections.push(format!("untracked file: {file}")),
+        }
+    }
+
+    if files.len() > 25 {
+        sections.push(format!(
+            "... {} more untracked files omitted",
+            files.len() - 25
+        ));
+    }
+
+    sections.join("\n\n")
 }
 
 fn play_completion_sound() {
