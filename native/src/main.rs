@@ -130,6 +130,7 @@ struct App {
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
+    task_cursor: usize,
     agents: Vec<AgentRun>,
     selected_agent: usize,
     backend: Backend,
@@ -189,6 +190,7 @@ impl App {
             cwd,
             branch: current_branch(),
             task_input: String::new(),
+            task_cursor: 0,
             agents: Vec::new(),
             selected_agent: 0,
             backend: Backend::Claude,
@@ -281,6 +283,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.task_input.clear();
+                self.task_cursor = 0;
                 self.picker_index = 0;
             }
             KeyCode::Enter => self.start_task(),
@@ -291,27 +294,60 @@ impl App {
                         | KeyModifiers::SUPER
                         | KeyModifiers::META,
                 ) {
-                    delete_previous_word(&mut self.task_input);
+                    delete_previous_word_at(&mut self.task_input, &mut self.task_cursor);
                 } else {
-                    self.task_input.pop();
+                    delete_char_before_cursor(&mut self.task_input, &mut self.task_cursor);
                 }
                 self.clamp_picker_index();
             }
+            KeyCode::Delete => {
+                delete_char_at_cursor(&mut self.task_input, self.task_cursor);
+                self.clamp_picker_index();
+            }
+            KeyCode::Left => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META)
+                {
+                    self.task_cursor = previous_word_position(&self.task_input, self.task_cursor);
+                } else {
+                    self.task_cursor = self.task_cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                let len = self.task_input.chars().count();
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META)
+                {
+                    self.task_cursor = next_word_position(&self.task_input, self.task_cursor);
+                } else {
+                    self.task_cursor = (self.task_cursor + 1).min(len);
+                }
+            }
+            KeyCode::Home => {
+                self.task_cursor = 0;
+            }
+            KeyCode::End => {
+                self.task_cursor = self.task_input.chars().count();
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.task_input.clear();
+                self.task_cursor = 0;
                 self.picker_index = 0;
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                delete_previous_word(&mut self.task_input);
+                delete_previous_word_at(&mut self.task_input, &mut self.task_cursor);
                 self.clamp_picker_index();
             }
             KeyCode::Char('/') if self.task_input.is_empty() => {
                 self.task_input.push('/');
+                self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some("type /model".to_string());
             }
             KeyCode::Char(ch) => {
-                self.task_input.push(ch);
+                insert_char_at_cursor(&mut self.task_input, &mut self.task_cursor, ch);
                 self.clamp_picker_index();
             }
             _ => {}
@@ -353,15 +389,18 @@ impl App {
         match suggestion.action {
             SuggestionAction::Insert(value) => {
                 self.task_input = value;
+                self.task_cursor = self.task_input.chars().count();
                 self.picker_index = 0;
             }
             SuggestionAction::ChooseModelProvider(backend) => {
                 self.task_input = format!("/model {} ", backend.as_str());
+                self.task_cursor = self.task_input.chars().count();
                 self.picker_index = 0;
                 self.notice = Some(format!("pick a {} model", backend.as_str()));
             }
             SuggestionAction::ChooseModel { backend, model } => {
                 self.task_input = format!("/model {} {} ", backend.as_str(), model);
+                self.task_cursor = self.task_input.chars().count();
                 self.picker_index = 0;
                 self.notice = Some(format!("pick effort for {model}"));
             }
@@ -374,6 +413,7 @@ impl App {
                 self.model = model;
                 self.effort = effort;
                 self.task_input.clear();
+                self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(format!(
                     "{} {}({})",
@@ -384,6 +424,7 @@ impl App {
             }
             SuggestionAction::ShowHelp => {
                 self.task_input.clear();
+                self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice =
                     Some("Tab focus  Enter start/focus  m merge  M merge all  d del".to_string());
@@ -409,7 +450,10 @@ impl App {
                     }
                 }
             }
-            FocusPane::Task => self.task_input.push_str(&text),
+            FocusPane::Task => {
+                insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, &text);
+                self.clamp_picker_index();
+            }
             FocusPane::Agents => {}
         }
     }
@@ -420,6 +464,7 @@ impl App {
             return;
         }
         self.task_input.clear();
+        self.task_cursor = 0;
 
         if self.handle_command(&input) {
             return;
@@ -817,6 +862,23 @@ mod app_tests {
         assert!(looks_busy("esc to interrupt"));
         assert!(!looks_busy("All checks passed."));
     }
+
+    #[test]
+    fn task_input_word_navigation_and_delete_respects_cursor() {
+        let input = "fix the auth bug";
+        assert_eq!(previous_word_position(input, 12), 8);
+        assert_eq!(next_word_position(input, 4), 7);
+
+        let mut editable = input.to_string();
+        let mut cursor = 12;
+        delete_previous_word_at(&mut editable, &mut cursor);
+        assert_eq!(editable, "fix the  bug");
+        assert_eq!(cursor, 8);
+
+        insert_str_at_cursor(&mut editable, &mut cursor, "login");
+        assert_eq!(editable, "fix the login bug");
+        assert_eq!(cursor, 13);
+    }
 }
 
 fn main() -> Result<()> {
@@ -1028,15 +1090,17 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
-    let Some(cursor) = app
-        .agents
-        .get(app.selected_agent)
-        .and_then(|run| run.terminal.as_ref())
-        .map(|terminal| terminal.cursor())
-    else {
+    let Some((backend, cursor)) = app.agents.get(app.selected_agent).and_then(|run| {
+        run.terminal
+            .as_ref()
+            .map(|terminal| (run.backend, terminal.cursor()))
+    }) else {
         return;
     };
-    if !cursor.visible || cursor.row >= inner.height || cursor.col >= inner.width {
+    if cursor.row >= inner.height || cursor.col >= inner.width {
+        return;
+    }
+    if !cursor.visible && backend != Backend::Claude {
         return;
     }
     frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
@@ -1116,7 +1180,7 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 
     if app.focus == FocusPane::Task {
-        let x = area.x + 1 + app.task_input.chars().count() as u16;
+        let x = area.x + 1 + app.task_cursor as u16;
         let y = area.y + 1;
         if x < area.right().saturating_sub(1) {
             frame.set_cursor_position((x, y));
@@ -1747,13 +1811,78 @@ fn short_task(task: &str) -> String {
     }
 }
 
-fn delete_previous_word(input: &mut String) {
-    while input.ends_with(char::is_whitespace) {
-        input.pop();
+fn insert_char_at_cursor(input: &mut String, cursor: &mut usize, ch: char) {
+    let byte_index = byte_index_for_char(input, *cursor);
+    input.insert(byte_index, ch);
+    *cursor += 1;
+}
+
+fn insert_str_at_cursor(input: &mut String, cursor: &mut usize, value: &str) {
+    let byte_index = byte_index_for_char(input, *cursor);
+    input.insert_str(byte_index, value);
+    *cursor += value.chars().count();
+}
+
+fn delete_char_before_cursor(input: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
     }
-    while input.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
-        input.pop();
+    let start = byte_index_for_char(input, cursor.saturating_sub(1));
+    let end = byte_index_for_char(input, *cursor);
+    input.replace_range(start..end, "");
+    *cursor -= 1;
+}
+
+fn delete_char_at_cursor(input: &mut String, cursor: usize) {
+    if cursor >= input.chars().count() {
+        return;
     }
+    let start = byte_index_for_char(input, cursor);
+    let end = byte_index_for_char(input, cursor + 1);
+    input.replace_range(start..end, "");
+}
+
+fn delete_previous_word_at(input: &mut String, cursor: &mut usize) {
+    let start_char = previous_word_position(input, *cursor);
+    if start_char == *cursor {
+        return;
+    }
+    let start = byte_index_for_char(input, start_char);
+    let end = byte_index_for_char(input, *cursor);
+    input.replace_range(start..end, "");
+    *cursor = start_char;
+}
+
+fn previous_word_position(input: &str, cursor: usize) -> usize {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut index = cursor.min(chars.len());
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn next_word_position(input: &str, cursor: usize) -> usize {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut index = cursor.min(chars.len());
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    while index < chars.len() && !chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn byte_index_for_char(input: &str, char_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len())
 }
 
 fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
