@@ -73,10 +73,16 @@ Open the tmux dashboard:
 rudder
 ```
 
-The dashboard stays in one pane. Every task opens a separate native worker pane
-running `claude` or `codex` in its own git worktree. Focus a worker pane to use
-Claude Code or Codex directly, including their slash commands, interrupts,
-copy/paste, model controls, resume behavior, and terminal UI.
+The tmux UI has three real panes:
+
+- left: the Rudder agent list
+- right: the worker pane, respawned as a native `claude` or `codex` process for
+  the selected task
+- bottom: the task input pane for creating new agents
+
+Focus the worker pane to use Claude Code or Codex directly, including their
+slash commands, interrupts, copy/paste, model controls, resume behavior, and
+terminal UI.
 
 | Key | Action |
 | --- | --- |

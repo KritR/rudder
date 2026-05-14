@@ -16,7 +16,7 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
-import { runTmuxDashboard } from "./tmux-dashboard.js";
+import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
 import { isTty } from "./util.js";
@@ -92,14 +92,42 @@ export async function main(): Promise<void> {
   }
 
   switch (parsed.command) {
-    case "__dashboard": {
+    case "__agents": {
       const repo = parsed.flags.repo;
       const tmuxSessionName = parsed.flags.tmuxSession;
       if (!repo || !tmuxSessionName) {
-        throw new Error("__dashboard requires --repo and --tmux-session");
+        throw new Error("__agents requires --repo and --tmux-session");
       }
       process.chdir(repo);
-      await runTmuxDashboard({
+      await runTmuxAgentPane({
+        tmuxSessionName,
+        backend: parsed.flags.backend,
+        model: parsed.flags.model,
+      });
+      return;
+    }
+    case "__task": {
+      const repo = parsed.flags.repo;
+      const tmuxSessionName = parsed.flags.tmuxSession;
+      if (!repo || !tmuxSessionName) {
+        throw new Error("__task requires --repo and --tmux-session");
+      }
+      process.chdir(repo);
+      await runTmuxTaskPane({
+        tmuxSessionName,
+        backend: parsed.flags.backend,
+        model: parsed.flags.model,
+      });
+      return;
+    }
+    case "__worker-idle": {
+      const repo = parsed.flags.repo;
+      const tmuxSessionName = parsed.flags.tmuxSession;
+      if (!repo || !tmuxSessionName) {
+        throw new Error("__worker-idle requires --repo and --tmux-session");
+      }
+      process.chdir(repo);
+      await runTmuxWorkerIdle({
         tmuxSessionName,
         backend: parsed.flags.backend,
         model: parsed.flags.model,
@@ -435,9 +463,10 @@ async function openTmuxDashboard(parsed: Parsed): Promise<void> {
   if (!entry) {
     throw new Error("Cannot locate Rudder entrypoint.");
   }
-  const args = [
+  const common = [
     entry,
-    "__dashboard",
+  ];
+  const commonFlags = [
     "--repo",
     repoRoot,
     "--tmux-session",
@@ -448,7 +477,11 @@ async function openTmuxDashboard(parsed: Parsed): Promise<void> {
   await ensureTmuxDashboardSession({
     repoRoot,
     sessionName,
-    dashboardCommand: shellCommand(process.execPath, args),
+    agentCommand: shellCommand(process.execPath, [...common, "__agents", ...commonFlags]),
+    workerCommand: shellCommand(process.execPath, [...common, "__worker-idle", ...commonFlags]),
+    taskCommand: shellCommand(process.execPath, [...common, "__task", ...commonFlags]),
+    backend: parsed.flags.backend === "codex" ? "codex" : "claude",
+    model: parsed.flags.model,
   });
   const code = await attachTmuxSession(sessionName);
   process.exitCode = code;

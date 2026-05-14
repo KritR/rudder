@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
+import {
+  loadTmuxDashboardState,
+  saveTmuxDashboardState,
+  type NativeBackendId,
+} from "./tmux-state.js";
 import { commandExists, runCommand, shellQuote, shortHash, slugify } from "./util.js";
 
 export function hasTmux(): boolean {
@@ -18,10 +23,17 @@ export function shellCommand(command: string, args: string[] = []): string {
 export async function ensureTmuxDashboardSession(params: {
   repoRoot: string;
   sessionName: string;
-  dashboardCommand: string;
+  agentCommand: string;
+  workerCommand: string;
+  taskCommand: string;
+  backend: NativeBackendId;
+  model?: string;
 }): Promise<void> {
-  if (await tmuxSessionExists(params.sessionName)) {
+  if (await tmuxSessionExists(params.sessionName) && await loadTmuxDashboardState(params.repoRoot, params.sessionName)) {
     return;
+  }
+  if (await tmuxSessionExists(params.sessionName)) {
+    await runTmux(["kill-session", "-t", params.sessionName], true);
   }
   await runTmux([
     "new-session",
@@ -32,12 +44,69 @@ export async function ensureTmuxDashboardSession(params: {
     params.repoRoot,
     "-n",
     "rudder",
-    params.dashboardCommand,
+    params.agentCommand,
   ]);
-  await runTmux(["set-option", "-t", params.sessionName, "mouse", "on"], true);
-  await runTmux(["set-option", "-t", params.sessionName, "pane-border-status", "top"], true);
-  await runTmux(["set-option", "-t", params.sessionName, "pane-border-format", " #{pane_title} "], true);
-  await runTmux(["select-pane", "-t", `${params.sessionName}:0.0`, "-T", "rudder dashboard"], true);
+  await configureRudderSession(params.sessionName);
+  const agentPaneId = await paneId(params.sessionName, "0.0");
+  await runTmux(["select-pane", "-t", agentPaneId, "-T", "agents"], true);
+  const taskPaneId = (
+    await runTmux([
+      "split-window",
+      "-v",
+      "-t",
+      agentPaneId,
+      "-l",
+      "4",
+      "-c",
+      params.repoRoot,
+      "-P",
+      "-F",
+      "#{pane_id}",
+      params.taskCommand,
+    ])
+  ).stdout.trim();
+  await runTmux(["select-pane", "-t", taskPaneId, "-T", "task"], true);
+  const workerPaneId = (
+    await runTmux([
+      "split-window",
+      "-h",
+      "-t",
+      agentPaneId,
+      "-p",
+      "82",
+      "-c",
+      params.repoRoot,
+      "-P",
+      "-F",
+      "#{pane_id}",
+      params.workerCommand,
+    ])
+  ).stdout.trim();
+  const agentWidth = Math.max(28, Math.min(44, Math.floor(await windowWidth(params.sessionName) * 0.22)));
+  await runTmux(["resize-pane", "-t", agentPaneId, "-x", String(agentWidth)], true);
+  await runTmux(["select-pane", "-t", workerPaneId, "-T", "worker"], true);
+  await runTmux(["set-option", "-p", "-t", workerPaneId, "remain-on-exit", "on"], true);
+  await saveTmuxDashboardState({
+    version: 1,
+    repoRoot: params.repoRoot,
+    sessionName: params.sessionName,
+    agentPaneId,
+    workerPaneId,
+    taskPaneId,
+    backend: params.backend,
+    model: params.model,
+  });
+  await selectPane(taskPaneId || agentPaneId);
+}
+
+export async function configureRudderSession(sessionName: string): Promise<void> {
+  await runTmux(["set-option", "-t", sessionName, "mouse", "on"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-status", "top"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-format", " #{pane_title} "], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=cyan"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour245"], true);
+  await runTmux(["bind-key", "-T", "root", "Tab", "select-pane", "-t", ":.+"], true);
+  await runTmux(["bind-key", "-T", "root", "BTab", "select-pane", "-t", ":.-"], true);
 }
 
 export async function attachTmuxSession(sessionName: string): Promise<number> {
@@ -84,6 +153,22 @@ export async function createAgentPane(params: {
   return paneId;
 }
 
+export async function respawnPane(params: {
+  paneId: string;
+  cwd: string;
+  title: string;
+  command: string;
+  logPath?: string;
+}): Promise<void> {
+  await runTmux(["respawn-pane", "-k", "-t", params.paneId, "-c", params.cwd, params.command]);
+  await runTmux(["select-pane", "-t", params.paneId, "-T", params.title], true);
+  await runTmux(["set-option", "-p", "-t", params.paneId, "remain-on-exit", "on"], true);
+  if (params.logPath) {
+    await runTmux(["pipe-pane", "-o", "-t", params.paneId, `cat >> ${shellQuote(params.logPath)}`], true);
+  }
+  await selectPane(params.paneId);
+}
+
 export async function selectPane(paneId: string): Promise<void> {
   await runTmux(["select-pane", "-t", paneId], true);
 }
@@ -108,6 +193,17 @@ export async function detachClient(sessionName: string): Promise<void> {
 async function tmuxSessionExists(sessionName: string): Promise<boolean> {
   const result = await runTmux(["has-session", "-t", sessionName], true);
   return result.code === 0;
+}
+
+async function paneId(sessionName: string, paneIndex: string): Promise<string> {
+  const result = await runTmux(["display-message", "-p", "-t", `${sessionName}:${paneIndex}`, "#{pane_id}"]);
+  return result.stdout.trim();
+}
+
+async function windowWidth(sessionName: string): Promise<number> {
+  const result = await runTmux(["display-message", "-p", "-t", `${sessionName}:0`, "#{window_width}"], true);
+  const width = Number(result.stdout.trim());
+  return Number.isFinite(width) && width > 0 ? width : 120;
 }
 
 async function runTmux(

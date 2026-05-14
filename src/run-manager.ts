@@ -34,7 +34,7 @@ import {
   removeWorktree,
 } from "./git.js";
 import { ensureDir, isTty, newRunId, nowIso, pathExists, shortenHome } from "./util.js";
-import { createAgentPane, killPane, selectPane } from "./tmux.js";
+import { createAgentPane, killPane, respawnPane, selectPane } from "./tmux.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
 
@@ -147,6 +147,7 @@ export async function startNativeRun(params: {
   tmuxSessionName: string;
   backend?: Exclude<BackendId, "acpx">;
   model?: string;
+  workerPaneId?: string;
   focus?: boolean;
   silent?: boolean;
 }): Promise<RunRecord> {
@@ -215,7 +216,17 @@ export async function startNativeRun(params: {
     });
     await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
     const title = `${backend}:${shortTask(params.task)}`;
-    const paneId = await createAgentPane({
+    const paneId = params.workerPaneId;
+    if (paneId) {
+      await respawnPane({
+        paneId,
+        cwd: worktreeInfo.path,
+        title,
+        command,
+        logPath: outputPath(repoRoot, run.id),
+      });
+    }
+    const launchedPaneId = paneId ?? await createAgentPane({
       sessionName: params.tmuxSessionName,
       cwd: worktreeInfo.path,
       title,
@@ -225,7 +236,7 @@ export async function startNativeRun(params: {
     run.terminal = {
       kind: "tmux",
       sessionName: params.tmuxSessionName,
-      paneId,
+      paneId: launchedPaneId,
       paneTitle: title,
       logPath: outputPath(repoRoot, run.id),
       launchedAt: nowIso(),
@@ -236,11 +247,11 @@ export async function startNativeRun(params: {
       runId: run.id,
       type: "run.started",
       message: `${backend} pane started`,
-      data: { paneId, worktree: worktreeInfo.path },
+      data: { paneId: launchedPaneId, worktree: worktreeInfo.path },
     });
     await writeAgentContext(repoRoot);
-    if (params.focus !== false && paneId) {
-      await selectPane(paneId);
+    if (params.focus !== false && launchedPaneId) {
+      await selectPane(launchedPaneId);
     }
     if (!params.silent) {
       console.log(`Started ${run.id}`);
