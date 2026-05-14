@@ -83,8 +83,11 @@ CLI:
 
 ```bash
 rudder cloud login
-rudder cloud setup-github <client-id> <client-secret>
+rudder cloud setup-github <client-id>
 ```
+
+The CLI prompts for the client secret without echoing it. For scripts, set
+`RUDDER_GITHUB_CLIENT_ID` and `RUDDER_GITHUB_CLIENT_SECRET`.
 
 The setup endpoint is restricted to `RUDDER_ADMIN_EMAILS` (defaults to
 `viraat.laldas@gmail.com,viraat@exla.ai`) and persists the credentials to S3

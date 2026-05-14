@@ -11,6 +11,7 @@ import {
   newRunId,
   nowIso,
   pathExists,
+  promptSecret,
   readJson,
   runCommand,
   shortenHome,
@@ -390,11 +391,12 @@ async function mutateSail(action: "onload" | "pause" | "resume", args: string[],
 
 async function setupGithub(args: string[], options: CloudCommandOptions): Promise<void> {
   const clientId = args[0]?.trim() || process.env.RUDDER_GITHUB_CLIENT_ID?.trim();
-  const clientSecret = args[1]?.trim() || process.env.RUDDER_GITHUB_CLIENT_SECRET?.trim();
+  const clientSecret =
+    process.env.RUDDER_GITHUB_CLIENT_SECRET?.trim() || args[1]?.trim() || await promptSecret("GitHub App client secret");
   if (!clientId || !clientSecret) {
     throw new Error([
       "Missing GitHub OAuth credentials.",
-      "Usage: rudder cloud setup-github <client-id> <client-secret>",
+      "Usage: rudder cloud setup-github <client-id>",
       "Or set RUDDER_GITHUB_CLIENT_ID and RUDDER_GITHUB_CLIENT_SECRET.",
     ].join("\n"));
   }
@@ -739,7 +741,7 @@ Usage:
   rudder sail list
   rudder sail pause <id>
   rudder sail resume <id>
-  rudder cloud setup-github <client-id> <client-secret>
+  rudder cloud setup-github <client-id>
 
 Environment:
   RUDDER_CLOUD_URL              Cloud control plane URL (defaults to ${DEFAULT_CLOUD_URL})

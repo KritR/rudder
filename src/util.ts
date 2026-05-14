@@ -170,6 +170,28 @@ export async function promptText(message: string, defaultValue?: string): Promis
   }
 }
 
+export async function promptSecret(message: string): Promise<string> {
+  if (!isTty()) {
+    return "";
+  }
+  const rl = readline.createInterface({ input, output });
+  output.write(`${message}: `);
+  const shouldDisableEcho = process.platform !== "win32";
+  try {
+    if (shouldDisableEcho) {
+      spawnSync("stty", ["-echo"], { stdio: ["inherit", "ignore", "ignore"] });
+    }
+    const answer = await rl.question("");
+    return answer.trim();
+  } finally {
+    if (shouldDisableEcho) {
+      spawnSync("stty", ["echo"], { stdio: ["inherit", "ignore", "ignore"] });
+    }
+    output.write("\n");
+    rl.close();
+  }
+}
+
 export async function promptConfirm(message: string, defaultValue = true): Promise<boolean> {
   const defaultHint = defaultValue ? "Y/n" : "y/N";
   const raw = await promptText(`${message} (${defaultHint})`);
