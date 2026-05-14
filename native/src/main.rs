@@ -36,7 +36,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 const TICK_RATE: Duration = Duration::from_millis(50);
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
-const FOCUS_COLOR: Color = Color::LightCyan;
+const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
 const INACTIVE_COLOR: Color = Color::DarkGray;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
