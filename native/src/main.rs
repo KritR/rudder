@@ -4,7 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Stdout},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -575,12 +575,14 @@ impl App {
                             AgentStatus::Failed
                         };
                         run.completed_at = Some(Instant::now());
+                        play_completion_sound();
                     }
                     Ok(None) => {}
                     Err(error) => {
                         run.status = AgentStatus::Failed;
                         run.completed_at = Some(Instant::now());
                         run.last_error = Some(error.to_string());
+                        play_completion_sound();
                     }
                 }
             }
@@ -1604,6 +1606,54 @@ fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     } else {
         message
     });
+}
+
+fn play_completion_sound() {
+    let Some(sound_path) = completion_sound_path() else {
+        return;
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("afplay")
+            .arg(sound_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = Command::new("ffplay")
+            .args(["-nodisp", "-autoexit", "-loglevel", "quiet"])
+            .arg(sound_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+fn completion_sound_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("RUDDER_COMPLETION_SOUND").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("assets/sounds/ping.mp3"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(native_dir) = exe.parent() {
+            candidates.push(native_dir.join("../../assets/sounds/ping.mp3"));
+            candidates.push(native_dir.join("../../../assets/sounds/ping.mp3"));
+        }
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn has_git_changes(cwd: &Path) -> bool {
