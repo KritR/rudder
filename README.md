@@ -97,13 +97,14 @@ terminal UI continue to work normally.
 | `Tab` / `Shift+Tab` | Cycle focus across agents, worker, and task panes |
 | `Alt-1` / `Alt-2` / `Alt-3` | Focus agents, worker, or task directly |
 | `Ctrl-G` | Toggle Rudder nav mode while focused inside a worker |
+| `PageUp` / `PageDown` | Scroll the focused worker pane by roughly one page |
 | `j` / `k` or arrows | Move through agents when the agents pane is focused |
 | `/model` | Open the provider-first model picker |
 | `/help` | Show the short command hint |
 | `v` | Open the selected agent's Hunk review view |
 | `m` | Merge the selected completed worktree |
 | `M` | Merge all completed worktrees |
-| `d` | Delete the selected agent; if its worktree has changes, Rudder asks you to merge or confirm discard |
+| `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
 | `q` | Quit when the worker is not consuming input |
 
 Use `Ctrl-G` before a Rudder shortcut if the worker pane is focused and you want
@@ -158,9 +159,9 @@ Every dashboard task runs in its own git worktree under
 `~/.rudder-worktrees/...`, so parallel agents do not edit the same checkout.
 
 Press `m` to merge the selected completed agent back into the original branch.
-Press `M` to merge all completed agents. Rudder uses normal git merge semantics;
-clean merges become merge commits, and conflicts are left in git's standard
-conflict state for you to resolve.
+Press `M` to merge all completed agents. Rudder asks for confirmation before
+merging. Clean merges become merge commits; if git reports conflicts, Rudder can
+open an agent in the main checkout to help resolve them.
 
 Command-line equivalents:
 
@@ -191,9 +192,9 @@ Hunk provides the multi-file review UI, sidebar navigation, mouse support,
 watch mode, inline agent notes, and untracked-file handling. Rudder forwards
 keyboard and mouse input into Hunk while the review pane is focused.
 
-Rudder writes a per-worktree `.hunk/config.toml` with the light `paper` theme
-and ignores that config through git's local info exclude, so it does not get
-merged.
+Rudder writes a per-worktree `.hunk/config.toml` in Hunk's light mode and
+ignores that config through git's local info exclude, so it does not get merged.
+Set `RUDDER_HUNK_THEME=paper` or another Hunk theme name to override it.
 
 If `hunk` is not installed, Rudder uses `npx --yes hunkdiff@latest` before
 opening the review. Press `Ctrl-G`, then `v`, to return to the live Claude Code

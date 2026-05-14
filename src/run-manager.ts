@@ -765,7 +765,7 @@ export async function stopRun(runId: string, options?: { silent?: boolean }): Pr
   }
 }
 
-export async function mergeRun(runId: string, allowDirty = false, options?: { silent?: boolean }): Promise<void> {
+export async function mergeRun(runId: string, allowDirty = false, options?: { silent?: boolean }): Promise<RunRecord> {
   const repoRoot = findRepoRoot();
   const run = await loadRunRecord(repoRoot, runId);
   if (!run) {
@@ -787,7 +787,7 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
     if (!options?.silent) {
       console.log(`Merged ${runId}`);
     }
-    return;
+    return merged;
   }
   await writeAgentContext(repoRoot);
   if (!options?.silent) {
@@ -796,6 +796,7 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
       console.log(`  ${file}`);
     }
   }
+  return merged;
 }
 
 export async function deleteRun(runId: string, options?: { mergeFirst?: boolean; force?: boolean; silent?: boolean }): Promise<void> {

@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    fs,
+    env, fs,
     hash::{Hash, Hasher},
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -38,6 +38,9 @@ const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
 const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
 const INACTIVE_COLOR: Color = Color::DarkGray;
+const MIN_WHEEL_SCROLL_ROWS: u16 = 6;
+const MAX_WHEEL_SCROLL_ROWS: u16 = 18;
+const TASK_HISTORY_LIMIT: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -142,6 +145,9 @@ struct App {
     branch: Option<String>,
     task_input: String,
     task_cursor: usize,
+    task_history: Vec<String>,
+    task_history_index: Option<usize>,
+    task_history_draft: String,
     agents: Vec<AgentRun>,
     selected_agent: usize,
     backend: Backend,
@@ -149,10 +155,27 @@ struct App {
     effort: Option<EffortLevel>,
     notice: Option<String>,
     delete_pending: Option<String>,
+    merge_confirm: Option<MergeConfirmation>,
+    conflict_prompt: Option<MergeConflictPrompt>,
     picker_index: usize,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
+}
+
+struct MergeConfirmation {
+    intent: MergeIntent,
+}
+
+enum MergeIntent {
+    Selected { id: String, task: String },
+    All { ids: Vec<String> },
+}
+
+struct MergeConflictPrompt {
+    task: String,
+    conflicted_files: Vec<String>,
+    error: String,
 }
 
 struct AgentRun {
@@ -225,6 +248,9 @@ impl App {
             branch: current_branch(),
             task_input: String::new(),
             task_cursor: 0,
+            task_history: Vec::new(),
+            task_history_index: None,
+            task_history_draft: String::new(),
             agents: Vec::new(),
             selected_agent: 0,
             backend: selection.backend,
@@ -232,6 +258,8 @@ impl App {
             effort: selection.effort,
             notice: None,
             delete_pending: None,
+            merge_confirm: None,
+            conflict_prompt: None,
             picker_index: 0,
             agents_area: None,
             worker_area: None,
@@ -254,6 +282,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.handle_merge_prompt_key(key) {
+            return false;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
@@ -308,10 +340,12 @@ impl App {
 
         match key.code {
             KeyCode::Tab => {
+                self.delete_pending = None;
                 self.focus = self.focus.next();
                 return false;
             }
             KeyCode::BackTab => {
+                self.delete_pending = None;
                 self.focus = self.focus.previous();
                 return false;
             }
@@ -329,18 +363,34 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.nav_mode = false;
+                self.delete_pending = None;
                 self.notice = Some("worker input restored".to_string());
             }
-            KeyCode::Tab => self.focus = self.focus.next(),
-            KeyCode::BackTab => self.focus = self.focus.previous(),
-            KeyCode::Char('1') => self.focus = FocusPane::Agents,
-            KeyCode::Char('2') => self.focus = FocusPane::Worker,
-            KeyCode::Char('3') => self.focus = FocusPane::Task,
+            KeyCode::Tab => {
+                self.delete_pending = None;
+                self.focus = self.focus.next();
+            }
+            KeyCode::BackTab => {
+                self.delete_pending = None;
+                self.focus = self.focus.previous();
+            }
+            KeyCode::Char('1') => {
+                self.delete_pending = None;
+                self.focus = FocusPane::Agents;
+            }
+            KeyCode::Char('2') => {
+                self.delete_pending = None;
+                self.focus = FocusPane::Worker;
+            }
+            KeyCode::Char('3') => {
+                self.delete_pending = None;
+                self.focus = FocusPane::Task;
+            }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
-            KeyCode::Char('m') => self.merge_selected_agent(),
-            KeyCode::Char('M') => self.merge_all_ready(),
+            KeyCode::Char('m') => self.request_merge_selected_agent(),
+            KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('d') => self.delete_selected_agent(),
             KeyCode::Char('q') => return true,
             _ => {}
@@ -355,12 +405,13 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Enter => {
                 if !self.agents.is_empty() {
+                    self.delete_pending = None;
                     self.focus = FocusPane::Worker;
                 }
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
-            KeyCode::Char('M') => self.merge_all_ready(),
-            KeyCode::Char('m') => self.merge_selected_agent(),
+            KeyCode::Char('M') => self.request_merge_all_ready(),
+            KeyCode::Char('m') => self.request_merge_selected_agent(),
             KeyCode::Char('d') => self.delete_selected_agent(),
             _ => {}
         }
@@ -372,7 +423,7 @@ impl App {
             if self.selected_review_terminal_mut().is_none() {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('v') => self.worker_view = WorkerView::Terminal,
-                    KeyCode::Char('m') => self.merge_selected_agent(),
+                    KeyCode::Char('m') => self.request_merge_selected_agent(),
                     _ => {}
                 }
                 return false;
@@ -392,11 +443,24 @@ impl App {
             return true;
         }
 
+        match key.code {
+            KeyCode::PageUp => {
+                self.handle_worker_page_key(key, page_scroll_rows(self.worker_area));
+                return false;
+            }
+            KeyCode::PageDown => {
+                self.handle_worker_page_key(key, -page_scroll_rows(self.worker_area));
+                return false;
+            }
+            _ => {}
+        }
+
         let Some(terminal) = self.selected_terminal_mut() else {
             return false;
         };
 
         if let Some(bytes) = terminal_bytes_for_key(key) {
+            terminal.reset_scrollback();
             if let Err(error) = terminal.write_input(&bytes) {
                 self.set_selected_error(error.to_string());
             }
@@ -405,10 +469,12 @@ impl App {
     }
 
     fn select_previous_agent(&mut self) {
+        self.delete_pending = None;
         self.selected_agent = self.selected_agent.saturating_sub(1);
     }
 
     fn select_next_agent(&mut self) {
+        self.delete_pending = None;
         let last = self.agents.len().saturating_sub(1);
         self.selected_agent = (self.selected_agent + 1).min(last);
     }
@@ -425,18 +491,36 @@ impl App {
     }
 
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
+        if self.task_history_index.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.show_previous_task_history();
+                    return false;
+                }
+                KeyCode::Down => {
+                    self.show_next_task_history();
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         if self.handle_picker_key(key) {
             return false;
         }
 
         match key.code {
             KeyCode::Esc => {
+                self.reset_task_history_navigation();
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
             }
             KeyCode::Enter => self.start_task(),
+            KeyCode::Up => self.show_previous_task_history(),
+            KeyCode::Down => self.show_next_task_history(),
             KeyCode::Backspace => {
+                self.reset_task_history_navigation();
                 if key.modifiers.intersects(
                     KeyModifiers::ALT
                         | KeyModifiers::CONTROL
@@ -450,6 +534,7 @@ impl App {
                 self.clamp_picker_index();
             }
             KeyCode::Delete => {
+                self.reset_task_history_navigation();
                 delete_char_at_cursor(&mut self.task_input, self.task_cursor);
                 self.clamp_picker_index();
             }
@@ -481,27 +566,76 @@ impl App {
                 self.task_cursor = self.task_input.chars().count();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_task_history_navigation();
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_task_history_navigation();
                 delete_previous_word_at(&mut self.task_input, &mut self.task_cursor);
                 self.clamp_picker_index();
             }
             KeyCode::Char('/') if self.task_input.is_empty() => {
+                self.reset_task_history_navigation();
                 self.task_input.push('/');
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some("type /model".to_string());
             }
             KeyCode::Char(ch) => {
+                self.reset_task_history_navigation();
                 insert_char_at_cursor(&mut self.task_input, &mut self.task_cursor, ch);
                 self.clamp_picker_index();
             }
             _ => {}
         }
         false
+    }
+
+    fn show_previous_task_history(&mut self) {
+        if let Some(value) = previous_task_history_entry(
+            &self.task_history,
+            &mut self.task_history_index,
+            &mut self.task_history_draft,
+            &self.task_input,
+        ) {
+            self.replace_task_input(value);
+        }
+    }
+
+    fn show_next_task_history(&mut self) {
+        if let Some(value) = next_task_history_entry(
+            &self.task_history,
+            &mut self.task_history_index,
+            &mut self.task_history_draft,
+        ) {
+            self.replace_task_input(value);
+        }
+    }
+
+    fn replace_task_input(&mut self, value: String) {
+        self.task_input = value;
+        self.task_cursor = self.task_input.chars().count();
+        self.picker_index = 0;
+        self.clamp_picker_index();
+    }
+
+    fn reset_task_history_navigation(&mut self) {
+        self.task_history_index = None;
+        self.task_history_draft.clear();
+    }
+
+    fn remember_task_history(&mut self, input: &str) {
+        if input.trim().is_empty() {
+            return;
+        }
+        self.task_history.push(input.to_string());
+        if self.task_history.len() > TASK_HISTORY_LIMIT {
+            let overflow = self.task_history.len() - TASK_HISTORY_LIMIT;
+            self.task_history.drain(0..overflow);
+        }
+        self.reset_task_history_navigation();
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
@@ -535,22 +669,17 @@ impl App {
     }
 
     fn apply_suggestion(&mut self, suggestion: Suggestion) {
+        self.reset_task_history_navigation();
         match suggestion.action {
             SuggestionAction::Insert(value) => {
-                self.task_input = value;
-                self.task_cursor = self.task_input.chars().count();
-                self.picker_index = 0;
+                self.replace_task_input(value);
             }
             SuggestionAction::ChooseModelProvider(backend) => {
-                self.task_input = format!("/model {} ", backend.as_str());
-                self.task_cursor = self.task_input.chars().count();
-                self.picker_index = 0;
+                self.replace_task_input(format!("/model {} ", backend.as_str()));
                 self.notice = Some(format!("pick a {} model", backend.as_str()));
             }
             SuggestionAction::ChooseModel { backend, model } => {
-                self.task_input = format!("/model {} {} ", backend.as_str(), model);
-                self.task_cursor = self.task_input.chars().count();
-                self.picker_index = 0;
+                self.replace_task_input(format!("/model {} {} ", backend.as_str(), model));
                 self.notice = Some(format!("pick effort for {model}"));
             }
             SuggestionAction::SetModel {
@@ -575,8 +704,9 @@ impl App {
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
-                self.notice =
-                    Some("Tab focus  Enter start/focus  m merge  M merge all  d del".to_string());
+                self.notice = Some(
+                    "Tab focus  Enter start/focus  m merge  M merge all  dd delete".to_string(),
+                );
             }
         }
     }
@@ -600,12 +730,14 @@ impl App {
                         }
                     }
                 } else if let Some(terminal) = self.selected_terminal_mut() {
+                    terminal.reset_scrollback();
                     if let Err(error) = terminal.write_input(text.as_bytes()) {
                         self.set_selected_error(error.to_string());
                     }
                 }
             }
             FocusPane::Task => {
+                self.reset_task_history_navigation();
                 insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, &text);
                 self.clamp_picker_index();
             }
@@ -615,36 +747,14 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self
-            .worker_area
-            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
-            && self.worker_view == WorkerView::Diff
-        {
-            self.focus = FocusPane::Worker;
-            if let Some(worker_area) = self.worker_area {
-                let inner = block_inner(worker_area);
-                if let Some(bytes) = mouse_event_to_sgr(mouse, inner) {
-                    if let Some(review) = self.selected_review_terminal_mut() {
-                        if let Err(error) = review.write_input(&bytes) {
-                            self.set_selected_review_error(error.to_string());
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        let delta = match mouse.kind {
-            MouseEventKind::ScrollUp => -3,
-            MouseEventKind::ScrollDown => 3,
-            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => return,
-            _ => return,
-        };
-
-        if self
             .agents_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
         {
-            if delta < 0 {
+            if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 self.select_previous_agent();
             } else {
                 self.select_next_agent();
@@ -652,27 +762,96 @@ impl App {
             return;
         }
 
-        if self
+        let Some(worker_area) = self
             .worker_area
-            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
-        {
-            self.focus = FocusPane::Worker;
-            match self.worker_view {
-                WorkerView::Diff => self.scroll_review(delta),
-                WorkerView::Terminal => self.scroll_worker(delta),
+            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+        else {
+            return;
+        };
+
+        self.focus = FocusPane::Worker;
+        let inner = block_inner(worker_area);
+
+        if self.worker_view == WorkerView::Diff {
+            if self.write_mouse_to_selected_review(mouse, inner) {
+                return;
             }
+            if is_scroll_mouse_event(mouse.kind) {
+                self.scroll_review(mouse_scrollback_delta(mouse, inner.height));
+            }
+            return;
+        }
+
+        if self.write_mouse_to_selected_worker(mouse, inner) {
+            return;
+        }
+        if is_scroll_mouse_event(mouse.kind) {
+            self.scroll_worker(mouse_scrollback_delta(mouse, inner.height));
         }
     }
 
-    fn scroll_worker(&mut self, delta: isize) {
+    fn write_mouse_to_selected_worker(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
+            return false;
+        };
+        let result = match self.selected_terminal_mut() {
+            Some(terminal) => {
+                if !terminal.wants_sgr_mouse_events() {
+                    return false;
+                }
+                terminal.write_input(&bytes)
+            }
+            None => return false,
+        };
+        if let Err(error) = result {
+            self.set_selected_error(error.to_string());
+        }
+        true
+    }
+
+    fn write_mouse_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
+            return false;
+        };
+        let result = match self.selected_review_terminal_mut() {
+            Some(review) => review.write_input(&bytes),
+            None => return false,
+        };
+        if let Err(error) = result {
+            self.set_selected_review_error(error.to_string());
+        }
+        true
+    }
+
+    fn handle_worker_page_key(&mut self, key: KeyEvent, rows: isize) {
+        let Some(bytes) = terminal_bytes_for_key(key) else {
+            return;
+        };
+        let result = match self.selected_terminal_mut() {
+            Some(terminal) => {
+                if terminal.uses_alternate_screen() {
+                    terminal.write_input(&bytes)
+                } else {
+                    terminal.scrollback_by(rows);
+                    Ok(())
+                }
+            }
+            None => return,
+        };
+        if let Err(error) = result {
+            self.set_selected_error(error.to_string());
+        }
+    }
+
+    fn scroll_worker(&mut self, rows: isize) {
         if let Some(terminal) = self.selected_terminal_mut() {
-            terminal.scrollback_by(-delta);
+            terminal.scrollback_by(rows);
         }
     }
 
-    fn scroll_review(&mut self, delta: isize) {
+    fn scroll_review(&mut self, rows: isize) {
         if let Some(terminal) = self.selected_review_terminal_mut() {
-            terminal.scrollback_by(-delta);
+            terminal.scrollback_by(rows);
         }
     }
 
@@ -681,12 +860,14 @@ impl App {
         if input.is_empty() {
             return;
         }
+        self.remember_task_history(&input);
         self.task_input.clear();
         self.task_cursor = 0;
 
         if self.handle_command(&input) {
             return;
         }
+        self.notice = None;
 
         let worktree = match prepare_worktree(&self.cwd, &input) {
             Ok(worktree) => worktree,
@@ -739,7 +920,6 @@ impl App {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
                 run.terminal = Some(terminal);
-                self.notice = Some(format!("started {}", short_task(&input)));
             }
             Err(error) => {
                 run.status = AgentStatus::Failed;
@@ -817,7 +997,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice =
-                    Some("Tab focus  Enter start/focus  /model  m/M merge  d delete".to_string());
+                    Some("Tab focus  Enter start/focus  /model  m/M merge  dd delete".to_string());
                 true
             }
             _ => false,
@@ -861,7 +1041,7 @@ impl App {
             "sh",
             [
                 "-lc",
-                "if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch; fi; exec npx --yes hunkdiff@latest diff --watch",
+                "theme=\"${RUDDER_HUNK_THEME:-paper}\"; if [ \"$theme\" = light ]; then theme=paper; fi; if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch --theme \"$theme\"; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch --theme \"$theme\"; fi; exec npx --yes hunkdiff@latest diff --watch --theme \"$theme\"",
             ],
         );
         if let Err(error) = ensure_hunk_config(&run.cwd) {
@@ -894,51 +1074,80 @@ impl App {
             return;
         }
         let selected = &self.agents[self.selected_agent];
-        if selected.worktree_path.is_some()
-            && has_git_changes(&selected.cwd)
-            && self.delete_pending.as_deref() != Some(&selected.id)
-        {
+        if self.delete_pending.as_deref() != Some(&selected.id) {
             self.delete_pending = Some(selected.id.clone());
-            self.notice =
-                Some("worktree has changes: press m to merge, or d again to delete".to_string());
+            self.notice = Some(
+                if selected.worktree_path.is_some() && has_git_changes(&selected.cwd) {
+                    "worktree has changes: press m to merge, or d again to delete".to_string()
+                } else if selected.worktree_path.is_some() {
+                    "press d again to delete agent and remove its worktree".to_string()
+                } else {
+                    "press d again to delete agent".to_string()
+                },
+            );
             return;
         }
 
         let run = self.agents.remove(self.selected_agent);
-        if let Some(path) = run.worktree_path {
-            let _ = Command::new("git")
+        let worktree_error = run.worktree_path.as_ref().and_then(|path| {
+            let output = Command::new("git")
                 .args(["worktree", "remove", "--force"])
-                .arg(&path)
+                .arg(path)
                 .current_dir(&self.cwd)
-                .output();
-        }
+                .output()
+                .ok()?;
+            if output.status.success() {
+                None
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Some(if stderr.is_empty() {
+                    "failed to remove worktree".to_string()
+                } else {
+                    format!("failed to remove worktree: {stderr}")
+                })
+            }
+        });
         let last = self.agents.len().saturating_sub(1);
         self.selected_agent = self.selected_agent.min(last);
         self.delete_pending = None;
-        self.notice = Some("deleted agent from dashboard".to_string());
+        self.notice = Some(worktree_error.unwrap_or_else(|| {
+            if run.worktree_path.is_some() {
+                "deleted agent and removed worktree".to_string()
+            } else {
+                "deleted agent from dashboard".to_string()
+            }
+        }));
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
-    fn merge_selected_agent(&mut self) {
-        if self.agents.get(self.selected_agent).is_none() {
+    fn request_merge_selected_agent(&mut self) {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        if run.worktree_branch.is_none() {
+            self.notice = Some("selected agent has no worktree to merge".to_string());
             return;
         }
-        match self.merge_agent_at(self.selected_agent) {
-            Ok(()) => {
-                self.delete_pending = None;
-                self.notice = Some("merged selected worktree".to_string());
-            }
-            Err(error) => self.notice = Some(format!("merge stopped: {error}")),
-        }
+        self.merge_confirm = Some(MergeConfirmation {
+            intent: MergeIntent::Selected {
+                id: run.id.clone(),
+                task: run.task.clone(),
+            },
+        });
+        self.conflict_prompt = None;
+        self.notice = Some(format!(
+            "merge {}? press y to confirm or n to cancel",
+            short_task(&run.task)
+        ));
     }
 
-    fn merge_all_ready(&mut self) {
+    fn request_merge_all_ready(&mut self) {
         let ready = self
             .agents
             .iter()
-            .enumerate()
-            .filter(|(_, run)| run.status == AgentStatus::Done && run.worktree_branch.is_some())
-            .map(|(index, _)| index)
+            .filter(|run| run.status == AgentStatus::Done && run.worktree_branch.is_some())
+            .map(|run| run.id.clone())
             .collect::<Vec<_>>();
 
         if ready.is_empty() {
@@ -946,19 +1155,178 @@ impl App {
             return;
         }
 
-        let mut merged = 0;
-        for index in ready {
-            if let Err(error) = self.merge_agent_at(index) {
-                self.notice = Some(format!("merge all stopped after {merged}: {error}"));
-                return;
-            }
-            merged += 1;
-        }
-        self.delete_pending = None;
+        self.merge_confirm = Some(MergeConfirmation {
+            intent: MergeIntent::All { ids: ready.clone() },
+        });
+        self.conflict_prompt = None;
         self.notice = Some(format!(
-            "merged {merged} worktree{}",
-            if merged == 1 { "" } else { "s" }
+            "merge {count} completed worktree{plural}? press y to confirm or n to cancel",
+            count = ready.len(),
+            plural = if ready.len() == 1 { "" } else { "s" }
         ));
+    }
+
+    fn handle_merge_prompt_key(&mut self, key: KeyEvent) -> bool {
+        if self.merge_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_pending_merge(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.merge_confirm = None;
+                    self.notice = Some("merge cancelled".to_string());
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        if self.conflict_prompt.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.start_conflict_resolution_agent(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.conflict_prompt = None;
+                    self.notice =
+                        Some("resolve the merge conflicts manually, then commit".to_string());
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn confirm_pending_merge(&mut self) {
+        let Some(confirm) = self.merge_confirm.take() else {
+            return;
+        };
+
+        match confirm.intent {
+            MergeIntent::Selected { id, task } => {
+                let Some(index) = self.agents.iter().position(|run| run.id == id) else {
+                    self.notice = Some("selected agent no longer exists".to_string());
+                    return;
+                };
+                match self.merge_agent_at(index) {
+                    Ok(()) => {
+                        self.delete_pending = None;
+                        self.notice = Some("merged selected worktree".to_string());
+                    }
+                    Err(error) => self.handle_merge_error(task, error, None),
+                }
+            }
+            MergeIntent::All { ids } => {
+                let mut merged = 0;
+                for id in ids {
+                    let Some(index) = self.agents.iter().position(|run| run.id == id) else {
+                        continue;
+                    };
+                    let task = self.agents[index].task.clone();
+                    if let Err(error) = self.merge_agent_at(index) {
+                        self.handle_merge_error(task, error, Some(merged));
+                        return;
+                    }
+                    merged += 1;
+                }
+                self.delete_pending = None;
+                self.notice = Some(format!(
+                    "merged {merged} worktree{}",
+                    if merged == 1 { "" } else { "s" }
+                ));
+            }
+        }
+    }
+
+    fn handle_merge_error(
+        &mut self,
+        task: String,
+        error: anyhow::Error,
+        merged_before_error: Option<usize>,
+    ) {
+        let conflicted_files = conflicted_files(&self.cwd);
+        if conflicted_files.is_empty() {
+            let prefix = merged_before_error
+                .map(|count| format!("merge all stopped after {count}: "))
+                .unwrap_or_else(|| "merge stopped: ".to_string());
+            self.notice = Some(format!("{prefix}{error}"));
+            return;
+        }
+
+        let count = conflicted_files.len();
+        self.conflict_prompt = Some(MergeConflictPrompt {
+            task,
+            conflicted_files,
+            error: error.to_string(),
+        });
+        self.notice = Some(format!(
+            "merge conflict in {count} file{}: press y for AI help or n to resolve manually",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn start_conflict_resolution_agent(&mut self) {
+        let Some(prompt) = self.conflict_resolution_prompt() else {
+            return;
+        };
+        self.conflict_prompt = None;
+
+        let id = new_run_id("resolve merge conflicts");
+        let command = agent_command(self.backend, &self.model, self.effort, &prompt);
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        let mut run = AgentRun {
+            id,
+            task: "Resolve merge conflicts".to_string(),
+            backend: self.backend,
+            model: self.model.clone(),
+            effort: self.effort,
+            status: AgentStatus::Running,
+            cwd: self.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: false,
+            needs_permission: false,
+            permission_notified: false,
+            last_error: None,
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                self.agents.push(run);
+                self.selected_agent = self.agents.len().saturating_sub(1);
+                self.focus = FocusPane::Worker;
+                self.notice = Some("started AI merge-conflict resolver".to_string());
+                let _ = write_rudder_context(&self.cwd, &self.agents, None);
+            }
+            Err(error) => {
+                self.notice = Some(format!("failed to start AI resolver: {error}"));
+            }
+        }
+    }
+
+    fn conflict_resolution_prompt(&self) -> Option<String> {
+        let prompt = self.conflict_prompt.as_ref()?;
+        let files = if prompt.conflicted_files.is_empty() {
+            "(git did not report conflicted files)".to_string()
+        } else {
+            prompt.conflicted_files.join("\n")
+        };
+        Some(format!(
+            "Read RUDDER.md first. A git merge for this Rudder task stopped with conflicts:\n\n{}\n\nConflicted files:\n{}\n\nGit reported:\n{}\n\nResolve the merge conflicts in this checkout. Inspect git status and the conflicted files, keep the intended changes from both sides where appropriate, run the relevant checks if possible, and tell me what you changed. Do not abort the merge unless resolving is impossible.",
+            prompt.task, files, prompt.error
+        ))
     }
 
     fn merge_agent_at(&mut self, index: usize) -> Result<()> {
@@ -1007,7 +1375,15 @@ impl App {
                 }
             }
             if run.status == AgentStatus::Running {
-                let needs_permission = terminal_needs_permission(run.backend, terminal);
+                let idle_enough = run.last_output_at.elapsed() >= INTERACTIVE_COMPLETION_IDLE;
+                let visible_lines = if had_output || run.needs_permission || idle_enough {
+                    Some(terminal.visible_lines_snapshot())
+                } else {
+                    None
+                };
+                let needs_permission = visible_lines
+                    .as_ref()
+                    .is_some_and(|lines| terminal_needs_permission_from_lines(lines));
                 run.needs_permission = needs_permission;
                 if needs_permission {
                     if !run.permission_notified {
@@ -1030,8 +1406,10 @@ impl App {
                         };
                     }
                     Ok(None) => {
-                        if run.last_output_at.elapsed() >= INTERACTIVE_COMPLETION_IDLE
-                            && terminal_looks_ready_for_input(run.backend, terminal)
+                        if idle_enough
+                            && visible_lines.as_ref().is_some_and(|lines| {
+                                terminal_looks_ready_for_input_from_lines(run.backend, lines)
+                            })
                         {
                             mark_run_done(run);
                         }
@@ -1103,12 +1481,11 @@ fn mark_run_done(run: &mut AgentRun) {
     }
 }
 
-fn terminal_looks_ready_for_input(backend: Backend, terminal: &mut TerminalPane) -> bool {
-    if terminal_needs_permission(backend, terminal) {
+fn terminal_looks_ready_for_input_from_lines(backend: Backend, lines: &[String]) -> bool {
+    if terminal_needs_permission_from_lines(lines) {
         return false;
     }
 
-    let lines = terminal.visible_lines();
     let recent = lines
         .iter()
         .rev()
@@ -1126,8 +1503,7 @@ fn terminal_looks_ready_for_input(backend: Backend, terminal: &mut TerminalPane)
         .any(|line| looks_like_agent_prompt(backend, line))
 }
 
-fn terminal_needs_permission(_backend: Backend, terminal: &mut TerminalPane) -> bool {
-    let lines = terminal.visible_lines();
+fn terminal_needs_permission_from_lines(lines: &[String]) -> bool {
     let recent = lines
         .iter()
         .rev()
@@ -1358,6 +1734,144 @@ mod app_tests {
             mouse_event_to_sgr(event, area),
             Some(b"\x1b[<0;3;4M".to_vec())
         );
+
+        let modified_scroll = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        assert_eq!(
+            mouse_event_to_sgr(modified_scroll, area),
+            Some(b"\x1b[<80;3;4M".to_vec())
+        );
+    }
+
+    #[test]
+    fn worker_wheel_scroll_rows_scale_with_viewport() {
+        assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 5);
+        assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 10);
+        assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 18);
+        assert_eq!(wheel_scroll_rows(30, KeyModifiers::CONTROL), 29);
+
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(mouse_scrollback_delta(down, 30), -10);
+    }
+
+    #[test]
+    fn maps_page_keys_for_terminal_passthrough() {
+        assert_eq!(
+            terminal_bytes_for_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty())),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            terminal_bytes_for_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty())),
+            Some(b"\x1b[6~".to_vec())
+        );
+    }
+
+    #[test]
+    fn task_history_walks_backward_forward_and_restores_draft() {
+        let history = vec![
+            "first task".to_string(),
+            "second task".to_string(),
+            "third task".to_string(),
+        ];
+        let mut index = None;
+        let mut draft = String::new();
+
+        assert_eq!(
+            previous_task_history_entry(&history, &mut index, &mut draft, "draft task").as_deref(),
+            Some("third task")
+        );
+        assert_eq!(index, Some(2));
+        assert_eq!(draft, "draft task");
+
+        assert_eq!(
+            previous_task_history_entry(&history, &mut index, &mut draft, "third task").as_deref(),
+            Some("second task")
+        );
+        assert_eq!(
+            previous_task_history_entry(&history, &mut index, &mut draft, "second task").as_deref(),
+            Some("first task")
+        );
+        assert_eq!(
+            previous_task_history_entry(&history, &mut index, &mut draft, "first task").as_deref(),
+            Some("first task")
+        );
+
+        assert_eq!(
+            next_task_history_entry(&history, &mut index, &mut draft).as_deref(),
+            Some("second task")
+        );
+        assert_eq!(
+            next_task_history_entry(&history, &mut index, &mut draft).as_deref(),
+            Some("third task")
+        );
+        assert_eq!(
+            next_task_history_entry(&history, &mut index, &mut draft).as_deref(),
+            Some("draft task")
+        );
+        assert_eq!(index, None);
+    }
+
+    #[test]
+    fn wraps_task_input_and_tracks_cursor_on_wrapped_lines() {
+        let input = "abcdef";
+
+        assert_eq!(wrap_input_text(input, 3), vec!["abc", "def"]);
+        assert_eq!(task_cursor_position(input, 6, 3), (2, 0));
+        assert_eq!(task_input_lines(input, 6, 3), vec!["abc", "def", ""]);
+    }
+
+    #[test]
+    fn task_pane_height_grows_for_long_task_input() {
+        let mut app = App::new();
+        let base_height = task_pane_height(&app, 40);
+        app.task_input = "x".repeat(80);
+        app.task_cursor = app.task_input.chars().count();
+
+        assert!(task_pane_height(&app, 40) > base_height);
+    }
+
+    #[test]
+    fn delete_agent_requires_second_d() {
+        let mut app = App::new();
+        app.agents.push(AgentRun {
+            id: "run-1".to_string(),
+            task: "test task".to_string(),
+            backend: Backend::Claude,
+            model: "sonnet".to_string(),
+            effort: None,
+            status: AgentStatus::Done,
+            cwd: app.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: Some(Instant::now()),
+            autosteered: false,
+            needs_permission: false,
+            permission_notified: false,
+            last_error: None,
+        });
+
+        app.delete_selected_agent();
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.delete_pending.as_deref(), Some("run-1"));
+
+        app.delete_selected_agent();
+        assert!(app.agents.is_empty());
+        assert!(app.delete_pending.is_none());
     }
 }
 
@@ -1458,6 +1972,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_gutter(frame, rows[1], Gutter::Horizontal);
     render_task(frame, rows[2], app);
     render_suggestions(frame, rows[2], app);
+    render_merge_prompt(frame, area, app);
 }
 
 #[derive(Clone, Copy)]
@@ -1500,7 +2015,13 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ListItem::new(Line::default()),
     ];
 
-    for hint in ["j/k move", "Enter focus", "v review", "m merge", "d delete"] {
+    for hint in [
+        "j/k move",
+        "Enter focus",
+        "v review",
+        "m merge",
+        "dd delete",
+    ] {
         lines.push(ListItem::new(Line::from(Span::styled(
             hint,
             muted_style(focused),
@@ -1604,30 +2125,37 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
-    let Some((backend, cursor)) = app.agents.get(app.selected_agent).and_then(|run| {
-        run.terminal
-            .as_ref()
-            .map(|terminal| (run.backend, terminal.cursor()))
-    }) else {
+    let Some(run) = app.agents.get(app.selected_agent) else {
         return;
     };
+    let Some(terminal) = run.terminal.as_ref() else {
+        return;
+    };
+    if terminal.scrollback() > 0 {
+        return;
+    }
+    let cursor = terminal.cursor();
     if cursor.row >= inner.height || cursor.col >= inner.width {
         return;
     }
-    if !cursor.visible && backend != Backend::Claude {
+    if !cursor.visible && run.backend != Backend::Claude {
         return;
     }
     frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
 }
 
 fn set_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
-    let Some(cursor) = app.agents.get(app.selected_agent).and_then(|run| {
-        run.review_terminal
-            .as_ref()
-            .map(|terminal| terminal.cursor())
-    }) else {
+    let Some(terminal) = app
+        .agents
+        .get(app.selected_agent)
+        .and_then(|run| run.review_terminal.as_ref())
+    else {
         return;
     };
+    if terminal.scrollback() > 0 {
+        return;
+    }
+    let cursor = terminal.cursor();
     if cursor.row >= inner.height || cursor.col >= inner.width || !cursor.visible {
         return;
     }
@@ -1722,22 +2250,43 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
-    let input = if app.task_input.is_empty() {
-        Line::from(Span::styled("Type a task or /model", muted_style(focused)))
-    } else {
-        Line::from(Span::styled(
-            app.task_input.as_str(),
-            pane_text_style(focused),
-        ))
-    };
-
     let hint = app
         .notice
         .as_deref()
-        .unwrap_or("Enter start  Tab focus  Alt-1/2/3 pane  /model");
+        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model");
     let inner_width = area.width.saturating_sub(2).max(1);
-    let mut lines = vec![input];
+    let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width);
+    let (cursor_line, cursor_column) =
+        task_cursor_position(&app.task_input, app.task_cursor, inner_width);
     let wrapped_hint = wrap_text(hint, inner_width);
+    let hint_line_count = wrapped_hint.len().max(1);
+    let available_lines = area.height.saturating_sub(2).max(1) as usize;
+    let max_input_lines = available_lines.saturating_sub(hint_line_count).max(1);
+    let input_start = if input_lines.len() > max_input_lines {
+        cursor_line.saturating_sub(max_input_lines.saturating_sub(1))
+    } else {
+        0
+    };
+    let input_start = input_start.min(input_lines.len().saturating_sub(1));
+    let mut lines = input_lines
+        .iter()
+        .skip(input_start)
+        .take(max_input_lines)
+        .map(|line| {
+            let display = if app.task_input.is_empty() {
+                "Type a task or /model"
+            } else {
+                line.as_str()
+            };
+            let style = if app.task_input.is_empty() {
+                muted_style(focused)
+            } else {
+                pane_text_style(focused)
+            };
+            Line::from(Span::styled(display.to_string(), style))
+        })
+        .collect::<Vec<_>>();
+
     if app.notice.is_some() {
         for line in wrapped_hint {
             lines.push(Line::from(Span::styled(line, muted_style(focused))));
@@ -1765,9 +2314,10 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 
     if app.focus == FocusPane::Task {
-        let x = area.x + 1 + app.task_cursor as u16;
-        let y = area.y + 1;
-        if x < area.right().saturating_sub(1) {
+        let visible_cursor_line = cursor_line.saturating_sub(input_start);
+        let x = area.x + 1 + cursor_column as u16;
+        let y = area.y + 1 + visible_cursor_line as u16;
+        if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
             frame.set_cursor_position((x, y));
         }
     }
@@ -1777,11 +2327,14 @@ fn task_pane_height(app: &App, width: u16) -> u16 {
     let hint = app
         .notice
         .as_deref()
-        .unwrap_or("Enter start  Tab focus  Alt-1/2/3 pane  /model");
+        .unwrap_or("Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /model");
     let inner_width = width.saturating_sub(2).max(1);
+    let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width)
+        .len()
+        .max(1) as u16;
     let hint_lines = wrap_text(hint, inner_width).len().max(1) as u16;
     2_u16
-        .saturating_add(1)
+        .saturating_add(input_lines)
         .saturating_add(hint_lines)
         .clamp(4, 10)
 }
@@ -1850,6 +2403,85 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
+fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (title, body, border_color) = if let Some(confirm) = &app.merge_confirm {
+        let summary = match &confirm.intent {
+            MergeIntent::Selected { task, .. } => {
+                format!("Merge selected worktree: {}", short_task(task))
+            }
+            MergeIntent::All { ids } => format!(
+                "Merge {} completed worktree{}",
+                ids.len(),
+                if ids.len() == 1 { "" } else { "s" }
+            ),
+        };
+        (
+            " confirm merge ",
+            vec![
+                summary,
+                "This will run git merge into the current branch.".to_string(),
+                "Press y to merge, n to cancel.".to_string(),
+            ],
+            Color::Yellow,
+        )
+    } else if let Some(prompt) = &app.conflict_prompt {
+        let files = prompt.conflicted_files.join(", ");
+        (
+            " merge conflict ",
+            vec![
+                format!(
+                    "Merge stopped with {} conflicted file{}.",
+                    prompt.conflicted_files.len(),
+                    if prompt.conflicted_files.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                if files.is_empty() {
+                    "Git did not report conflicted files.".to_string()
+                } else {
+                    format!("Files: {files}")
+                },
+                "Press y to start an AI resolver, n to handle manually.".to_string(),
+            ],
+            Color::Red,
+        )
+    } else {
+        return;
+    };
+
+    let modal = centered_modal(area, 74, (body.len() as u16).saturating_add(2));
+    let inner_width = modal.width.saturating_sub(4).max(1);
+    let lines = body
+        .into_iter()
+        .flat_map(|line| wrap_text(&line, inner_width))
+        .map(|line| Line::from(Span::styled(line, Style::default())))
+        .collect::<Vec<_>>();
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        );
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(Clear, modal);
+    frame.render_widget(paragraph, modal);
+}
+
+fn centered_modal(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
+    let width = desired_width.min(area.width.saturating_sub(4)).max(24);
+    let height = desired_height.min(area.height.saturating_sub(2)).max(5);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
 fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default()
@@ -1873,6 +2505,65 @@ fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'stat
         .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .borders(Borders::ALL)
         .border_style(border_style)
+}
+
+fn task_input_lines(value: &str, cursor: usize, width: u16) -> Vec<String> {
+    let mut lines = wrap_input_text(value, width);
+    let (cursor_line, _) = task_cursor_position(value, cursor, width);
+    while lines.len() <= cursor_line {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn wrap_input_text(value: &str, width: u16) -> Vec<String> {
+    let max_width = usize::from(width.max(1));
+    let mut lines = vec![String::new()];
+
+    for ch in value.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            lines.push(String::new());
+            continue;
+        }
+        if lines
+            .last()
+            .is_some_and(|line| line.chars().count() == max_width)
+        {
+            lines.push(String::new());
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(ch);
+        }
+    }
+
+    lines
+}
+
+fn task_cursor_position(value: &str, cursor: usize, width: u16) -> (usize, usize) {
+    let max_width = usize::from(width.max(1));
+    let mut line = 0;
+    let mut column = 0;
+
+    for ch in value.chars().take(cursor) {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 0;
+            continue;
+        }
+        column += 1;
+        if column == max_width {
+            line += 1;
+            column = 0;
+        }
+    }
+
+    (line, column)
 }
 
 fn wrap_text(value: &str, width: u16) -> Vec<String> {
@@ -1974,6 +2665,46 @@ fn block_inner(area: Rect) -> Rect {
 
 fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
+}
+
+fn is_scroll_mouse_event(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    )
+}
+
+fn mouse_scrollback_delta(mouse: MouseEvent, viewport_height: u16) -> isize {
+    let rows = wheel_scroll_rows(viewport_height, mouse.modifiers) as isize;
+    match mouse.kind {
+        MouseEventKind::ScrollUp => rows,
+        MouseEventKind::ScrollDown => -rows,
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => 0,
+        _ => 0,
+    }
+}
+
+fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
+    let page = viewport_height.saturating_sub(1).max(1);
+    if modifiers.intersects(
+        KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::META | KeyModifiers::SUPER,
+    ) {
+        return page;
+    }
+
+    (viewport_height / 3)
+        .max(MIN_WHEEL_SCROLL_ROWS)
+        .min(MAX_WHEEL_SCROLL_ROWS)
+        .min(page)
+        .max(1)
+}
+
+fn page_scroll_rows(area: Option<Rect>) -> isize {
+    let height = area.map(block_inner).map(|inner| inner.height).unwrap_or(1);
+    height.saturating_sub(1).max(1) as isize
 }
 
 fn status_style(status: AgentStatus) -> Style {
@@ -2797,6 +3528,45 @@ fn short_task(task: &str) -> String {
     }
 }
 
+fn previous_task_history_entry(
+    history: &[String],
+    index: &mut Option<usize>,
+    draft: &mut String,
+    current_input: &str,
+) -> Option<String> {
+    if history.is_empty() {
+        return None;
+    }
+
+    let next_index = match *index {
+        Some(current) => current
+            .min(history.len().saturating_sub(1))
+            .saturating_sub(1),
+        None => {
+            *draft = current_input.to_string();
+            history.len().saturating_sub(1)
+        }
+    };
+    *index = Some(next_index);
+    history.get(next_index).cloned()
+}
+
+fn next_task_history_entry(
+    history: &[String],
+    index: &mut Option<usize>,
+    draft: &mut String,
+) -> Option<String> {
+    let current = (*index)?.min(history.len().saturating_sub(1));
+    if current + 1 < history.len() {
+        let next_index = current + 1;
+        *index = Some(next_index);
+        return history.get(next_index).cloned();
+    }
+
+    *index = None;
+    Some(std::mem::take(draft))
+}
+
 fn insert_char_at_cursor(input: &mut String, cursor: &mut usize, ch: char) {
     let byte_index = byte_index_for_char(input, *cursor);
     input.insert(byte_index, ch);
@@ -2913,6 +3683,8 @@ fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Down => modified_arrow("B", key.modifiers),
         KeyCode::Home => b"\x1b[H".to_vec(),
         KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         _ => return None,
     };
@@ -2936,6 +3708,7 @@ fn mouse_event_to_sgr(mouse: MouseEvent, area: Rect) -> Option<Vec<u8>> {
         MouseEventKind::ScrollLeft => (66, true),
         MouseEventKind::ScrollRight => (67, true),
     };
+    let button = button + mouse_modifier_code(mouse.modifiers);
 
     Some(
         format!(
@@ -2955,6 +3728,20 @@ fn mouse_button_code(button: MouseButton) -> u16 {
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
     }
+}
+
+fn mouse_modifier_code(modifiers: KeyModifiers) -> u16 {
+    let mut code = 0;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {
+        code += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+    code
 }
 
 fn control_char_bytes(ch: char) -> Option<Vec<u8>> {
@@ -3115,6 +3902,16 @@ fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     });
 }
 
+fn conflicted_files(cwd: &Path) -> Vec<String> {
+    git_output(cwd, ["diff", "--name-only", "--diff-filter=U"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn diff_short_summary(run: &AgentRun) -> Option<String> {
     let status = git_output(&run.cwd, ["status", "--short"]).ok()?;
     if status.trim().is_empty() {
@@ -3254,19 +4051,28 @@ fn ensure_hunk_config(cwd: &Path) -> Result<()> {
     let dir = cwd.join(".hunk");
     fs::create_dir_all(&dir)?;
     let config = dir.join("config.toml");
+    let theme = hunk_light_theme();
     let contents = [
-        "theme = \"paper\"",
-        "mode = \"auto\"",
-        "vcs = \"git\"",
-        "exclude_untracked = false",
-        "line_numbers = true",
-        "wrap_lines = false",
-        "agent_notes = true",
-        "",
+        format!("theme = \"{theme}\""),
+        "mode = \"auto\"".to_string(),
+        "vcs = \"git\"".to_string(),
+        "exclude_untracked = false".to_string(),
+        "line_numbers = true".to_string(),
+        "wrap_lines = false".to_string(),
+        "agent_notes = true".to_string(),
+        String::new(),
     ]
     .join("\n");
     fs::write(config, contents)?;
     Ok(())
+}
+
+fn hunk_light_theme() -> String {
+    match env::var("RUDDER_HUNK_THEME") {
+        Ok(value) if value == "light" => "paper".to_string(),
+        Ok(value) if matches!(value.as_str(), "paper" | "graphite" | "midnight" | "ember") => value,
+        _ => "paper".to_string(),
+    }
 }
 
 fn ensure_git_info_exclude_contains(cwd: &Path, line: &str) -> Result<()> {

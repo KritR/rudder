@@ -131,8 +131,8 @@ impl TerminalPane {
     ///
     /// Output is collected by a background reader thread. Call
     /// [`drain_output`](Self::drain_output) to feed pending bytes into the
-    /// terminal buffer, then [`visible_lines`](Self::visible_lines) to render
-    /// the current screen as plain text.
+    /// terminal buffer, then [`visible_lines_snapshot`](Self::visible_lines_snapshot)
+    /// to render the current screen as plain text without draining again.
     pub fn spawn_shell_or_command(
         command: Option<TerminalCommand>,
         options: TerminalPaneOptions,
@@ -233,6 +233,10 @@ impl TerminalPane {
     /// keeping callers on this app-facing API.
     pub fn visible_lines(&mut self) -> Vec<String> {
         self.drain_output();
+        self.visible_lines_snapshot()
+    }
+
+    pub fn visible_lines_snapshot(&self) -> Vec<String> {
         self.parser
             .screen()
             .rows(0, self.size.cols)
@@ -242,6 +246,10 @@ impl TerminalPane {
 
     pub fn styled_lines(&mut self) -> Vec<Vec<StyledTerminalCell>> {
         self.drain_output();
+        self.styled_lines_snapshot()
+    }
+
+    pub fn styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
         let screen = self.parser.screen();
         let mut rows = Vec::with_capacity(self.size.rows as usize);
 
@@ -289,6 +297,18 @@ impl TerminalPane {
 
     pub fn scrollback(&self) -> usize {
         self.parser.screen().scrollback()
+    }
+
+    pub fn wants_sgr_mouse_events(&mut self) -> bool {
+        self.drain_output();
+        let screen = self.parser.screen();
+        screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+            && screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
+    }
+
+    pub fn uses_alternate_screen(&mut self) -> bool {
+        self.drain_output();
+        self.parser.screen().alternate_screen()
     }
 
     pub fn scrollback_by(&mut self, rows: isize) {

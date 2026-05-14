@@ -20,6 +20,7 @@ import { shortenHome } from "./util.js";
 
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 const ATTENTION_TAIL_BYTES = 64 * 1024;
+const TASK_HISTORY_LIMIT = 100;
 
 type PaneDefaults = {
   tmuxSessionName: string;
@@ -231,6 +232,9 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [effort, setEffort] = useState<EffortLevel | undefined>();
   const [input, setInput] = useState("");
   const inputRef = useRef("");
+  const taskHistoryRef = useRef<string[]>([]);
+  const taskHistoryIndexRef = useRef<number | null>(null);
+  const taskHistoryDraftRef = useRef("");
   const [notice, setNotice] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [commandIndex, setCommandIndex] = useState(0);
@@ -294,6 +298,64 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     setInput(value);
   }, []);
 
+  const resetTaskHistoryNavigation = useCallback(() => {
+    taskHistoryIndexRef.current = null;
+    taskHistoryDraftRef.current = "";
+  }, []);
+
+  const editTaskInput = useCallback((next: string | ((current: string) => string)) => {
+    resetTaskHistoryNavigation();
+    setTaskInput(next);
+  }, [resetTaskHistoryNavigation, setTaskInput]);
+
+  const rememberTaskHistory = useCallback((value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return;
+    }
+    const history = taskHistoryRef.current;
+    history.push(trimmed);
+    if (history.length > TASK_HISTORY_LIMIT) {
+      history.splice(0, history.length - TASK_HISTORY_LIMIT);
+    }
+    resetTaskHistoryNavigation();
+  }, [resetTaskHistoryNavigation]);
+
+  const showTaskHistory = useCallback((direction: "previous" | "next") => {
+    const history = taskHistoryRef.current;
+    if (!history.length) {
+      return false;
+    }
+
+    if (direction === "previous") {
+      const current = taskHistoryIndexRef.current;
+      if (current === null) {
+        taskHistoryDraftRef.current = inputRef.current;
+        taskHistoryIndexRef.current = history.length - 1;
+      } else {
+        taskHistoryIndexRef.current = Math.max(0, Math.min(current, history.length - 1) - 1);
+      }
+      setTaskInput(history[taskHistoryIndexRef.current] ?? "");
+      return true;
+    }
+
+    const current = taskHistoryIndexRef.current;
+    if (current === null) {
+      return false;
+    }
+    if (current + 1 < history.length) {
+      taskHistoryIndexRef.current = current + 1;
+      setTaskInput(history[taskHistoryIndexRef.current] ?? "");
+      return true;
+    }
+
+    taskHistoryIndexRef.current = null;
+    const draft = taskHistoryDraftRef.current;
+    taskHistoryDraftRef.current = "";
+    setTaskInput(draft);
+    return true;
+  }, [setTaskInput]);
+
   useEffect(() => {
     setCommandIndex(0);
   }, [input]);
@@ -348,6 +410,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       await submit(resolvedCommand.value);
       return;
     }
+    rememberTaskHistory(task);
     if (task === "/model") {
       setTaskInput("");
       setNotice("");
@@ -427,7 +490,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     } finally {
       setSubmitting(false);
     }
-  }, [backend, config, defaults.tmuxSessionName, effort, effortOptionsFor, model, modelIndex, modelOptions, modelPickerStep, pendingModel, repoRoot, setTaskInput, submitting]);
+  }, [backend, config, defaults.tmuxSessionName, effort, effortOptionsFor, model, modelIndex, modelOptions, modelPickerStep, pendingModel, rememberTaskHistory, repoRoot, setTaskInput, submitting]);
 
   useInput((chunk, key) => {
     if (key.ctrl && chunk === "c") {
@@ -498,18 +561,26 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     if (returnIndex >= 0 && !key.ctrl && !key.meta) {
       const beforeReturn = stripControlInput(chunk.slice(0, returnIndex));
       if (beforeReturn) {
-        setTaskInput((current) => current + beforeReturn);
+        editTaskInput((current) => current + beforeReturn);
       }
       void submit();
       return;
     }
     if (isLineClear(chunk, key)) {
-      setTaskInput("");
+      editTaskInput("");
       setNotice("");
       return;
     }
     if (isWordDelete(chunk, key)) {
-      setTaskInput((current) => deletePreviousWord(current));
+      editTaskInput((current) => deletePreviousWord(current));
+      return;
+    }
+    if (taskHistoryIndexRef.current !== null && key.upArrow) {
+      showTaskHistory("previous");
+      return;
+    }
+    if (taskHistoryIndexRef.current !== null && key.downArrow) {
+      showTaskHistory("next");
       return;
     }
     if (commandMenuOpen) {
@@ -522,7 +593,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         return;
       }
       if (key.escape) {
-        setTaskInput("");
+        editTaskInput("");
         setNotice("");
         return;
       }
@@ -531,7 +602,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       if (commandMenuOpen) {
         const command = commandOptions[commandIndex];
         if (command?.complete) {
-          setTaskInput(command.complete);
+          editTaskInput(command.complete);
           setNotice("");
           return;
         }
@@ -543,12 +614,20 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       void submit();
       return;
     }
+    if (key.upArrow) {
+      showTaskHistory("previous");
+      return;
+    }
+    if (key.downArrow) {
+      showTaskHistory("next");
+      return;
+    }
     if (key.backspace || key.delete || chunk === "\u007f" || chunk === "\b") {
-      setTaskInput((current) => current.slice(0, -1));
+      editTaskInput((current) => current.slice(0, -1));
       return;
     }
     if (chunk && !key.ctrl && !key.meta) {
-      setTaskInput((current) => current + chunk);
+      editTaskInput((current) => current + chunk);
     }
   });
 
@@ -569,7 +648,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
           ? <EffortMenu option={pendingModel ?? modelOptions[modelIndex]} selected={effortIndex} backend={toNativeBackend(pendingModel?.backend ?? backend)} options={effortOptionsFor(toNativeBackend(pendingModel?.backend ?? backend))} />
           : <ModelMenu options={modelOptions} selected={modelIndex} backend={backend} />
       ) : (
-        <Text color="gray">Enter start  Tab focus pane  / commands  {backend} {configured} {configuredEffort}</Text>
+        <Text color="gray">Enter start  Up/Down history  Tab focus pane  / commands  {backend} {configured} {configuredEffort}</Text>
       )}
     </Box>
   );
