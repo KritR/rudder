@@ -196,7 +196,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/rudder/setup/github") {
-      await handleGithubCredentialSetup(req, res);
+      await handleOAuthCredentialSetup(req, res, "github");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/rudder/setup/google") {
+      await handleOAuthCredentialSetup(req, res, "google");
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/cli/login") {
@@ -505,7 +509,11 @@ async function handleGithubAppSetupCallback(url: URL, res: ServerResponse): Prom
 </body></html>`);
 }
 
-async function handleGithubCredentialSetup(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleOAuthCredentialSetup(
+  req: IncomingMessage,
+  res: ServerResponse,
+  provider: "github" | "google",
+): Promise<void> {
   const authContext = requireBearer(req);
   requireAdmin(authContext);
   const body = await readJsonBody(req);
@@ -514,12 +522,13 @@ async function handleGithubCredentialSetup(req: IncomingMessage, res: ServerResp
   if (!clientId || !clientSecret) {
     throw badRequest("clientId and clientSecret are required");
   }
-  setSetting("github_client_id", clientId.trim());
-  setSetting("github_client_secret", clientSecret.trim());
+  setSetting(`${provider}_client_id`, clientId.trim());
+  setSetting(`${provider}_client_secret`, clientSecret.trim());
   refreshAuthHandler(true);
   await persistDatabaseToS3();
   sendJson(res, 200, {
     ok: true,
+    provider,
     auth: configuredProviders(),
   });
 }
