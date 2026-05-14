@@ -597,7 +597,7 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, gutter: Gutter) {
     let style = Style::default().fg(Color::DarkGray);
     let line = match gutter {
         Gutter::Horizontal => "─".repeat(area.width as usize),
-        Gutter::Vertical => "│".to_string(),
+        Gutter::Vertical => " ".to_string(),
     };
 
     let lines = vec![Line::from(Span::styled(line, style)); area.height as usize];
@@ -792,7 +792,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
     let border_style = if focused {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -800,7 +802,7 @@ fn pane_block(title: &'static str, focused: bool) -> Block<'static> {
     let title_style = if focused {
         Style::default()
             .fg(Color::Black)
-            .bg(Color::Red)
+            .bg(Color::Blue)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
