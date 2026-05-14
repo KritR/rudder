@@ -44,7 +44,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
 export async function runTmuxAgentPane(defaults: PaneDefaults): Promise<void> {
   const instance = render(<AgentPane defaults={defaults} />, {
     exitOnCtrlC: false,
-    maxFps: 5,
+    maxFps: 20,
   });
   await instance.waitUntilExit();
 }
@@ -52,7 +52,7 @@ export async function runTmuxAgentPane(defaults: PaneDefaults): Promise<void> {
 export async function runTmuxTaskPane(defaults: PaneDefaults): Promise<void> {
   const instance = render(<TaskPane defaults={defaults} />, {
     exitOnCtrlC: false,
-    maxFps: 10,
+    maxFps: 30,
   });
   await instance.waitUntilExit();
 }
@@ -60,13 +60,12 @@ export async function runTmuxTaskPane(defaults: PaneDefaults): Promise<void> {
 export async function runTmuxWorkerIdle(defaults: PaneDefaults): Promise<void> {
   const instance = render(<WorkerIdle defaults={defaults} />, {
     exitOnCtrlC: false,
-    maxFps: 1,
+    maxFps: 10,
   });
   await instance.waitUntilExit();
 }
 
 function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement {
-  useHiddenCursor();
   const size = useWindowSize();
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [branch, setBranch] = useState("HEAD");
@@ -76,56 +75,27 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   const [notice, setNotice] = useState("");
   const [deleteIntent, setDeleteIntent] = useState<{ runId: string; canMerge: boolean } | null>(null);
   const finishedRef = useRef<Set<string> | null>(null);
-  const agentSnapshotRef = useRef("");
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
+    await reconcileNativeTerminals(root).catch(() => undefined);
     const [nextBranch, nextConfig, nextRuns, state] = await Promise.all([
       currentBranch(root),
       loadConfig(),
       listRuns(root),
       loadTmuxDashboardState(root, defaults.tmuxSessionName),
     ]);
-    const nextSelectedRunId = state?.selectedRunId ?? selectedRunId ?? nextRuns[0]?.id;
-    const nextSnapshot = JSON.stringify({
-      root,
-      branch: nextBranch,
-      config: dashboardConfigSnapshot(nextConfig),
-      runs: nextRuns.map(runSnapshot),
-      selectedRunId: nextSelectedRunId,
-    });
-    if (nextSnapshot === agentSnapshotRef.current) {
-      return;
-    }
-    agentSnapshotRef.current = nextSnapshot;
     setRepoRoot(root);
     setBranch(nextBranch);
     setConfig(nextConfig);
     setRuns(nextRuns);
-    setSelectedRunId(nextSelectedRunId);
-  }, [defaults.tmuxSessionName, selectedRunId]);
+    setSelectedRunId((current) => state?.selectedRunId ?? current ?? nextRuns[0]?.id);
+  }, [defaults.tmuxSessionName]);
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 2000);
+    const timer = setInterval(() => void refresh(), 1000);
     return () => clearInterval(timer);
-  }, [refresh]);
-
-  useEffect(() => {
-    let stopped = false;
-    const reconcile = async () => {
-      if (stopped) {
-        return;
-      }
-      const root = findRepoRoot();
-      await reconcileNativeTerminals(root).catch(() => undefined);
-      await refresh();
-    };
-    const timer = setInterval(() => void reconcile(), 5000);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
   }, [refresh]);
 
   useEffect(() => {
@@ -242,7 +212,6 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
 }
 
 function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement {
-  useHiddenCursor();
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [config, setConfig] = useState<RudderConfig | null>(null);
   const [backend, setBackend] = useState<NativeBackendId>(toNativeBackend(defaults.backend ?? "claude"));
@@ -263,7 +232,6 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [claudeEfforts, setClaudeEfforts] = useState<EffortOption[]>([]);
   const [codexEfforts, setCodexEfforts] = useState<EffortOption[]>([]);
   const [taskPaneId, setTaskPaneId] = useState<string | undefined>();
-  const taskSnapshotRef = useRef("");
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
@@ -271,33 +239,18 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       loadConfig(),
       loadTmuxDashboardState(root, defaults.tmuxSessionName),
     ]);
-    const nextBackend = state?.backend ?? toNativeBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
-    const nextModel = state?.model ?? defaults.model;
-    const nextEffort = state?.effort ?? effortForBackend(nextBackend, nextConfig);
-    const nextTaskPaneId = state?.taskPaneId;
-    const nextSnapshot = JSON.stringify({
-      root,
-      config: dashboardConfigSnapshot(nextConfig),
-      backend: nextBackend,
-      model: nextModel,
-      effort: nextEffort,
-      taskPaneId: nextTaskPaneId,
-    });
-    if (nextSnapshot === taskSnapshotRef.current) {
-      return;
-    }
-    taskSnapshotRef.current = nextSnapshot;
     setRepoRoot(root);
     setConfig(nextConfig);
+    const nextBackend = state?.backend ?? toNativeBackend(defaults.backend ?? nextConfig.lastUsedBackend ?? nextConfig.defaultBackend);
     setBackend(nextBackend);
-    setModel(nextModel);
-    setEffort(nextEffort);
-    setTaskPaneId(nextTaskPaneId);
+    setModel(state?.model ?? defaults.model);
+    setEffort(state?.effort ?? effortForBackend(nextBackend, nextConfig));
+    setTaskPaneId(state?.taskPaneId);
   }, [defaults.backend, defaults.model, defaults.tmuxSessionName]);
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 3000);
+    const timer = setInterval(() => void refresh(), 1500);
     return () => clearInterval(timer);
   }, [refresh]);
 
@@ -644,17 +597,7 @@ function EffortMenu({ option, selected, backend, options }: { option?: ModelOpti
 }
 
 function WorkerIdle(_props: { defaults: PaneDefaults }): React.ReactElement {
-  useHiddenCursor();
   return <Box />;
-}
-
-function useHiddenCursor(): void {
-  useEffect(() => {
-    process.stdout.write("\u001b[?25l");
-    return () => {
-      process.stdout.write("\u001b[?25h");
-    };
-  }, []);
 }
 
 function toNativeBackend(backend: BackendId): NativeBackendId {
@@ -688,39 +631,6 @@ function notifyFinishedRuns(runs: RunRecord[], ref: React.MutableRefObject<Set<s
 
 function isTerminalRun(run: RunRecord): boolean {
   return ["completed", "failed", "cancelled", "merged", "merge-conflict"].includes(run.status);
-}
-
-function dashboardConfigSnapshot(config: RudderConfig | null): unknown {
-  if (!config) {
-    return null;
-  }
-  return {
-    defaultBackend: config.defaultBackend,
-    lastUsedBackend: config.lastUsedBackend,
-    claude: {
-      model: config.backends.claude?.model,
-      effort: config.backends.claude?.effort,
-    },
-    codex: {
-      model: config.backends.codex?.model,
-      effort: config.backends.codex?.effort,
-      reasoningEffort: config.backends.codex?.reasoningEffort,
-    },
-  };
-}
-
-function runSnapshot(run: RunRecord): unknown {
-  return {
-    id: run.id,
-    task: run.task,
-    status: run.status,
-    backend: run.backend,
-    model: run.model,
-    effort: run.effort,
-    paneId: run.terminal?.paneId,
-    worktree: run.worktree.path,
-    updatedAt: run.updatedAt,
-  };
 }
 
 function playCompletionSound(): void {
