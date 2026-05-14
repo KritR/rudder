@@ -13,9 +13,9 @@ import {
   loadConfig,
   loadRunRecord,
   outputPath,
+  rememberBackendSelection,
   resolveRun,
   runDir,
-  saveConfig,
   saveRunRecord,
 } from "./state.js";
 import type { BackendId, EffortLevel, JsonValue, RunRecord, RudderEvent, VerificationResult } from "./types.js";
@@ -59,7 +59,7 @@ export async function startRun(params: {
   const model =
     params.model ??
     (backend === "claude"
-      ? normalizeClaudeDefault(config.backends.claude?.model)
+      ? config.backends.claude?.model
       : backend === "codex"
         ? config.backends.codex?.model
         : config.backends.acpx?.model);
@@ -99,8 +99,13 @@ export async function startRun(params: {
   });
   await writeAgentContext(repoRoot);
 
-  config.lastUsedBackend = backend;
-  await saveConfig(config);
+  await rememberBackendSelection({
+    backend,
+    model: params.model,
+    effort: params.effort,
+    updateModel: params.model !== undefined,
+    updateEffort: params.effort !== undefined,
+  });
   const worker = spawn(process.execPath, [process.argv[1] ?? "", "__worker", "--repo", repoRoot, "--run", run.id], {
     cwd: repoRoot,
     detached: true,
@@ -161,7 +166,7 @@ export async function startNativeRun(params: {
   const model =
     params.model ??
     (backend === "claude"
-      ? normalizeClaudeDefault(config.backends.claude?.model)
+      ? config.backends.claude?.model
       : config.backends.codex?.model);
   const effort = params.effort ?? effortForBackend(backend, config);
   const baseCommit = await currentCommit(repoRoot);
@@ -196,8 +201,13 @@ export async function startNativeRun(params: {
   });
   await writeAgentContext(repoRoot);
 
-  config.lastUsedBackend = backend;
-  await saveConfig(config);
+  await rememberBackendSelection({
+    backend,
+    model: params.model,
+    effort: params.effort,
+    updateModel: params.model !== undefined,
+    updateEffort: params.effort !== undefined,
+  });
 
   try {
     const backendAdapter = getBackend(backend);
@@ -608,10 +618,6 @@ async function ensureLine(filePath: string, line: string): Promise<void> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function normalizeClaudeDefault(model: string | undefined): string | undefined {
-  return model === "opus" ? "sonnet" : model;
 }
 
 function toNativeBackend(backend: BackendId): Exclude<BackendId, "acpx"> {

@@ -12,7 +12,7 @@ import {
   stopRun,
   watchRun,
 } from "./run-manager.js";
-import { loadConfig } from "./state.js";
+import { loadConfig, rememberBackendSelection } from "./state.js";
 import type { BackendId } from "./types.js";
 import { shortenHome } from "./util.js";
 
@@ -83,10 +83,17 @@ async function handleSlashCommand(line: string, state: ShellState): Promise<bool
     case "q":
       return true;
     case "backend":
-      setBackend(state, args[0]);
+      if (setBackend(state, args[0])) {
+        await rememberBackendSelection({ backend: state.backend });
+      }
       return false;
     case "model":
       state.model = args.join(" ") || undefined;
+      await rememberBackendSelection({
+        backend: state.backend,
+        model: state.model,
+        updateModel: true,
+      });
       console.log(`model: ${state.model || "(backend default)"}`);
       return false;
     case "worktree":
@@ -181,14 +188,15 @@ async function watchFromShell(runId?: string): Promise<void> {
   }
 }
 
-function setBackend(state: ShellState, value?: string): void {
+function setBackend(state: ShellState, value?: string): boolean {
   if (value !== "claude" && value !== "codex" && value !== "acpx") {
     console.log("usage: /backend claude|codex|acpx");
-    return;
+    return false;
   }
   state.backend = value;
   state.model = undefined;
   console.log(`backend: ${formatBackend(state)}`);
+  return true;
 }
 
 function setWorktree(state: ShellState, value?: string): void {

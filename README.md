@@ -121,6 +121,10 @@ model, then the effort level supported by that model.
   `gpt-5.4-codex`, and other discovered GPT-5/Codex models.
 - `auto` effort means Rudder does not pass an effort override.
 
+Rudder saves the last selected provider and model, plus effort when chosen, in
+`~/.rudder/config.json`, so the same defaults are used when you open a new
+dashboard or shell session.
+
 Rudder refreshes model metadata from `https://models.dev/api.json` before the
 dashboard starts and caches it in `~/.rudder/models-dev.json`. If the network is
 unavailable, it falls back to local Claude session history and Codex's local

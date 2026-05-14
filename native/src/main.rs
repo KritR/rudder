@@ -199,9 +199,22 @@ enum SuggestionAction {
     ShowHelp,
 }
 
+struct InitialSelection {
+    backend: Backend,
+    model: String,
+    effort: Option<EffortLevel>,
+}
+
+#[derive(Default)]
+struct CliSelection {
+    backend: Option<Backend>,
+    model: Option<String>,
+}
+
 impl App {
     fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let selection = initial_selection();
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
@@ -212,9 +225,9 @@ impl App {
             task_cursor: 0,
             agents: Vec::new(),
             selected_agent: 0,
-            backend: Backend::Claude,
-            model: default_model_for(Backend::Claude).to_string(),
-            effort: default_effort_for(Backend::Claude, default_model_for(Backend::Claude)),
+            backend: selection.backend,
+            model: selection.model,
+            effort: selection.effort,
             notice: None,
             delete_pending: None,
             picker_index: 0,
@@ -222,6 +235,20 @@ impl App {
             worker_area: None,
             task_area: None,
         }
+    }
+
+    fn set_model_defaults(
+        &mut self,
+        backend: Backend,
+        model: String,
+        effort: Option<EffortLevel>,
+    ) -> Option<String> {
+        self.backend = backend;
+        self.model = model;
+        self.effort = effort;
+        save_model_defaults(self.backend, &self.model, self.effort)
+            .err()
+            .map(|error| format!("config warning: {error}"))
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -529,18 +556,18 @@ impl App {
                 model,
                 effort,
             } => {
-                self.backend = backend;
-                self.model = model;
-                self.effort = effort;
+                let warning = self.set_model_defaults(backend, model, effort);
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
-                self.notice = Some(format!(
-                    "{} {}({})",
-                    self.backend.as_str(),
-                    self.model,
-                    effort_label(self.effort)
-                ));
+                self.notice = warning.or_else(|| {
+                    Some(format!(
+                        "{} {}({})",
+                        self.backend.as_str(),
+                        self.model,
+                        effort_label(self.effort)
+                    ))
+                });
             }
             SuggestionAction::ShowHelp => {
                 self.task_input.clear();
@@ -739,40 +766,47 @@ impl App {
                     }
                     [provider, model] if provider_backend(provider).is_some() => {
                         let backend = provider_backend(provider).unwrap();
-                        self.backend = backend;
-                        self.model = (*model).to_string();
-                        self.effort = default_effort_for(backend, model);
-                        self.notice = Some(format!(
-                            "{} {}({})",
-                            self.backend.as_str(),
-                            self.model,
-                            effort_label(self.effort)
-                        ));
+                        let warning = self.set_model_defaults(
+                            backend,
+                            (*model).to_string(),
+                            default_effort_for(backend, model),
+                        );
+                        self.notice = warning.or_else(|| {
+                            Some(format!(
+                                "{} {}({})",
+                                self.backend.as_str(),
+                                self.model,
+                                effort_label(self.effort)
+                            ))
+                        });
                     }
                     [provider, model, effort, ..] if provider_backend(provider).is_some() => {
                         let backend = provider_backend(provider).unwrap();
                         let parsed_effort = parse_effort_arg(effort);
-                        self.backend = backend;
-                        self.model = (*model).to_string();
-                        self.effort = parsed_effort;
-                        self.notice = Some(format!(
-                            "{} {}({})",
-                            self.backend.as_str(),
-                            self.model,
-                            effort_label(self.effort)
-                        ));
+                        let warning =
+                            self.set_model_defaults(backend, (*model).to_string(), parsed_effort);
+                        self.notice = warning.or_else(|| {
+                            Some(format!(
+                                "{} {}({})",
+                                self.backend.as_str(),
+                                self.model,
+                                effort_label(self.effort)
+                            ))
+                        });
                     }
                     _ => {
                         let model = args.join(" ");
-                        self.backend = backend_for_model(&model);
-                        self.model = model;
-                        self.effort = default_effort_for(self.backend, &self.model);
-                        self.notice = Some(format!(
-                            "{} {}({})",
-                            self.backend.as_str(),
-                            self.model,
-                            effort_label(self.effort)
-                        ));
+                        let backend = backend_for_model(&model);
+                        let effort = default_effort_for(backend, &model);
+                        let warning = self.set_model_defaults(backend, model, effort);
+                        self.notice = warning.or_else(|| {
+                            Some(format!(
+                                "{} {}({})",
+                                self.backend.as_str(),
+                                self.model,
+                                effort_label(self.effort)
+                            ))
+                        });
                     }
                 }
                 true
@@ -1853,6 +1887,276 @@ fn map_vt100_color(color: vt100::Color) -> Option<Color> {
         vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
     }
 }
+
+fn initial_selection() -> InitialSelection {
+    let cli = cli_selection();
+    let config = load_rudder_config();
+    let backend = cli
+        .backend
+        .or_else(|| config.as_ref().and_then(config_backend))
+        .unwrap_or(Backend::Claude);
+    let cli_model = cli.model.filter(|model| !model.trim().is_empty());
+    let should_remember = cli.backend.is_some() || cli_model.is_some();
+    let model = cli_model
+        .clone()
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config_model(config, backend))
+        })
+        .unwrap_or_else(|| default_model_for(backend).to_string());
+    let effort = if cli_model.is_some() {
+        default_effort_for(backend, &model)
+    } else {
+        config
+            .as_ref()
+            .and_then(|config| config_effort(config, backend))
+            .or_else(|| default_effort_for(backend, &model))
+    };
+
+    if should_remember {
+        let _ = save_model_defaults(backend, &model, effort);
+    }
+
+    InitialSelection {
+        backend,
+        model,
+        effort,
+    }
+}
+
+fn cli_selection() -> CliSelection {
+    let mut selection = CliSelection::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => break,
+            "--backend" | "-b" => {
+                if let Some(value) = args.next() {
+                    selection.backend = provider_backend(&value);
+                }
+            }
+            "--model" | "-m" => {
+                selection.model = args.next();
+            }
+            _ if arg.starts_with("--backend=") => {
+                selection.backend = provider_backend(&arg["--backend=".len()..]);
+            }
+            _ if arg.starts_with("--model=") => {
+                selection.model = Some(arg["--model=".len()..].to_string());
+            }
+            _ => {}
+        }
+    }
+    selection
+}
+
+fn load_rudder_config() -> Option<serde_json::Value> {
+    let path = rudder_config_path()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn config_backend(config: &serde_json::Value) -> Option<Backend> {
+    config
+        .get("lastUsedBackend")
+        .and_then(serde_json::Value::as_str)
+        .and_then(provider_backend)
+        .or_else(|| {
+            config
+                .get("defaultBackend")
+                .and_then(serde_json::Value::as_str)
+                .and_then(provider_backend)
+        })
+}
+
+fn config_model(config: &serde_json::Value, backend: Backend) -> Option<String> {
+    config
+        .get("backends")?
+        .get(backend.as_str())?
+        .get("model")?
+        .as_str()
+        .filter(|model| !model.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn config_effort(config: &serde_json::Value, backend: Backend) -> Option<EffortLevel> {
+    let backend_config = config.get("backends")?.get(backend.as_str())?;
+    let keys: &[&str] = match backend {
+        Backend::Claude => &["effort", "reasoningEffort"],
+        Backend::Codex => &["reasoningEffort", "effort"],
+    };
+    keys.iter().find_map(|key| {
+        backend_config
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(EffortLevel::parse)
+    })
+}
+
+fn save_model_defaults(backend: Backend, model: &str, effort: Option<EffortLevel>) -> Result<()> {
+    let path = rudder_config_path().context("could not determine Rudder config path")?;
+    let mut config = load_rudder_config().unwrap_or_else(default_config_value);
+    if !config.is_object() {
+        config = default_config_value();
+    }
+    ensure_config_defaults(&mut config);
+
+    let root = config
+        .as_object_mut()
+        .context("Rudder config root is not an object")?;
+    root.insert(
+        "lastUsedBackend".to_string(),
+        serde_json::Value::String(backend.as_str().to_string()),
+    );
+    let backends = root
+        .entry("backends".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !backends.is_object() {
+        *backends = serde_json::json!({});
+    }
+    let backends = backends
+        .as_object_mut()
+        .context("Rudder backends config is not an object")?;
+    let backend_config = backends
+        .entry(backend.as_str().to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !backend_config.is_object() {
+        *backend_config = serde_json::json!({});
+    }
+    let backend_config = backend_config
+        .as_object_mut()
+        .context("Rudder backend config is not an object")?;
+    if model.trim().is_empty() {
+        backend_config.remove("model");
+    } else {
+        backend_config.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    match backend {
+        Backend::Claude => {
+            if let Some(effort) = effort {
+                backend_config.insert(
+                    "effort".to_string(),
+                    serde_json::Value::String(effort.as_str().to_string()),
+                );
+            } else {
+                backend_config.remove("effort");
+            }
+        }
+        Backend::Codex => {
+            if let Some(effort) = effort {
+                backend_config.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::Value::String(effort.as_str().to_string()),
+                );
+            } else {
+                backend_config.remove("reasoningEffort");
+            }
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    fs::write(
+        &temp,
+        format!("{}\n", serde_json::to_string_pretty(&config)?),
+    )?;
+    fs::rename(&temp, &path)?;
+    set_private_file_mode(&path);
+    Ok(())
+}
+
+fn ensure_config_defaults(config: &mut serde_json::Value) {
+    let Some(root) = config.as_object_mut() else {
+        return;
+    };
+    root.entry("version".to_string())
+        .or_insert(serde_json::json!(1));
+    root.entry("defaultBackend".to_string())
+        .or_insert(serde_json::json!("claude"));
+    root.entry("runPolicy".to_string()).or_insert_with(|| {
+        serde_json::json!({
+            "sameCheckout": "single-active",
+            "concurrentPromptMode": "worktree",
+            "mergeMode": "manual-on-conflict"
+        })
+    });
+    root.entry("acpx".to_string())
+        .or_insert_with(|| serde_json::json!({ "install": "latest" }));
+    root.entry("backends".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+}
+
+fn default_config_value() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "defaultBackend": "claude",
+        "runPolicy": {
+            "sameCheckout": "single-active",
+            "concurrentPromptMode": "worktree",
+            "mergeMode": "manual-on-conflict"
+        },
+        "acpx": { "install": "latest" },
+        "backends": {
+            "claude": {
+                "profileId": "anthropic:claude-code",
+                "model": "sonnet"
+            },
+            "codex": {
+                "profileId": "openai-codex:default",
+                "model": "gpt-5.5"
+            },
+            "acpx": {
+                "model": "gpt-5.5"
+            }
+        }
+    })
+}
+
+fn rudder_config_path() -> Option<PathBuf> {
+    let home = if let Some(value) = std::env::var_os("RUDDER_HOME") {
+        let value = PathBuf::from(value);
+        if !value.as_os_str().is_empty() {
+            value
+        } else {
+            user_home_dir()?.join(".rudder")
+        }
+    } else {
+        user_home_dir()?.join(".rudder")
+    };
+    Some(home.join("config.json"))
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+#[cfg(unix)]
+fn set_private_file_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_private_file_mode(_path: &Path) {}
 
 fn default_model_for(backend: Backend) -> &'static str {
     match backend {

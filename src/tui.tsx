@@ -10,6 +10,7 @@ import {
   listRuns,
   loadConfig,
   outputPath,
+  rememberBackendSelection,
 } from "./state.js";
 import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
 import type { BackendId, RunRecord, RudderConfig, RudderEvent, RunStatus } from "./types.js";
@@ -276,7 +277,9 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         return;
       case "backend":
         if (isInteractiveBackend(args[0])) {
-          chooseBackend(args[0], setBackend, setModel, setNotice);
+          const nextBackend = args[0];
+          chooseBackend(nextBackend, setBackend, setModel, setNotice);
+          setConfig(await rememberBackendSelection({ backend: nextBackend }));
         } else {
           setNotice("Usage: /backend claude|codex");
         }
@@ -311,6 +314,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         } else {
           const nextModel = args.join(" ");
           setModel(nextModel);
+          setConfig(await rememberBackendSelection({
+            backend,
+            model: nextModel,
+            updateModel: true,
+          }));
           setNotice(`Model ${nextModel}`);
         }
         setInput("");
@@ -360,7 +368,14 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     setModelMenuOpen(false);
     setModelMenuIndex(index);
     setNotice(option.value ? `Model ${option.value}` : "Using backend default model");
-  }, [modelOptions]);
+    void rememberBackendSelection({
+      backend,
+      model: option.value,
+      updateModel: true,
+    }).then(setConfig).catch((error) => {
+      setNotice(error instanceof Error ? error.message : String(error));
+    });
+  }, [backend, modelOptions]);
 
   const selectCommandOption = useCallback((index: number) => {
     const option = commandOptions[index];
@@ -1131,7 +1146,7 @@ function modelForBackend(backend: BackendId, config: RudderConfig | null): strin
     return undefined;
   }
   if (backend === "claude") {
-    return config.backends.claude?.model === "opus" ? "sonnet" : config.backends.claude?.model;
+    return config.backends.claude?.model;
   }
   if (backend === "codex") {
     return config.backends.codex?.model;
