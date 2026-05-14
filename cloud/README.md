@@ -57,10 +57,12 @@ Google/GitHub OAuth client IDs and client secrets still need to be created in
 the provider consoles and added as App Runner secrets before the hosted login
 flow can go live.
 
-Until provider OAuth clients are installed, the CLI can still log in through an
-already-authenticated GitHub CLI or GitHub's browser device flow. `rudder login`
-sends the resulting GitHub token to `/api/cli/login/github-token`; the server
-verifies it with GitHub and stores only a hashed Rudder Cloud token.
+Until provider OAuth clients are installed, login still works through an
+already-authenticated GitHub CLI or GitHub's device flow. `rudder login` sends
+the resulting GitHub token to `/api/cli/login/github-token`; the server verifies
+it with GitHub and stores only a hashed Rudder Cloud token. The hosted
+`/cli/login` page also exposes a GitHub device-login path so browser login does
+not dead-end while Google/GitHub Better Auth provider secrets are missing.
 
 OAuth callback URLs:
 
