@@ -34,7 +34,7 @@ import {
   removeWorktree,
 } from "./git.js";
 import { ensureDir, isTty, newRunId, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
-import { createAgentPane, killPane, respawnPane, selectPane } from "./tmux.js";
+import { createAgentPane, killPane, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
 
@@ -616,14 +616,14 @@ function toNativeBackend(backend: BackendId): Exclude<BackendId, "acpx"> {
   return backend === "codex" ? "codex" : "claude";
 }
 
-function effortForBackend(backend: BackendId, config: Awaited<ReturnType<typeof loadConfig>>): EffortLevel {
+function effortForBackend(backend: BackendId, config: Awaited<ReturnType<typeof loadConfig>>): EffortLevel | undefined {
   if (backend === "claude") {
-    return config.backends.claude?.effort ?? "xhigh";
+    return config.backends.claude?.effort;
   }
   if (backend === "codex") {
-    return config.backends.codex?.reasoningEffort ?? config.backends.codex?.effort ?? "xhigh";
+    return config.backends.codex?.reasoningEffort ?? config.backends.codex?.effort;
   }
-  return config.backends.acpx?.reasoningEffort ?? config.backends.acpx?.effort ?? "xhigh";
+  return config.backends.acpx?.reasoningEffort ?? config.backends.acpx?.effort;
 }
 
 function shortTask(task: string): string {
@@ -833,6 +833,98 @@ export async function cleanupRuns(force = false): Promise<void> {
     console.log(`Removed ${shortenHome(run.worktree.path)}`);
   }
   await writeAgentContext(repoRoot);
+}
+
+export async function reconcileNativeTerminals(repoRoot: string): Promise<void> {
+  const runs = await listRuns(repoRoot);
+  let touched = false;
+  for (const run of runs) {
+    if (run.terminal?.kind !== "tmux") {
+      continue;
+    }
+    if (run.status === "running") {
+      const exitCode = await paneExitStatus(run.terminal.paneId).catch(() => null);
+      if (exitCode === null) {
+        continue;
+      }
+      run.process = {
+        ...(run.process ?? {}),
+        endedAt: nowIso(),
+        exitCode,
+        signal: null,
+      };
+      if (exitCode !== 0) {
+        run.status = "failed";
+        await saveRunRecord(run);
+        await emit(run, { ts: nowIso(), runId: run.id, type: "run.failed", message: `Backend exited with ${exitCode}` });
+        touched = true;
+        continue;
+      }
+
+      run.status = "verifying";
+      await saveRunRecord(run);
+      const verification = await verifyRun(run);
+      run.verification = verification;
+      await saveRunRecord(run);
+      await emit(run, {
+        ts: nowIso(),
+        runId: run.id,
+        type: "verifier.result",
+        message: verification.notes,
+        data: verification as unknown as JsonValue,
+      });
+
+      if (await shouldAutoSteer(run, verification)) {
+        const waitingSince = nowIso();
+        run.status = "steering";
+        run.autoSteer = {
+          count: run.autoSteer?.count ?? 0,
+          max: run.autoSteer?.max ?? 2,
+          waitingSince,
+        };
+        await saveRunRecord(run);
+        await emit(run, { ts: waitingSince, runId: run.id, type: "steerer.waiting", message: "Waiting 10 seconds before automatic steering" });
+      } else {
+        run.status = verification.shouldContinue ? "failed" : "completed";
+        await saveRunRecord(run);
+        await emit(run, {
+          ts: nowIso(),
+          runId: run.id,
+          type: run.status === "completed" ? "run.completed" : "run.failed",
+          message: run.status === "completed" ? "Run completed" : `Run failed verification: ${verification.missing.join("; ")}`,
+        });
+      }
+      touched = true;
+      continue;
+    }
+
+    if (run.status === "steering" && run.autoSteer?.waitingSince && Date.now() - Date.parse(run.autoSteer.waitingSince) >= AUTO_STEER_DELAY_MS) {
+      const steeringPrompt = buildSteeringPrompt(run.verification ?? { satisfied: [], missing: [], notes: "", shouldContinue: false });
+      run.currentPrompt = steeringPrompt;
+      run.turns = [...(run.turns ?? []), { ts: nowIso(), prompt: steeringPrompt, source: "steerer" }];
+      run.autoSteer = {
+        count: (run.autoSteer?.count ?? 0) + 1,
+        max: run.autoSteer?.max ?? 2,
+      };
+      run.status = "running";
+      await saveRunRecord(run);
+      await emit(run, { ts: nowIso(), runId: run.id, type: "steerer.prompt", message: "Automatic steering prompt sent", data: { prompt: steeringPrompt } });
+      const spec = await createSpec(run);
+      const command = nativeAgentCommand({ run, prompt: steeringPrompt, contract: renderContract(spec) });
+      await respawnPane({
+        paneId: run.terminal.paneId,
+        cwd: run.worktree.path,
+        title: `${run.backend}:${shortTask(run.task)}`,
+        command,
+        logPath: outputPath(repoRoot, run.id),
+      });
+      await emit(run, { ts: nowIso(), runId: run.id, type: "run.started", message: `${run.backend} pane restarted`, data: { paneId: run.terminal.paneId } });
+      touched = true;
+    }
+  }
+  if (touched) {
+    await writeAgentContext(repoRoot);
+  }
 }
 
 async function emit(run: RunRecord, event: RudderEvent): Promise<void> {

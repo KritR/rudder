@@ -122,10 +122,12 @@ legacy full-screen stream TUI.
 ## Models
 
 `/model` opens a bounded picker for Claude and Codex models. Pick a model, then
-pick the reasoning effort (`low`, `medium`, `high`, `xhigh`, and `max` where the
-backend supports it). Rudder passes both choices to the underlying CLI: Claude
-uses `claude --model <value> --effort <value>`, and Codex uses
-`codex --model <value> -c model_reasoning_effort="<value>"`.
+pick effort. The default is `auto`, which means Rudder does not pass an effort
+override and lets the selected backend/model choose its own default. Explicit
+effort values are discovered from the installed CLI when available. If you pick
+one, Rudder passes it through: Claude uses `claude --model <value> --effort
+<value>`, and Codex uses `codex --model <value> -c
+model_reasoning_effort="<value>"`.
 
 - Claude is alias-first like Claude Code itself: `sonnet`, `sonnet[1m]`,
   `opus`, `opus[1m]`, and `haiku` appear before explicit model IDs.

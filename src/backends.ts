@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore } from "./types.js";
 import { loadAuthStore, saveRunRecord } from "./state.js";
+import { normalizeEffortForBackend } from "./effort.js";
 import { commandExists, lineSplitBuffer, nowIso, parseJsonLine } from "./util.js";
 
 export function getBackend(id: BackendId): BackendAdapter {
@@ -32,13 +33,13 @@ function claudeBackend(): BackendAdapter {
       };
       await saveRunRecord(request.run);
       const env = await backendEnv("anthropic");
-      const effort = request.run.effort || "xhigh";
-      const args = [
+      const effort = normalizeEffortForBackend("claude", request.run.effort);
+      const args = compact([
         "-p",
         request.prompt,
         "--model",
         request.run.model || "sonnet",
-        "--effort",
+        effort ? "--effort" : undefined,
         effort,
         "--permission-mode",
         "bypassPermissions",
@@ -52,7 +53,7 @@ function claudeBackend(): BackendAdapter {
         ...(isFollowUp && existingSessionId
           ? ["--resume", existingSessionId, "--fork-session"]
           : ["--session-id", sessionId]),
-      ];
+      ]);
       return await spawnAndStream({
         command: "claude",
         args,
@@ -75,8 +76,8 @@ function codexBackend(): BackendAdapter {
     },
     async run(request, emit) {
       const env = await backendEnv("openai");
-      const effort = codexEffort(request.run.effort);
-      const args = [
+      const effort = normalizeEffortForBackend("codex", request.run.effort);
+      const args = compact([
         "exec",
         "--json",
         "--color",
@@ -90,14 +91,14 @@ function codexBackend(): BackendAdapter {
         "goals",
         "-c",
         'approval_policy="never"',
-        "-c",
-        `model_reasoning_effort="${effort}"`,
+        effort ? "-c" : undefined,
+        effort ? `model_reasoning_effort="${effort}"` : undefined,
         "-c",
         'model_reasoning_summary="detailed"',
         "-c",
         "model_supports_reasoning_summaries=true",
         `${request.contract}\n\nUSER TASK:\n${request.prompt}`,
-      ];
+      ]);
       return await spawnAndStream({
         command: "codex",
         args,
@@ -110,8 +111,8 @@ function codexBackend(): BackendAdapter {
   };
 }
 
-function codexEffort(effort: RunRequest["run"]["effort"]): string {
-  return effort === "max" ? "xhigh" : effort || "xhigh";
+function compact(values: Array<string | undefined>): string[] {
+  return values.filter((value): value is string => Boolean(value));
 }
 
 function acpxBackend(): BackendAdapter {

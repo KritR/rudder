@@ -81,13 +81,12 @@ export function defaultConfig(): RudderConfig {
     },
     acpx: { install: "latest" },
     backends: {
-      claude: { profileId: "anthropic:claude-code", model: "sonnet", effort: "xhigh" },
+      claude: { profileId: "anthropic:claude-code", model: "sonnet" },
       codex: {
         profileId: "openai-codex:default",
         model: "gpt-5.5",
-        reasoningEffort: "xhigh",
       },
-      acpx: { model: "gpt-5.5", reasoningEffort: "xhigh" },
+      acpx: { model: "gpt-5.5" },
     },
   };
 }

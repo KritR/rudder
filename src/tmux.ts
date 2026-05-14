@@ -112,10 +112,10 @@ export async function configureRudderSession(sessionName: string): Promise<void>
     "-t",
     sessionName,
     "pane-border-format",
-    "#{?pane_active,#[fg=black,bg=brightcyan,bold]  FOCUS  #[default] #[fg=brightcyan,bold]━━━━ ,#[fg=colour244]}#{pane_title} ",
+    "#{?pane_active,#[fg=black,bg=brightcyan,bold]  FOCUS #{pane_title}  #[default]#[fg=black,bold]════════════════════════,#[fg=colour240]  #{pane_title}  ───────────────}",
   ], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=brightcyan,bold"], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour238"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=black,bold"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour245"], true);
   await runTmux(["bind-key", "-T", "root", "Tab", "select-pane", "-t", ":.+"], true);
   await runTmux(["bind-key", "-T", "root", "BTab", "select-pane", "-t", ":.-"], true);
 }
@@ -182,6 +182,16 @@ export async function respawnPane(params: {
 
 export async function selectPane(paneId: string): Promise<void> {
   await runTmux(["select-pane", "-t", paneId], true);
+}
+
+export async function paneExitStatus(paneId: string): Promise<number | null> {
+  const result = await runTmux(["display-message", "-p", "-t", paneId, "#{pane_dead} #{pane_dead_status}"], true);
+  const [dead, status] = result.stdout.trim().split(/\s+/);
+  if (dead !== "1") {
+    return null;
+  }
+  const parsed = Number(status);
+  return Number.isFinite(parsed) ? parsed : 1;
 }
 
 export async function selectNextPane(sessionName: string): Promise<void> {

@@ -319,7 +319,7 @@
             </div>
             <div class="point">
               <strong>Driven to completion</strong>
-              <span>Rudder checks finished agents and nudges them with a follow-up when the work still needs testing or cleanup.</span>
+              <span>When a pane exits, Rudder verifies the run, waits briefly, then restarts the agent with a focused follow-up if tests or cleanup are still missing.</span>
             </div>
             <div class="point">
               <strong>Merge with one key</strong>
@@ -331,8 +331,8 @@
         <section class="terminal" aria-label="Rudder terminal layout mockup">
           <div class="pane agents">
             <div class="label">agents</div>
-            <div class="run active">› fix auth callback<br />  running 60%  claude sonnet</div>
-            <div class="run muted">  add parser tests<br />  done 95%  codex gpt-5.5</div>
+            <div class="run active">› fix auth callback<br />  running  claude sonnet</div>
+            <div class="run muted">  add parser tests<br />  done  codex gpt-5.5</div>
             <div class="merge-button">m merge selected</div>
           </div>
           <div class="pane worker">
@@ -351,10 +351,6 @@ Enter start   Tab focus pane   / commands   claude sonnet</pre>
           </div>
         </section>
       </main>
-
-      <footer>
-        Built for local coding agents, tmux panes, and git worktrees.
-      </footer>
     </div>
     <script>
       document.querySelectorAll("[data-copy]").forEach((button) => {

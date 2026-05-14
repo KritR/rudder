@@ -1,8 +1,11 @@
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useInput, useWindowSize } from "ink";
+import { discoverEffortOptions, fallbackEffortOptions, type EffortOption } from "./effort.js";
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
-import { startNativeRun, deleteRun, mergeRun, stopRun } from "./run-manager.js";
+import { startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
 import { listRuns, loadConfig, saveConfig } from "./state.js";
 import {
   loadTmuxDashboardState,
@@ -12,6 +15,8 @@ import {
 import { detachClient, resizePane, selectPane } from "./tmux.js";
 import type { BackendId, EffortLevel, RunRecord, RudderConfig } from "./types.js";
 import { shortenHome } from "./util.js";
+
+const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 
 type PaneDefaults = {
   tmuxSessionName: string;
@@ -69,9 +74,11 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [notice, setNotice] = useState("");
   const [deleteIntent, setDeleteIntent] = useState<{ runId: string; canMerge: boolean } | null>(null);
+  const finishedRef = useRef<Set<string> | null>(null);
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
+    await reconcileNativeTerminals(root).catch(() => undefined);
     const [nextBranch, nextConfig, nextRuns, state] = await Promise.all([
       currentBranch(root),
       loadConfig(),
@@ -90,6 +97,10 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
     const timer = setInterval(() => void refresh(), 1000);
     return () => clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    notifyFinishedRuns(runs, finishedRef);
+  }, [runs]);
 
   const selectedIndex = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
   const selectedRun = runs[selectedIndex];
@@ -144,9 +155,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
       return;
     }
     if (key.return || chunk === "f") {
-      if (selectedRun?.terminal?.paneId) {
-        void selectPane(selectedRun.terminal.paneId);
-      }
+      void focusSelectedWorker(repoRoot, defaults.tmuxSessionName, selectedRun);
       return;
     }
     if (chunk === "m" && selectedRun) {
@@ -220,6 +229,8 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [pendingModel, setPendingModel] = useState<ModelOption | null>(null);
   const [claudeModels, setClaudeModels] = useState<ModelOption[]>([]);
   const [codexModels, setCodexModels] = useState<ModelOption[]>([]);
+  const [claudeEfforts, setClaudeEfforts] = useState<EffortOption[]>([]);
+  const [codexEfforts, setCodexEfforts] = useState<EffortOption[]>([]);
   const [taskPaneId, setTaskPaneId] = useState<string | undefined>();
 
   const refresh = useCallback(async () => {
@@ -259,6 +270,11 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     },
     [backend, claudeDefault, claudeModels, codexDefault, codexModels],
   );
+  const effortOptionsFor = useCallback((nextBackend: NativeBackendId) => (
+    nextBackend === "claude"
+      ? (claudeEfforts.length ? claudeEfforts : fallbackEffortOptions("claude"))
+      : (codexEfforts.length ? codexEfforts : fallbackEffortOptions("codex"))
+  ), [claudeEfforts, codexEfforts]);
 
   const setTaskInput = useCallback((next: string | ((current: string) => string)) => {
     const value = typeof next === "function" ? next(inputRef.current) : next;
@@ -286,6 +302,22 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       cancelled = true;
     };
   }, [claudeDefault, codexDefault]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([
+      discoverEffortOptions("claude").catch(() => fallbackEffortOptions("claude")),
+      discoverEffortOptions("codex").catch(() => fallbackEffortOptions("codex")),
+    ]).then(([nextClaudeEfforts, nextCodexEfforts]) => {
+      if (!cancelled) {
+        setClaudeEfforts(nextClaudeEfforts);
+        setCodexEfforts(nextCodexEfforts);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!taskPaneId) {
@@ -316,7 +348,8 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     if (task.startsWith("/model ")) {
       const nextModel = task.slice("/model ".length).trim() || undefined;
       setModel(nextModel);
-      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, backend, nextModel, effort);
+      setEffort(undefined);
+      await updateBackendDefaults(repoRoot, defaults.tmuxSessionName, backend, nextModel, undefined);
       setTaskInput("");
       setNotice("");
       return;
@@ -376,7 +409,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     } finally {
       setSubmitting(false);
     }
-  }, [backend, config, defaults.tmuxSessionName, effort, model, repoRoot, setTaskInput, submitting]);
+  }, [backend, config, defaults.tmuxSessionName, effort, effortOptionsFor, model, modelIndex, modelOptions, modelPickerStep, pendingModel, repoRoot, setTaskInput, submitting]);
 
   useInput((chunk, key) => {
     if (key.ctrl && chunk === "c") {
@@ -395,7 +428,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         return;
       }
       const activeBackend = toNativeBackend(pendingModel?.backend ?? backend);
-      const effortOptions = effortOptionsForBackend(activeBackend);
+      const effortOptions = effortOptionsFor(activeBackend);
       if (key.upArrow || chunk === "k") {
         if (modelPickerStep === "effort") {
           setEffortIndex((current) => Math.max(0, current - 1));
@@ -417,7 +450,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
           const option = modelOptions[modelIndex] ?? { label: "Default", value: undefined, backend };
           const nextBackend = toNativeBackend(option.backend ?? backend);
           const currentEffort = effortForBackend(nextBackend, config);
-          const nextEffortOptions = effortOptionsForBackend(nextBackend);
+          const nextEffortOptions = effortOptionsFor(nextBackend);
           setPendingModel(option);
           setEffortIndex(Math.max(0, nextEffortOptions.findIndex((candidate) => candidate.value === currentEffort)));
           setModelPickerStep("effort");
@@ -426,7 +459,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         const option = pendingModel ?? modelOptions[modelIndex] ?? { label: "Default", value: undefined, backend };
         const nextBackend = toNativeBackend(option.backend ?? backend);
         const nextModel = option.value;
-        const nextEffort = effortOptions[effortIndex]?.value ?? "xhigh";
+        const nextEffort = effortOptions[effortIndex]?.value;
         setBackend(nextBackend);
         setModel(nextModel);
         setEffort(nextEffort);
@@ -499,7 +532,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   });
 
   const configured = model || (backend === "claude" ? config?.backends.claude?.model : config?.backends.codex?.model) || "default";
-  const configuredEffort = effort || effortForBackend(backend, config);
+  const configuredEffort = effort || effortForBackend(backend, config) || "auto";
 
   return (
     <Box flexDirection="column">
@@ -512,7 +545,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
         <CommandMenu commands={commandOptions} selected={commandIndex} />
       ) : modelPickerOpen ? (
         modelPickerStep === "effort"
-          ? <EffortMenu option={pendingModel ?? modelOptions[modelIndex]} selected={effortIndex} backend={toNativeBackend(pendingModel?.backend ?? backend)} />
+          ? <EffortMenu option={pendingModel ?? modelOptions[modelIndex]} selected={effortIndex} backend={toNativeBackend(pendingModel?.backend ?? backend)} options={effortOptionsFor(toNativeBackend(pendingModel?.backend ?? backend))} />
           : <ModelMenu options={modelOptions} selected={modelIndex} backend={backend} />
       ) : (
         <Text color="gray">Enter start  Tab focus pane  / commands  {backend} {configured} {configuredEffort}</Text>
@@ -547,14 +580,13 @@ function ModelMenu({ options, selected, backend }: { options: ModelOption[]; sel
   );
 }
 
-function EffortMenu({ option, selected, backend }: { option?: ModelOption; selected: number; backend: NativeBackendId }): React.ReactElement {
-  const options = effortOptionsForBackend(backend);
+function EffortMenu({ option, selected, backend, options }: { option?: ModelOption; selected: number; backend: NativeBackendId; options: EffortOption[] }): React.ReactElement {
   const modelName = option?.label ?? "Default";
   return (
     <Box flexDirection="column">
       <Text color="gray">Pick effort for {backend} {modelName}. Esc goes back.</Text>
       {options.map((candidate, index) => (
-        <Text key={candidate.value} color={index === selected ? "cyan" : "gray"}>
+        <Text key={candidate.value ?? "auto"} color={index === selected ? "cyan" : "gray"}>
           {index === selected ? "> " : "  "}
           <Text color={candidate.value === "xhigh" || candidate.value === "max" ? "yellow" : undefined}>{candidate.label}</Text>
           {candidate.detail ? `  ${candidate.detail}` : ""}
@@ -570,6 +602,49 @@ function WorkerIdle(_props: { defaults: PaneDefaults }): React.ReactElement {
 
 function toNativeBackend(backend: BackendId): NativeBackendId {
   return backend === "codex" ? "codex" : "claude";
+}
+
+async function focusSelectedWorker(repoRoot: string, tmuxSessionName: string, run: RunRecord | undefined): Promise<void> {
+  if (run?.terminal?.paneId) {
+    await selectPane(run.terminal.paneId).catch(() => undefined);
+    return;
+  }
+  const state = await loadTmuxDashboardState(repoRoot, tmuxSessionName);
+  if (state?.workerPaneId) {
+    await selectPane(state.workerPaneId).catch(() => undefined);
+  }
+}
+
+function notifyFinishedRuns(runs: RunRecord[], ref: React.MutableRefObject<Set<string> | null>): void {
+  const finished = new Set(runs.filter((run) => isTerminalRun(run)).map((run) => run.id));
+  if (!ref.current) {
+    ref.current = finished;
+    return;
+  }
+  for (const run of runs) {
+    if (isTerminalRun(run) && !ref.current.has(run.id)) {
+      playCompletionSound();
+      ref.current.add(run.id);
+    }
+  }
+}
+
+function isTerminalRun(run: RunRecord): boolean {
+  return ["completed", "failed", "cancelled", "merged", "merge-conflict"].includes(run.status);
+}
+
+function playCompletionSound(): void {
+  try {
+    const player = process.platform === "darwin" ? "afplay" : "ffplay";
+    const args = process.platform === "darwin"
+      ? [COMPLETION_SOUND]
+      : ["-nodisp", "-autoexit", "-loglevel", "quiet", COMPLETION_SOUND];
+    const child = spawn(player, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => process.stdout.write("\u0007"));
+    child.unref();
+  } catch {
+    process.stdout.write("\u0007");
+  }
 }
 
 function statusMark(run: RunRecord): string {
@@ -590,9 +665,6 @@ function statusColor(run: RunRecord): string {
 }
 
 function taskColor(run: RunRecord): string | undefined {
-  if (run.status === "merged" || run.status === "completed") return "green";
-  if (run.status === "running" || run.status === "steering" || run.status === "verifying") return "yellow";
-  if (run.status === "failed" || run.status === "merge-conflict") return "red";
   return undefined;
 }
 
@@ -603,30 +675,18 @@ function modelLabel(run: RunRecord, config: RudderConfig | null): string {
       : config?.backends.codex?.model)
     ?? "default";
   const effort = run.effort ?? effortForBackend(toNativeBackend(run.backend), config);
-  return summarize(`${model} ${effort}`, 18);
+  return summarize(`${model} ${effort ?? "auto"}`, 18);
 }
 
 function modelForBackend(backend: NativeBackendId, config: RudderConfig | null): string | undefined {
   return backend === "claude" ? config?.backends.claude?.model : config?.backends.codex?.model;
 }
 
-function effortForBackend(backend: NativeBackendId, config: RudderConfig | null): EffortLevel {
+function effortForBackend(backend: NativeBackendId, config: RudderConfig | null): EffortLevel | undefined {
   if (backend === "claude") {
-    return config?.backends.claude?.effort ?? "xhigh";
+    return config?.backends.claude?.effort;
   }
-  return config?.backends.codex?.reasoningEffort ?? config?.backends.codex?.effort ?? "xhigh";
-}
-
-function effortOptionsForBackend(backend: NativeBackendId): Array<{ label: string; value: EffortLevel; detail: string }> {
-  const common: Array<{ label: string; value: EffortLevel; detail: string }> = [
-    { label: "low", value: "low", detail: "fastest" },
-    { label: "medium", value: "medium", detail: "balanced" },
-    { label: "high", value: "high", detail: "deeper reasoning" },
-    { label: "xhigh", value: "xhigh", detail: "best default for agent work" },
-  ];
-  return backend === "claude"
-    ? [...common, { label: "max", value: "max", detail: "most reasoning" }]
-    : common;
+  return config?.backends.codex?.reasoningEffort ?? config?.backends.codex?.effort;
 }
 
 async function updateBackendDefaults(
@@ -643,13 +703,13 @@ async function updateBackendDefaults(
     config.backends.claude = {
       ...(config.backends.claude ?? {}),
       model,
-      effort: effort ?? config.backends.claude?.effort ?? "xhigh",
+      effort,
     };
   } else {
     config.backends.codex = {
       ...(config.backends.codex ?? {}),
       model,
-      reasoningEffort: effort ?? config.backends.codex?.reasoningEffort ?? "xhigh",
+      reasoningEffort: effort,
     };
   }
   await saveConfig(config);

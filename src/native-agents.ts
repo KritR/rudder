@@ -1,4 +1,5 @@
 import type { RunRecord } from "./types.js";
+import { normalizeEffortForBackend } from "./effort.js";
 import { shellQuote } from "./util.js";
 
 export function nativeAgentCommand(params: {
@@ -14,13 +15,13 @@ export function nativeAgentCommand(params: {
 
 function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] {
   const model = run.model || "sonnet";
-  const effort = run.effort || "xhigh";
+  const effort = normalizeEffortForBackend("claude", run.effort);
   const sessionId = run.session?.nativeSessionId;
   return compact([
     "claude",
     "--model",
     model,
-    "--effort",
+    effort ? "--effort" : undefined,
     effort,
     "--permission-mode",
     "bypassPermissions",
@@ -37,7 +38,7 @@ function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] 
 
 function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
   const model = run.model || "gpt-5.5";
-  const effort = codexEffort(run.effort);
+  const effort = normalizeEffortForBackend("codex", run.effort);
   return [
     "codex",
     "--model",
@@ -49,8 +50,8 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
     "--dangerously-bypass-approvals-and-sandbox",
     "--enable",
     "goals",
-    "-c",
-    `model_reasoning_effort="${effort}"`,
+    effort ? "-c" : undefined,
+    effort ? `model_reasoning_effort="${effort}"` : undefined,
     "-c",
     'model_reasoning_summary="detailed"',
     "-c",
@@ -58,11 +59,7 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
     "--cd",
     run.worktree.path,
     [contract, "", prompt].join("\n"),
-  ];
-}
-
-function codexEffort(effort: RunRecord["effort"]): string {
-  return effort === "max" ? "xhigh" : effort || "xhigh";
+  ].filter((value): value is string => Boolean(value));
 }
 
 function paneTitle(run: RunRecord): string {
