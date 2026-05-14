@@ -819,11 +819,15 @@ impl App {
             return;
         }
 
-        if self.write_mouse_to_selected_worker(mouse, inner) {
+        if is_scroll_mouse_event(mouse.kind) {
+            if self.write_scroll_to_selected_worker(mouse, inner) {
+                return;
+            }
+            self.scroll_worker(mouse_scrollback_delta(mouse, inner.height));
             return;
         }
-        if is_scroll_mouse_event(mouse.kind) {
-            self.scroll_worker(mouse_scrollback_delta(mouse, inner.height));
+        if self.write_mouse_to_selected_worker(mouse, inner) {
+            return;
         }
     }
 
@@ -840,6 +844,30 @@ impl App {
             }
             None => return false,
         };
+        if let Err(error) = result {
+            self.set_selected_error(error.to_string());
+        }
+        true
+    }
+
+    fn write_scroll_to_selected_worker(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
+            return false;
+        };
+        let steps = terminal_scroll_steps(area.height, mouse.modifiers);
+        let Some(terminal) = self.selected_terminal_mut() else {
+            return false;
+        };
+        if !terminal.wants_sgr_mouse_events() {
+            return false;
+        }
+        let mut result: Result<()> = Ok(());
+        for _ in 0..steps {
+            if let Err(error) = terminal.write_input(&bytes) {
+                result = Err(error);
+                break;
+            }
+        }
         if let Err(error) = result {
             self.set_selected_error(error.to_string());
         }
@@ -1988,6 +2016,9 @@ mod app_tests {
         assert_eq!(review_scroll_steps(30, KeyModifiers::empty()), 3);
         assert_eq!(review_scroll_steps(90, KeyModifiers::empty()), 8);
         assert_eq!(review_scroll_steps(30, KeyModifiers::ALT), 24);
+        assert_eq!(terminal_scroll_steps(30, KeyModifiers::empty()), 3);
+        assert_eq!(terminal_scroll_steps(90, KeyModifiers::empty()), 8);
+        assert_eq!(terminal_scroll_steps(30, KeyModifiers::ALT), 24);
 
         let down = MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -3000,7 +3031,7 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
         .max(1)
 }
 
-fn review_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
+fn terminal_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
     let page = viewport_height.saturating_sub(1).max(1) as usize;
     if modifiers.intersects(
         KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::META | KeyModifiers::SUPER,
@@ -3008,6 +3039,10 @@ fn review_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
         return page.clamp(8, 24);
     }
     ((viewport_height / 8).max(3).min(8)) as usize
+}
+
+fn review_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
+    terminal_scroll_steps(viewport_height, modifiers)
 }
 
 fn page_scroll_rows(area: Option<Rect>) -> isize {
