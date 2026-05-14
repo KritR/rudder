@@ -81,7 +81,7 @@ copy/paste, model controls, resume behavior, and terminal UI.
 | Key | Action |
 | --- | --- |
 | `Enter` | Start a task, or focus the selected worker if the task box is empty |
-| `Tab` | Toggle backend between Claude and Codex |
+| `Tab` | Move focus to the next tmux pane |
 | `j` / `k` or arrows | Select an agent run |
 | `f` | Focus the selected native worker pane |
 | `o` or `/model` | Open the model picker |

@@ -9,7 +9,7 @@ import {
   stopRun,
 } from "./run-manager.js";
 import { listRuns, loadConfig } from "./state.js";
-import { detachClient, selectPane } from "./tmux.js";
+import { detachClient, selectNextPane, selectPane } from "./tmux.js";
 import type { BackendId, RunRecord, RudderConfig } from "./types.js";
 import { shortenHome } from "./util.js";
 
@@ -23,8 +23,6 @@ type DeleteIntent = {
   runId: string;
   canMerge: boolean;
 };
-
-const BACKENDS: Array<Exclude<BackendId, "acpx">> = ["claude", "codex"];
 
 export async function runTmuxDashboard(defaults: DashboardDefaults): Promise<void> {
   const instance = render(<TmuxDashboard defaults={defaults} />, {
@@ -241,10 +239,7 @@ function TmuxDashboard({ defaults }: { defaults: DashboardDefaults }): React.Rea
       return;
     }
     if (key.tab) {
-      const next = BACKENDS[(BACKENDS.indexOf(backend) + 1) % BACKENDS.length] ?? "claude";
-      setBackend(next);
-      setModel(undefined);
-      setNotice(`Backend ${next}`);
+      void selectNextPane(defaults.tmuxSessionName);
       return;
     }
     if (key.upArrow || (chunk === "k" && !input)) {
@@ -375,7 +370,7 @@ function TmuxDashboard({ defaults }: { defaults: DashboardDefaults }): React.Rea
         <Text color="gray">  {submitting ? "starting..." : notice}</Text>
       </Box>
       <Box>
-        <Text color="gray">Enter start/focus  Tab backend  o model  j/k select  m merge  d delete  q detach</Text>
+        <Text color="gray">Enter start/focus  Tab focus pane  o model  /backend switch  j/k select  m merge  d delete  q detach</Text>
       </Box>
     </Box>
   );
