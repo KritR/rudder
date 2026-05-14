@@ -34,6 +34,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
+const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -667,21 +668,32 @@ impl App {
             let Some(terminal) = run.terminal.as_mut() else {
                 continue;
             };
-            if !terminal.drain_output().is_empty() {
+            let had_output = !terminal.drain_output().is_empty();
+            if had_output {
                 run.last_output_at = Instant::now();
+                if run.status == AgentStatus::Done {
+                    run.status = AgentStatus::Running;
+                    run.completed_at = None;
+                }
             }
             if run.status == AgentStatus::Running {
                 match terminal.try_wait() {
                     Ok(Some(status)) => {
-                        run.status = if status.success() {
-                            AgentStatus::Done
+                        if status.success() {
+                            mark_run_done(run);
                         } else {
-                            AgentStatus::Failed
+                            run.status = AgentStatus::Failed;
+                            run.completed_at = Some(Instant::now());
+                            play_completion_sound();
                         };
-                        run.completed_at = Some(Instant::now());
-                        play_completion_sound();
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if run.last_output_at.elapsed() >= INTERACTIVE_COMPLETION_IDLE
+                            && terminal_looks_ready_for_input(run.backend, terminal)
+                        {
+                            mark_run_done(run);
+                        }
+                    }
                     Err(error) => {
                         run.status = AgentStatus::Failed;
                         run.completed_at = Some(Instant::now());
@@ -729,6 +741,81 @@ impl App {
                 }
             }
         }
+    }
+}
+
+fn mark_run_done(run: &mut AgentRun) {
+    if run.status != AgentStatus::Done {
+        run.status = AgentStatus::Done;
+        run.completed_at = Some(Instant::now());
+        play_completion_sound();
+    }
+}
+
+fn terminal_looks_ready_for_input(backend: Backend, terminal: &mut TerminalPane) -> bool {
+    let lines = terminal.visible_lines();
+    let recent = lines
+        .iter()
+        .rev()
+        .take(8)
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if recent.iter().any(|line| looks_busy(line)) {
+        return false;
+    }
+
+    recent
+        .iter()
+        .any(|line| looks_like_agent_prompt(backend, line))
+}
+
+fn looks_busy(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("thinking")
+        || lower.contains("working")
+        || lower.contains("running")
+        || lower.contains("esc to interrupt")
+        || lower.contains("ctrl-c to interrupt")
+        || lower.contains("press esc")
+}
+
+fn looks_like_agent_prompt(backend: Backend, line: &str) -> bool {
+    match backend {
+        Backend::Claude => {
+            line == ">"
+                || line.starts_with("> ")
+                || line.starts_with("❯ ")
+                || line.starts_with("› ")
+                || line.contains("Type a message")
+        }
+        Backend::Codex => {
+            line == "›"
+                || line.starts_with("› ")
+                || line.starts_with("> ")
+                || line.contains("Type a message")
+        }
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn detects_common_idle_prompts() {
+        assert!(looks_like_agent_prompt(Backend::Claude, "> "));
+        assert!(looks_like_agent_prompt(Backend::Claude, "› try something"));
+        assert!(looks_like_agent_prompt(Backend::Codex, "› ask follow up"));
+        assert!(looks_like_agent_prompt(Backend::Codex, "> "));
+    }
+
+    #[test]
+    fn detects_busy_lines() {
+        assert!(looks_busy("Thinking hard about tests"));
+        assert!(looks_busy("esc to interrupt"));
+        assert!(!looks_busy("All checks passed."));
     }
 }
 
