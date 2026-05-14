@@ -46,6 +46,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   const size = useWindowSize();
   const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
   const [branch, setBranch] = useState("HEAD");
+  const [config, setConfig] = useState<RudderConfig | null>(null);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [notice, setNotice] = useState("");
@@ -53,13 +54,15 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
 
   const refresh = useCallback(async () => {
     const root = findRepoRoot();
-    const [nextBranch, nextRuns, state] = await Promise.all([
+    const [nextBranch, nextConfig, nextRuns, state] = await Promise.all([
       currentBranch(root),
+      loadConfig(),
       listRuns(root),
       loadTmuxDashboardState(root, defaults.tmuxSessionName),
     ]);
     setRepoRoot(root);
     setBranch(nextBranch);
+    setConfig(nextConfig);
     setRuns(nextRuns);
     setSelectedRunId((current) => state?.selectedRunId ?? current ?? nextRuns[0]?.id);
   }, [defaults.tmuxSessionName]);
@@ -155,7 +158,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   });
 
   const width = Math.max(24, size.columns);
-  const maxRuns = Math.max(2, size.rows - 5);
+  const maxRuns = Math.max(1, Math.floor((size.rows - 5) / 3));
   const visibleRuns = runs.slice(0, maxRuns);
 
   return (
@@ -166,9 +169,10 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
       {visibleRuns.length === 0 ? <Text color="gray">No agents yet.</Text> : visibleRuns.map((run) => (
         <Box key={run.id} flexDirection="column">
           <Text color={run.id === selectedRun?.id ? "cyan" : undefined}>
-            {run.id === selectedRun?.id ? "> " : "  "}{statusMark(run)} {run.backend} {summarize(run.task, width - 14)}
+            {run.id === selectedRun?.id ? "> " : "  "}{statusMark(run)} {run.backend} {modelLabel(run, config)}
           </Text>
-          <Text color="gray">  {run.terminal?.paneId ? `pane ${run.terminal.paneId}` : run.status}</Text>
+          <Text color={run.id === selectedRun?.id ? "cyan" : "gray"}>  {summarize(run.task, width - 3)}</Text>
+          <Text color="gray">  {run.status}{run.terminal?.paneId ? ` ${run.terminal.paneId}` : ""}</Text>
         </Box>
       ))}
       {notice ? <Text color={deleteIntent ? "red" : "yellow"}>{summarize(notice, width)}</Text> : null}
@@ -329,6 +333,15 @@ function statusMark(run: RunRecord): string {
   if (run.status === "cancelled") return "--";
   if (run.status === "running") return "tm";
   return "..";
+}
+
+function modelLabel(run: RunRecord, config: RudderConfig | null): string {
+  const model = run.model
+    ?? (run.backend === "claude"
+      ? config?.backends.claude?.model
+      : config?.backends.codex?.model)
+    ?? "default";
+  return summarize(model, 18);
 }
 
 function shortId(id: string): string {

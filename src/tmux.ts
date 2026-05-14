@@ -102,9 +102,16 @@ export async function ensureTmuxDashboardSession(params: {
 export async function configureRudderSession(sessionName: string): Promise<void> {
   await runTmux(["set-option", "-t", sessionName, "mouse", "on"], true);
   await runTmux(["set-option", "-t", sessionName, "pane-border-status", "top"], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-border-format", " #{pane_title} "], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=cyan"], true);
-  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour245"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-lines", "double"], true);
+  await runTmux([
+    "set-option",
+    "-t",
+    sessionName,
+    "pane-border-format",
+    "#{?pane_active,#[fg=black,bg=cyan,bold] FOCUS #[default] #[fg=cyan,bold],#[fg=colour245]}#{pane_title} ",
+  ], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-active-border-style", "fg=cyan,bold"], true);
+  await runTmux(["set-option", "-t", sessionName, "pane-border-style", "fg=colour240"], true);
   await runTmux(["bind-key", "-T", "root", "Tab", "select-pane", "-t", ":.+"], true);
   await runTmux(["bind-key", "-T", "root", "BTab", "select-pane", "-t", ":.-"], true);
 }
