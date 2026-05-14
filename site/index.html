@@ -46,7 +46,7 @@
       }
 
       .page {
-        max-width: 1120px;
+        max-width: 1440px;
         margin: 0 auto;
         padding: 32px 24px 72px;
       }
@@ -80,10 +80,11 @@
       }
 
       main {
-        display: grid;
-        grid-template-columns: minmax(0, 0.92fr) minmax(420px, 1.08fr);
-        gap: 48px;
-        align-items: start;
+        display: block;
+      }
+
+      .hero {
+        max-width: 900px;
       }
 
       h1 {
@@ -96,7 +97,7 @@
 
       .lede {
         margin: 28px 0 0;
-        max-width: 560px;
+        max-width: 760px;
         font-size: clamp(18px, 2vw, 24px);
         line-height: 1.35;
         color: #333;
@@ -138,9 +139,9 @@
 
       .points {
         display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
         gap: 16px;
-        margin-top: 44px;
-        max-width: 520px;
+        margin-top: 38px;
       }
 
       .point {
@@ -169,12 +170,24 @@
         box-shadow: 12px 12px 0 #111;
       }
 
+      .screenshot-section {
+        margin-top: 52px;
+      }
+
       .screenshot {
         display: block;
         width: 100%;
         border: 1px solid #111;
         box-shadow: 12px 12px 0 #111;
         background: #eef1f7;
+      }
+
+      .caption {
+        margin-top: 18px;
+        max-width: 900px;
+        color: #555;
+        font-size: 15px;
+        line-height: 1.55;
       }
 
       .pane {
@@ -270,6 +283,10 @@
         }
 
         main {
+          display: block;
+        }
+
+        .points {
           grid-template-columns: 1fr;
         }
 
@@ -290,7 +307,13 @@
         }
 
         .screenshot {
+          min-width: 860px;
           box-shadow: 8px 8px 0 #111;
+        }
+
+        .screenshot-section {
+          overflow-x: auto;
+          padding-bottom: 14px;
         }
       }
     </style>
@@ -309,54 +332,53 @@
       </header>
 
       <main>
-        <section>
-          <h1>The OS for running coding agents.</h1>
+        <section class="hero">
+          <h1>The terminal OS for coding agents.</h1>
           <p class="lede">
-            Rudder is a native terminal workspace for Claude Code and Codex.
-            Start tasks, watch real agent processes, keep every run isolated,
-            review changes with Hunk, and merge completed work with one key.
-            Rudder Cloud lets runs keep going away from your laptop.
+            Rudder opens a local dashboard where each prompt becomes a real
+            Claude Code or Codex worker in its own git worktree. Watch the
+            agent live, review the diff, steer it when needed, then merge the
+            finished work back into your branch. Use Rudder Cloud when a run
+            should keep going away from your laptop.
           </p>
           <div class="install">
             <code id="install-command">npm install -g @viraatdas/rudder@latest
 rudder</code>
             <button class="copy" type="button" data-copy="install-command">Copy</button>
           </div>
-
-          <div class="points">
-            <div class="point">
-              <strong>Three panes, one flow</strong>
-              <span>Agents on the left, a real PTY worker on the right, task input at the bottom.</span>
-            </div>
-            <div class="point">
-              <strong>Native agents</strong>
-              <span>The worker pane is the real Claude Code or Codex process, not a fake transcript.</span>
-            </div>
-            <div class="point">
-              <strong>Clean isolation</strong>
-              <span>Each prompt runs in its own git worktree so parallel tasks do not collide.</span>
-            </div>
-            <div class="point">
-              <strong>Rudder Cloud</strong>
-              <span>Log in with rudder login, open /cloud or /sail in the dashboard, list cloud workers, and onload a worktree when a local run should continue remotely.</span>
-            </div>
-            <div class="point">
-              <strong>Local to cloud</strong>
-              <span>Cloud onload is built around the same worktree and merge flow: prepare isolated source state, run remotely, review locally, then merge intentionally.</span>
-            </div>
-            <div class="point">
-              <strong>No-secret safety</strong>
-              <span>Cloud snapshots include useful config paths, while filtering AWS credentials, .env files, SSH keys, Docker auth, kube config, and private keys.</span>
-            </div>
-            <div class="point">
-              <strong>Hunk review built in</strong>
-              <span>Press v to open a light-mode Hunk review, then press m from the agent list to merge the completed worktree back into your branch.</span>
-            </div>
-          </div>
         </section>
 
-        <section aria-label="Rudder dashboard screenshot">
+        <section class="screenshot-section" aria-label="Rudder dashboard screenshot">
           <img class="screenshot" src="/rudder-dashboard.svg" alt="Rudder dashboard with agents on the left, a Codex worker on the right, and task input at the bottom." />
+          <p class="caption">
+            The left pane tracks every agent, the right pane is the live Claude
+            Code or Codex process, and the bottom pane starts new tasks. Rudder
+            keeps each task isolated in a worktree so you can run, review, and
+            merge work intentionally.
+          </p>
+        </section>
+
+        <section class="points" aria-label="Rudder features">
+          <div class="point">
+            <strong>Real worker panes</strong>
+            <span>Claude Code and Codex run as native terminal processes, not rendered transcripts.</span>
+          </div>
+          <div class="point">
+            <strong>Worktree isolation</strong>
+            <span>Every prompt gets its own checkout so parallel agents do not fight over files.</span>
+          </div>
+          <div class="point">
+            <strong>Review and merge</strong>
+            <span>Open a Hunk review with `v`, then merge the selected completed agent with `m`.</span>
+          </div>
+          <div class="point">
+            <strong>Designed for long runs</strong>
+            <span>Rudder keeps run state, lets you restart stopped agents, and is adding cloud workers for offloaded tasks.</span>
+          </div>
+          <div class="point">
+            <strong>Rudder Cloud</strong>
+            <span>Run `rudder login`, then use `/cloud` or `/sail` to list, start, pause, resume, or onload a worktree to a cloud worker.</span>
+          </div>
         </section>
       </main>
     </div>
