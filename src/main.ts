@@ -2,6 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
+import { findRepoRoot } from "./git.js";
 import {
   cleanupRuns,
   deleteRun,
@@ -15,9 +16,11 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
+import { runTmuxDashboard } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
 import { isTty } from "./util.js";
+import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 
 type Parsed = {
   command?: string;
@@ -40,6 +43,9 @@ type Parsed = {
     run?: string;
     help?: boolean;
     version?: boolean;
+    noTmux?: boolean;
+    headless?: boolean;
+    tmuxSession?: string;
   };
 };
 
@@ -69,6 +75,10 @@ export async function main(): Promise<void> {
     }
     if (!parsed.command && isTty() && !parsed.flags.help) {
       await maybeOnboard();
+      if (!parsed.flags.noTmux && !parsed.flags.headless && hasTmux()) {
+        await openTmuxDashboard(parsed);
+        return;
+      }
       await runInteractiveTui({
         backend: parsed.flags.backend,
         model: parsed.flags.model,
@@ -82,6 +92,25 @@ export async function main(): Promise<void> {
   }
 
   switch (parsed.command) {
+    case "__dashboard": {
+      const repo = parsed.flags.repo;
+      const tmuxSessionName = parsed.flags.tmuxSession;
+      if (!repo || !tmuxSessionName) {
+        throw new Error("__dashboard requires --repo and --tmux-session");
+      }
+      process.chdir(repo);
+      await runTmuxDashboard({
+        tmuxSessionName,
+        backend: parsed.flags.backend,
+        model: parsed.flags.model,
+      });
+      return;
+    }
+    case "tmux":
+    case "dashboard":
+      await maybeOnboard();
+      await openTmuxDashboard(parsed);
+      return;
     case "tui":
       await maybeOnboard();
       await runInteractiveTui({
@@ -295,6 +324,14 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.nonInteractive = true;
       continue;
     }
+    if (arg === "--no-tmux") {
+      parsed.flags.noTmux = true;
+      continue;
+    }
+    if (arg === "--headless") {
+      parsed.flags.headless = true;
+      continue;
+    }
     if (takesValue(arg, "--model", "-m")) {
       parsed.flags.model = readValue(argv, ++i, arg);
       continue;
@@ -315,6 +352,10 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.run = readValue(argv, ++i, arg);
       continue;
     }
+    if (takesValue(arg, "--tmux-session")) {
+      parsed.flags.tmuxSession = readValue(argv, ++i, arg);
+      continue;
+    }
     if (arg.startsWith("--model=")) {
       parsed.flags.model = arg.slice("--model=".length);
       continue;
@@ -333,6 +374,10 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--run=")) {
       parsed.flags.run = arg.slice("--run=".length);
+      continue;
+    }
+    if (arg.startsWith("--tmux-session=")) {
+      parsed.flags.tmuxSession = arg.slice("--tmux-session=".length);
       continue;
     }
     if (!parsed.command && !arg.startsWith("-")) {
@@ -374,6 +419,41 @@ async function maybeOnboard(): Promise<void> {
   await runOnboard();
 }
 
+async function openTmuxDashboard(parsed: Parsed): Promise<void> {
+  if (!hasTmux()) {
+    await runInteractiveTui({
+      backend: parsed.flags.backend,
+      model: parsed.flags.model,
+      worktree: parsed.flags.worktree,
+      detach: parsed.flags.detach,
+    });
+    return;
+  }
+  const repoRoot = findRepoRoot();
+  const sessionName = parsed.flags.tmuxSession ?? repoTmuxSessionName(repoRoot);
+  const entry = process.argv[1];
+  if (!entry) {
+    throw new Error("Cannot locate Rudder entrypoint.");
+  }
+  const args = [
+    entry,
+    "__dashboard",
+    "--repo",
+    repoRoot,
+    "--tmux-session",
+    sessionName,
+    ...(parsed.flags.backend ? ["--backend", parsed.flags.backend] : []),
+    ...(parsed.flags.model ? ["--model", parsed.flags.model] : []),
+  ];
+  await ensureTmuxDashboardSession({
+    repoRoot,
+    sessionName,
+    dashboardCommand: shellCommand(process.execPath, args),
+  });
+  const code = await attachTmuxSession(sessionName);
+  process.exitCode = code;
+}
+
 async function packageVersion(): Promise<string> {
   const packageFile = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
   const raw = await fsp.readFile(packageFile, "utf8").catch(() => "");
@@ -388,8 +468,9 @@ function printHelp(): void {
   console.log(`rudder
 
 Usage:
-  rudder                         Open full-screen interactive TUI
-  rudder tui                     Open full-screen interactive TUI
+  rudder                         Open tmux dashboard with native agent panes
+  rudder tmux                    Open tmux dashboard with native agent panes
+  rudder tui                     Open legacy full-screen stream TUI
   rudder "task"
   rudder run [options] "task"
   rudder claude [options] "task"
@@ -416,6 +497,8 @@ Options:
   -m, --model <model>             Backend model
   -b, --backend <backend>         claude or codex
   -C, --cwd <dir>                 Run from another directory
+      --no-tmux                   Use the legacy TUI for bare rudder
+      --headless                  Alias for --no-tmux on bare rudder
       --json                      Machine-readable output
   -v, --version                   Print version
       --allow-dirty               Allow merge into dirty target branch

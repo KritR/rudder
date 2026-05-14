@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createSpec, renderContract, verifyRun } from "./brain.js";
 import { getBackend } from "./backends.js";
+import { nativeAgentCommand } from "./native-agents.js";
 import {
   createRunRecord,
   agentContextPath,
@@ -32,6 +34,7 @@ import {
   removeWorktree,
 } from "./git.js";
 import { ensureDir, isTty, newRunId, nowIso, pathExists, shortenHome } from "./util.js";
+import { createAgentPane, killPane, selectPane } from "./tmux.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
 
@@ -137,6 +140,120 @@ export async function startRun(params: {
     view: params.view,
   });
   return run;
+}
+
+export async function startNativeRun(params: {
+  task: string;
+  tmuxSessionName: string;
+  backend?: Exclude<BackendId, "acpx">;
+  model?: string;
+  focus?: boolean;
+  silent?: boolean;
+}): Promise<RunRecord> {
+  const repoRoot = findRepoRoot();
+  const config = await loadConfig();
+  const backend = params.backend ?? toNativeBackend(config.lastUsedBackend ?? config.defaultBackend);
+  const model =
+    params.model ??
+    (backend === "claude"
+      ? normalizeClaudeDefault(config.backends.claude?.model)
+      : config.backends.codex?.model);
+  const baseCommit = await currentCommit(repoRoot);
+  const targetBranch = await currentBranch(repoRoot);
+  const id = newRunId(params.task);
+  const worktreeInfo = await createRunWorktree({ repoRoot, runId: id, task: params.task, baseCommit });
+  const run = await createRunRecord({
+    id,
+    repoRoot,
+    task: params.task,
+    backend,
+    model,
+    targetBranch,
+    baseCommit,
+    useWorktree: true,
+    worktreeBranch: worktreeInfo.branch,
+    worktreePath: worktreeInfo.path,
+  });
+  run.session = {
+    ...(run.session ?? {}),
+    nativeSessionId: backend === "claude" ? randomUUID() : run.session?.nativeSessionId,
+    sessionName: params.tmuxSessionName,
+  };
+  run.status = "running";
+  await saveRunRecord(run);
+  await emit(run, {
+    ts: nowIso(),
+    runId: run.id,
+    type: "run.created",
+    message: `Created worktree ${shortenHome(worktreeInfo.path)}`,
+  });
+  await writeAgentContext(repoRoot);
+
+  config.lastUsedBackend = backend;
+  await saveConfig(config);
+
+  try {
+    const backendAdapter = getBackend(backend);
+    const health = await backendAdapter.verify();
+    if (!health.ok) {
+      throw new Error(health.message);
+    }
+
+    const spec = await createSpec(run);
+    await emit(run, {
+      ts: nowIso(),
+      runId: run.id,
+      type: "planner.spec",
+      message: "Planner contract created",
+      data: spec as unknown as JsonValue,
+    });
+    const contract = renderContract(spec);
+    const command = nativeAgentCommand({
+      run,
+      prompt: params.task,
+      contract,
+    });
+    await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
+    const title = `${backend}:${shortTask(params.task)}`;
+    const paneId = await createAgentPane({
+      sessionName: params.tmuxSessionName,
+      cwd: worktreeInfo.path,
+      title,
+      command,
+      logPath: outputPath(repoRoot, run.id),
+    });
+    run.terminal = {
+      kind: "tmux",
+      sessionName: params.tmuxSessionName,
+      paneId,
+      paneTitle: title,
+      logPath: outputPath(repoRoot, run.id),
+      launchedAt: nowIso(),
+    };
+    await saveRunRecord(run);
+    await emit(run, {
+      ts: nowIso(),
+      runId: run.id,
+      type: "run.started",
+      message: `${backend} pane started`,
+      data: { paneId, worktree: worktreeInfo.path },
+    });
+    await writeAgentContext(repoRoot);
+    if (params.focus !== false && paneId) {
+      await selectPane(paneId);
+    }
+    if (!params.silent) {
+      console.log(`Started ${run.id}`);
+    }
+    return run;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    run.status = "failed";
+    await saveRunRecord(run);
+    await emit(run, { ts: nowIso(), runId: run.id, type: "run.failed", message });
+    await writeAgentContext(repoRoot);
+    throw error;
+  }
 }
 
 export async function continueRun(params: {
@@ -406,7 +523,7 @@ function buildSteeringPrompt(verification: VerificationResult): string {
     .join("\n");
 }
 
-async function writeAgentContext(repoRoot: string): Promise<void> {
+export async function writeAgentContext(repoRoot: string): Promise<void> {
   const runs = await listRuns(repoRoot);
   const active = runs.filter((run) => isActiveStatus(run.status));
   const lines = [
@@ -441,6 +558,14 @@ function delay(ms: number): Promise<void> {
 
 function normalizeClaudeDefault(model: string | undefined): string | undefined {
   return model === "opus" ? "sonnet" : model;
+}
+
+function toNativeBackend(backend: BackendId): Exclude<BackendId, "acpx"> {
+  return backend === "codex" ? "codex" : "claude";
+}
+
+function shortTask(task: string): string {
+  return task.replace(/\s+/g, " ").trim().slice(0, 34) || "agent";
 }
 
 export async function statusRuns(options?: { json?: boolean }): Promise<void> {
@@ -553,6 +678,9 @@ export async function stopRun(runId: string, options?: { silent?: boolean }): Pr
   if (run.process?.pid && processAlive(run.process.pid)) {
     process.kill(run.process.pid, "SIGTERM");
   }
+  if (run.terminal?.kind === "tmux") {
+    await killPane(run.terminal.paneId).catch(() => undefined);
+  }
   run.status = "cancelled";
   run.process = {
     ...(run.process ?? {}),
@@ -615,6 +743,9 @@ export async function deleteRun(runId: string, options?: { mergeFirst?: boolean;
   }
   if (latest.process?.pid && processAlive(latest.process.pid)) {
     process.kill(latest.process.pid, "SIGTERM");
+  }
+  if (latest.terminal?.kind === "tmux") {
+    await killPane(latest.terminal.paneId).catch(() => undefined);
   }
   if (latest.worktree.enabled) {
     await removeWorktree(repoRoot, latest.worktree.path, options?.force ?? true).catch(() => undefined);

@@ -5,10 +5,10 @@
 [![Node >=20](https://img.shields.io/badge/node-%3E%3D20-43853d.svg)](https://nodejs.org/)
 [![CLI](https://img.shields.io/badge/interface-terminal-111827.svg)](#run)
 
-Rudder is a Claude Code-style terminal app for running coding agents without
-letting parallel tasks fight over the same checkout. It gives you a focused TUI,
-OpenClaw-style credential detection, background runs, saved transcripts,
-worktree isolation, model picking, agent steering, and one-command merging.
+Rudder is a Claude Code-style terminal command center for running coding agents
+without letting parallel tasks fight over the same checkout. It opens a tmux
+dashboard, creates one git worktree per task, and launches real Claude Code or
+Codex terminal panes so you keep the full native agent experience.
 
 ## Quick Start
 
@@ -40,6 +40,7 @@ npx @viraatdas/rudder@latest --help
 
 - Node.js 20 or newer
 - Git, for run tracking and worktree isolation
+- tmux, for the native multi-pane dashboard
 - Claude Code and/or Codex installed and logged in
 
 Check your setup:
@@ -66,44 +67,33 @@ Detected auth sources:
 
 ## Run
 
-Open the full-screen UI:
+Open the tmux dashboard:
 
 ```bash
 rudder
 ```
 
-The UI has three focus panes. The focused pane has a double cyan border and a
-focus badge so it is clear where input goes.
+The dashboard stays in one pane. Every task opens a separate native worker pane
+running `claude` or `codex` in its own git worktree. Focus a worker pane to use
+Claude Code or Codex directly, including their slash commands, interrupts,
+copy/paste, model controls, resume behavior, and terminal UI.
 
 | Key | Action |
 | --- | --- |
-| `Tab` | Switch focus between agents, worker, and task panes |
-| `Enter` | Submit the current input |
+| `Enter` | Start a task, or focus the selected worker if the task box is empty |
+| `Tab` | Toggle backend between Claude and Codex |
 | `j` / `k` or arrows | Select an agent run |
-| `c` or `Esc` | Focus the selected worker |
-| `n` | Return to new-task mode |
+| `f` | Focus the selected native worker pane |
 | `o` or `/model` | Open the model picker |
-| `/` | Open searchable slash commands |
-| `x` | Expand/collapse selected run |
-| `l` | Expand/collapse transcript |
 | `s` | Stop selected run |
-| `d` | Delete selected run, with an offer to merge completed work first |
-| `y` | Copy the selected worker transcript to the clipboard |
+| `d` | Delete selected run, with an offer to merge first when there are changes |
 | `m` | Merge selected completed worktree run |
-| `M` | Merge all completed worktree runs |
 | `Cmd+Backspace` / `Ctrl+U` | Clear the input line |
-| `?` | Help |
-| `q` | Quit |
+| `q` or `Ctrl+C` | Detach from the tmux session |
 
-Worker focus is intentionally direct: the input moves into the selected worker
-pane, so a completed run feels like a resumable standalone session. Type there
-and press `Enter` to continue that agent. If the agent is still running, `Enter`
-interrupts and redirects it. Press `Esc` from an empty worker input to return to
-new-task mode.
-
-Paste works directly in the task and worker input. For long pasted prompts,
-Rudder normalizes line breaks into spaces so the prompt stays inside the input
-box.
+Inside a worker pane, Rudder is out of the way. You are in the real Claude Code
+or Codex process. Use tmux mouse support, your terminal copy mode, or native
+agent keybindings normally.
 
 Slash commands:
 
@@ -111,27 +101,16 @@ Slash commands:
 /backend claude|codex
 /model
 /model <model-id>
-/agent [runId]
-/interrupt [runId]
-/new
-/worktree auto|always
-/stop [runId]
-/delete [runId]
-/copy [runId]
-/merge [runId] [--allow-dirty]
-/merge-all [--allow-dirty]
-/clear
-/exit
 ```
 
-Typing `/` opens command search. Use arrows to move, then press `Enter` to run
-or complete the selected command.
+If tmux is not installed, or you pass `--no-tmux`, Rudder falls back to the
+legacy full-screen stream TUI.
 
 ## Models
 
 `/model` opens a bounded picker for the active backend. Rudder passes the
 selected value straight through to the underlying CLI: Claude uses
-`claude --model <value>`, and Codex uses `codex exec --model <value>`.
+`claude --model <value>`, and Codex uses `codex --model <value>`.
 
 - Claude is alias-first like Claude Code itself: `sonnet`, `sonnet[1m]`,
   `opus`, `opus[1m]`, and `haiku` appear before explicit model IDs.
@@ -168,9 +147,10 @@ Each run gets a lightweight Rudder contract with:
 - acceptance criteria for the task
 - suggested verification commands
 
-After an agent finishes, Rudder verifies basic completion signals. If there are
-clear gaps, it can send a follow-up steering prompt. It does not auto-steer
-simple no-op greetings.
+For tmux-launched agents, the contract is injected into the native process at
+startup. The worker pane remains yours after the initial task, so you can keep
+typing into Claude Code or Codex directly. Headless one-shot runs still use
+Rudder's verifier and steering loop.
 
 ## One-Shot Commands
 
@@ -179,6 +159,7 @@ rudder "fix the failing tests"
 rudder claude "fix the auth redirect bug"
 rudder codex --model gpt-5.5 "refactor the parser"
 rudder run -d "rewrite this module"
+rudder tui
 ```
 
 ## Run Management

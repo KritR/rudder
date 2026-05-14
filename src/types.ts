@@ -143,6 +143,14 @@ export type RunRecord = {
     acpxSessionId?: string;
     sessionName?: string;
   };
+  terminal?: {
+    kind: "tmux";
+    sessionName: string;
+    paneId: string;
+    paneTitle?: string;
+    logPath?: string;
+    launchedAt: string;
+  };
   verification?: VerificationResult;
   merge?: MergeState;
 };
