@@ -1021,6 +1021,25 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+
+    if focused {
+        set_worker_cursor(frame, inner, app);
+    }
+}
+
+fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
+    let Some(cursor) = app
+        .agents
+        .get(app.selected_agent)
+        .and_then(|run| run.terminal.as_ref())
+        .map(|terminal| terminal.cursor())
+    else {
+        return;
+    };
+    if !cursor.visible || cursor.row >= inner.height || cursor.col >= inner.width {
+        return;
+    }
+    frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
 }
 
 fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {

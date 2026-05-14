@@ -118,6 +118,13 @@ pub struct StyledTerminalCell {
     pub inverse: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCursor {
+    pub row: u16,
+    pub col: u16,
+    pub visible: bool,
+}
+
 impl TerminalPane {
     /// Spawn the user's shell when `command` is `None`, or spawn the supplied
     /// program and arguments when it is `Some`.
@@ -278,6 +285,15 @@ impl TerminalPane {
 
     pub fn size(&self) -> TerminalSize {
         self.size
+    }
+
+    pub fn cursor(&self) -> TerminalCursor {
+        let (row, col) = self.parser.screen().cursor_position();
+        TerminalCursor {
+            row,
+            col,
+            visible: !self.parser.screen().hide_cursor(),
+        }
     }
 
     pub fn child_process_id(&self) -> Option<u32> {
