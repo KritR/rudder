@@ -31,17 +31,6 @@ Then type a task and press `Enter`:
 fix the failing tests
 ```
 
-Each dashboard task runs in its own git worktree. When a selected run is done,
-press `m` from the agent list to merge it back into your current branch, or
-press `M` to merge all completed worktree runs. For headless runs, use:
-
-```bash
-rudder merge <runId>
-```
-
-Rudder uses normal git merge behavior. If there is a conflict, git stops and
-you resolve it in the repo like any other merge.
-
 Upgrade later with:
 
 ```bash
