@@ -43,10 +43,11 @@ const MODEL_COLOR: Color = Color::Magenta;
 const RUNNING_COLOR: Color = Color::Yellow;
 const DONE_COLOR: Color = Color::Gray;
 const FAILED_COLOR: Color = Color::Red;
+const CLOUD_COLOR: Color = Color::Cyan;
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
-const AGENT_LIST_RUN_START_ROW: u16 = 11;
+const AGENT_LIST_RUN_START_ROW: u16 = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -196,6 +197,7 @@ struct App {
     model: String,
     effort: Option<EffortLevel>,
     notice: Option<String>,
+    cloud_prompt: Option<CloudLaunchPrompt>,
     delete_pending: Option<String>,
     merge_confirm: Option<MergeConfirmation>,
     conflict_prompt: Option<MergeConflictPrompt>,
@@ -205,6 +207,9 @@ struct App {
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
+    cloud_connected: bool,
+    cloud_runtime: Option<String>,
+    last_cloud_check: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
 }
@@ -229,6 +234,18 @@ struct NormalizedSelection {
 
 struct MergeConfirmation {
     intent: MergeIntent,
+}
+
+struct CloudLaunchPrompt {
+    scratch_args: Vec<String>,
+    scratch_label: String,
+    selected_run_id: Option<String>,
+    selected_task: Option<String>,
+}
+
+struct CloudSummary {
+    connected: bool,
+    runtime: Option<String>,
 }
 
 enum MergeIntent {
@@ -328,6 +345,7 @@ impl App {
         } else {
             load_persisted_agents(&cwd)
         };
+        let cloud = read_cloud_summary();
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
@@ -346,6 +364,7 @@ impl App {
             model: selection.model,
             effort: selection.effort,
             notice: None,
+            cloud_prompt: None,
             delete_pending: None,
             merge_confirm: None,
             conflict_prompt: None,
@@ -355,6 +374,9 @@ impl App {
             agents_area: None,
             worker_area: None,
             task_area: None,
+            cloud_connected: cloud.connected,
+            cloud_runtime: cloud.runtime,
+            last_cloud_check: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
         }
@@ -377,6 +399,10 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
+        }
+
+        if self.handle_cloud_prompt_key(key) {
+            return false;
         }
 
         if is_copy_key(key) {
@@ -1816,12 +1842,15 @@ impl App {
             }
             Some("/cloud") => {
                 let raw_args = parts.collect::<Vec<_>>();
-                let args = self.cloud_command_args(raw_args.clone());
                 if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
                     self.notice =
                         Some("not logged in to Rudder Cloud; run /login first".to_string());
                     return true;
                 }
+                if self.maybe_prompt_cloud_launch(&raw_args) {
+                    return true;
+                }
+                let args = self.cloud_command_args(raw_args.clone());
                 let label = cloud_agent_label(&args);
                 self.start_rudder_cli_command(&label, args);
                 true
@@ -1839,6 +1868,73 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn maybe_prompt_cloud_launch(&mut self, raw_args: &[&str]) -> bool {
+        if !cloud_args_start_worker(raw_args) {
+            return false;
+        }
+        let scratch_args = self.cloud_command_args_with_fly(raw_args);
+        let scratch_label = cloud_agent_label(&scratch_args);
+        let selected = self
+            .agents
+            .get(self.selected_agent)
+            .filter(|run| !is_cloud_agent(run))
+            .map(|run| (run.id.clone(), run.task_summary.clone()));
+        let (selected_run_id, selected_task) = selected
+            .map(|(id, task)| (Some(id), Some(task)))
+            .unwrap_or((None, None));
+        self.cloud_prompt = Some(CloudLaunchPrompt {
+            scratch_args,
+            scratch_label,
+            selected_run_id,
+            selected_task,
+        });
+        self.notice =
+            Some("Cloud launch: press n for new Fly worker, o to upload selected local run, Esc to cancel".to_string());
+        true
+    }
+
+    fn handle_cloud_prompt_key(&mut self, key: KeyEvent) -> bool {
+        let Some(prompt) = self.cloud_prompt.take() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.notice = Some("cloud launch cancelled".to_string());
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Enter => {
+                self.start_rudder_cli_command_with_env(
+                    &prompt.scratch_label,
+                    prompt.scratch_args,
+                    &[("RUDDER_CLOUD_RUNTIME", "fly")],
+                );
+                true
+            }
+            KeyCode::Char('o') => {
+                if let Some(run_id) = prompt.selected_run_id {
+                    let args = vec!["cloud".to_string(), "onload".to_string(), run_id];
+                    let label = prompt
+                        .selected_task
+                        .as_deref()
+                        .map(|task| format!("cloud onload {}", short_task(task)))
+                        .unwrap_or_else(|| "cloud onload".to_string());
+                    self.start_rudder_cli_command_with_env(
+                        &label,
+                        args,
+                        &[("RUDDER_CLOUD_RUNTIME", "fly")],
+                    );
+                } else {
+                    self.notice = Some("no local agent selected to upload; press /cloud again and choose new".to_string());
+                }
+                true
+            }
+            _ => {
+                self.cloud_prompt = Some(prompt);
+                false
+            }
         }
     }
 
@@ -1883,9 +1979,25 @@ impl App {
         command
     }
 
+    fn cloud_command_args_with_fly(&self, args: &[&str]) -> Vec<String> {
+        self.cloud_command_args(args.to_vec())
+    }
+
     fn start_rudder_cli_command(&mut self, label: &str, args: Vec<String>) {
+        self.start_rudder_cli_command_with_env(label, args, &[]);
+    }
+
+    fn start_rudder_cli_command_with_env(
+        &mut self,
+        label: &str,
+        args: Vec<String>,
+        env_overrides: &[(&str, &str)],
+    ) {
         let id = new_run_id(label);
-        let command = TerminalCommand::with_args("rudder", args);
+        let mut command = TerminalCommand::with_args("rudder", args);
+        for (key, value) in env_overrides {
+            command = command.with_env(*key, *value);
+        }
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(self.cwd.clone()),
@@ -2328,6 +2440,13 @@ impl App {
     }
 
     fn poll_agents(&mut self) {
+        if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
+            let cloud = read_cloud_summary();
+            self.cloud_connected = cloud.connected;
+            self.cloud_runtime = cloud.runtime;
+            self.last_cloud_check = Instant::now();
+        }
+
         let repo_root = self.cwd.clone();
         for run in &mut self.agents {
             let mut changed = false;
@@ -3692,7 +3811,7 @@ mod app_tests {
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 2,
-            row: 14,
+            row: 15,
             modifiers: KeyModifiers::empty(),
         });
 
@@ -4136,6 +4255,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_gutter(frame, rows[1], Gutter::Horizontal);
     render_task(frame, rows[2], app);
     render_suggestions(frame, rows[2], app);
+    render_cloud_prompt(frame, area, app);
     render_merge_prompt(frame, area, app);
     render_mouse_debug(frame, area, app);
 }
@@ -4207,6 +4327,18 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("agents ", pane_text_style(focused)),
             Span::styled(app.agents.len().to_string(), accent_style(focused)),
             Span::styled(" runs", pane_text_style(focused)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
+            Span::styled(
+                if app.cloud_connected { "cloud connected" } else { "cloud offline" },
+                cloud_style(app.cloud_connected, focused),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                app.cloud_runtime.as_deref().unwrap_or("fly"),
+                muted_style(focused),
+            ),
         ])),
         ListItem::new(Line::default()),
     ];
@@ -4740,6 +4872,51 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, modal);
 }
 
+fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(prompt) = &app.cloud_prompt else {
+        return;
+    };
+    let selected = prompt
+        .selected_task
+        .as_deref()
+        .map(|task| format!("Upload selected local run: {}", short_task(task)))
+        .unwrap_or_else(|| "No local run selected to upload".to_string());
+    let lines = vec![
+        Line::from(Span::styled("Start this work in Rudder Cloud on a Fly microVM.", app_style())),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Enter / n ", accent_style(true)),
+            Span::styled("start a fresh cloud worker from this repo", app_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("o ", accent_style(true)),
+            Span::styled(selected, app_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("Esc ", muted_style(true)),
+            Span::styled("cancel", muted_style(true)),
+        ]),
+    ];
+    let modal = centered_modal(area, 78, 8);
+    let block = Block::default()
+        .title(" cloud launch ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(CLOUD_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(app_style());
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app_style())
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        modal,
+    );
+}
+
 fn merge_confirm_hint_line() -> Line<'static> {
     Line::from(vec![
         Span::styled("Press ", app_style()),
@@ -4933,6 +5110,15 @@ fn model_style(focused: bool) -> Style {
         Style::default()
             .fg(INACTIVE_COLOR)
             .add_modifier(Modifier::DIM)
+    }
+}
+
+fn cloud_style(connected: bool, focused: bool) -> Style {
+    let color = if connected { CLOUD_COLOR } else { INACTIVE_COLOR };
+    if focused {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color).add_modifier(Modifier::DIM)
     }
 }
 
@@ -5639,32 +5825,68 @@ fn rudder_cloud_auth_path() -> Option<PathBuf> {
 }
 
 fn rudder_cloud_authenticated() -> bool {
+    read_cloud_summary().connected
+}
+
+fn read_cloud_summary() -> CloudSummary {
     if env::var("RUDDER_CLOUD_TOKEN")
         .ok()
         .is_some_and(|token| !token.trim().is_empty())
     {
-        return true;
+        return CloudSummary {
+            connected: true,
+            runtime: env::var("RUDDER_CLOUD_RUNTIME").ok().filter(|value| !value.trim().is_empty()),
+        };
     }
 
     let Some(path) = rudder_cloud_auth_path() else {
-        return false;
+        return CloudSummary {
+            connected: false,
+            runtime: None,
+        };
     };
     let Ok(raw) = fs::read_to_string(path) else {
-        return false;
+        return CloudSummary {
+            connected: false,
+            runtime: None,
+        };
     };
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
+    let data = serde_json::from_str::<serde_json::Value>(&raw).ok();
+    let connected = data
+        .as_ref()
         .is_some_and(|data| {
             data.get("token")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|token| !token.trim().is_empty())
-        })
+        });
+    let runtime = env::var("RUDDER_CLOUD_RUNTIME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            data.as_ref()
+                .and_then(|data| data.get("defaultRuntime"))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| if value == "byo-vm" { "byoc" } else { value }.to_string())
+        });
+    CloudSummary { connected, runtime }
 }
 
 fn cloud_args_need_auth(args: &[&str]) -> bool {
     !args
         .first()
         .is_some_and(|arg| matches!(*arg, "help" | "login"))
+}
+
+fn cloud_args_start_worker(args: &[&str]) -> bool {
+    match args.first().copied() {
+        None => true,
+        Some(
+            "help" | "login" | "list" | "ls" | "status" | "runtime" | "setup" | "setup-byoc"
+            | "setup-vm" | "setup-fly" | "bootstrap" | "pause" | "resume" | "stop" | "logs"
+            | "onload",
+        ) => false,
+        Some(_) => true,
+    }
 }
 
 fn cloud_agent_label(args: &[String]) -> String {
@@ -5876,8 +6098,13 @@ fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/cloud".to_string(),
-            detail: "list cloud workers, requires /login first".to_string(),
+            detail: "start a Fly cloud worker, asks fresh or upload selected".to_string(),
             action: SuggestionAction::RunCommand("/cloud".to_string()),
+        },
+        Suggestion {
+            label: "/cloud list".to_string(),
+            detail: "list cloud workers".to_string(),
+            action: SuggestionAction::RunCommand("/cloud list".to_string()),
         },
         Suggestion {
             label: "/cloud setup-byoc".to_string(),

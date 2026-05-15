@@ -91,10 +91,12 @@ By default the CLI points at the hosted Rudder Cloud control plane:
 `https://mpd2pmnpep.us-east-1.awsapprunner.com`. Set `RUDDER_CLOUD_URL` to
 override it for local development or another deployment.
 
-Inside the dashboard, `/login` starts browser auth, `/cloud list` lists cloud
-workers after you are logged in, and `/cloud` starts a cloud worker with a
-generated memorable name. `/cloud <name>` and `/sail <name>` start named cloud
-workers. `/cloud help` shows the cloud command reference.
+Inside the dashboard, `/login` starts browser auth and `/cloud list` lists
+cloud workers after you are logged in. `/cloud` opens a confirmation pane before
+anything launches. Press `Enter` or `n` to start a fresh Fly microVM from the
+current repo, or press `o` to upload the selected local run and continue it in
+the cloud. `/cloud <name>` uses the same prompt but gives the fresh worker a
+specific name. `/cloud help` shows the cloud command reference.
 
 Cloud workers use Fly Machines by default. To bring your own workstation or
 server instead, add it to `~/.ssh/config` and run:
@@ -105,12 +107,14 @@ rudder cloud setup-byoc rudder-workstation
 
 That SSH host should use key-based auth and have Docker available to your SSH
 user. Rudder checks the host and stores it in `~/.rudder/cloud-auth.json`.
-After that, `rudder cloud <task>`, `/cloud <task>`, and `/sail <task>` prepare
-a BYOC run and Rudder tries to start it on that host over SSH. If SSH or Docker
-is not ready, Rudder prints the Docker command so you can run it manually on the
-server. Use `rudder cloud setup-fly` to switch future launches back to Fly, or
-`rudder cloud runtime [fly|byoc]` to inspect or change the saved runtime. For
-one launch without changing the default, use `rudder cloud byoc "<task>"`.
+user. Rudder checks the host and stores it in `~/.rudder/cloud.json`.
+After that, `rudder cloud <task>` and `/sail <task>` prepare a BYOC run and
+Rudder tries to start it on that host over SSH. Dashboard `/cloud` always uses
+Fly for its fresh cloud-worker path so the main cloud shortcut behaves
+consistently. Use `rudder cloud setup-fly` to switch future CLI launches back to
+Fly, or `rudder cloud runtime [fly|byoc]` to inspect or change the saved CLI
+runtime. For one BYOC launch without changing the default, use
+`rudder cloud byoc "<task>"`.
 Set `RUDDER_BYOC_AUTOSTART=0` if you always want Rudder to print the Docker
 command instead of starting it over SSH.
 
@@ -156,6 +160,159 @@ Google/GitHub login, stores launch snapshots in an encrypted S3 bucket, and
 starts Fly Machines workers with one-hour presigned snapshot URLs. The local CLI
 package stays small; cloud state and worker orchestration run in the separate
 control plane.
+
+## Architecture
+
+Rudder has three layers:
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│ Local Rudder CLI                                           │
+│ native OpenTUI dashboard, task input, panes, worktrees     │
+├────────────────────────────────────────────────────────────┤
+│ Agent Process Layer                                        │
+│ real claude or codex terminals, not mocked transcript UIs  │
+├────────────────────────────────────────────────────────────┤
+│ Optional Rudder Cloud                                      │
+│ Better Auth, S3 snapshots, Fly Machines, BYOC Docker runs  │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Local Dashboard
+
+`rudder` starts the native dashboard. The native binary owns the terminal, draws
+the three-pane UI, creates PTYs for workers, and routes keyboard and mouse input.
+
+```text
+┌───────────────┬────────────────────────────────────────────┐
+│ agents        │ worker                                     │
+│ task list     │ live Claude Code or Codex PTY               │
+│ status/model  │ scrollback, review view, copy selection     │
+├───────────────┴────────────────────────────────────────────┤
+│ task input: new tasks, slash commands, cloud launch prompts │
+└────────────────────────────────────────────────────────────┘
+```
+
+The worker pane is an actual terminal process. When you focus it, keystrokes go
+to Claude Code or Codex. Rudder only intercepts global controls such as
+`Ctrl-C`, pane focus, review mode, merge, and delete.
+
+### Worktrees And Context
+
+Each normal task gets its own git worktree so agents do not compete inside the
+same checkout.
+
+```text
+main checkout
+  ├─ .rudder/runs/<run-id>/run.json       local run metadata
+  ├─ RUDDER.md                            current agent map, gitignored
+  └─ ~/.rudder-worktrees/<repo>/<run-id>  isolated agent checkout
+```
+
+`RUDDER.md` is regenerated as agents start, finish, restart, or delete. Rudder
+injects a short prompt telling each agent to read it, so a new agent can see
+what other agents are doing without Rudder rewriting the user task.
+
+Merging is intentionally git-native:
+
+```text
+agent worktree -> optional commit -> git merge --no-ff -> main checkout
+```
+
+If a merge conflicts, Rudder leaves the merge in place and offers to start an
+AI resolver in the main checkout. It does not hide the conflicted git state.
+
+### Review Flow
+
+Review mode uses Hunk when available, with git diff as the fallback path.
+
+```text
+selected run worktree
+  └─ hunk diff --watch
+       └─ embedded PTY in the worker/review pane
+```
+
+The review pane is also a real terminal. Mouse wheel and trackpad events scroll
+Rudder's captured scrollback first; if there is no Rudder scrollback to move,
+events can pass through to the inner TUI.
+
+### Cloud Auth
+
+Rudder Cloud auth is separate from Claude Code and Codex auth.
+
+```text
+/login or rudder login
+  -> browser opens Rudder Cloud
+  -> Better Auth handles Google or GitHub
+  -> control plane issues a Rudder CLI token
+  -> local CLI writes ~/.rudder/cloud.json
+```
+
+Claude Code and Codex credentials stay in their normal locations such as
+`~/.claude`, `~/.codex`, Keychain, or existing environment variables. Cloud
+workers receive a filtered snapshot of useful HOME config, excluding obvious
+high-risk material such as SSH keys, AWS credentials, Docker auth, kube config,
+and `.env` files.
+
+### Fly Cloud Path
+
+Dashboard `/cloud` always uses the Fly path for a fresh cloud worker. This keeps
+the shortcut predictable even if the CLI default runtime was changed to BYOC.
+
+```text
+task pane /cloud
+  -> confirmation pane
+       Enter or n: fresh Fly microVM
+       o: upload selected local run
+  -> local CLI creates repo snapshot
+  -> control plane stores snapshot in S3
+  -> control plane creates Fly Machine
+  -> worker downloads snapshot and starts Rudder
+```
+
+The cloud indicator in the agents pane shows whether the local dashboard is
+connected to Rudder Cloud and which saved CLI runtime is configured.
+
+### BYOC Path
+
+BYOC is for a server you own, reachable through SSH.
+
+```text
+rudder cloud setup-byoc <ssh-host>
+  -> read ~/.ssh/config
+  -> verify SSH and Docker
+  -> save host in ~/.rudder/cloud.json
+
+rudder cloud byoc "task"
+  -> upload snapshot to Rudder Cloud
+  -> receive docker run bootstrap command
+  -> run it over SSH with nohup
+```
+
+On ARM hosts, the bootstrap command switches from
+`public.ecr.aws/exla/rudder-worker:latest` to
+`public.ecr.aws/exla/rudder-worker:arm64`, so Jetson-style machines do not try
+to run an amd64 worker image.
+
+### Control Plane
+
+The hosted control plane is in `cloud/`.
+
+```text
+cloud/src/server.ts
+  ├─ Better Auth pages and API routes
+  ├─ /api/rudder/sail launch/list/pause/resume/onload/bootstrap
+  ├─ S3 snapshot storage and persisted state
+  ├─ Fly Machines API client
+  └─ BYOC bootstrap command generation
+
+cloud/worker/entrypoint.sh
+  ├─ download snapshot
+  ├─ restore selected HOME config
+  ├─ initialize git baseline if needed
+  ├─ run Rudder/Codex task
+  └─ heartbeat completion back to the control plane
+```
 
 ## Dashboard
 
@@ -230,8 +387,8 @@ through suggestions and `Enter` to choose one.
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/login` | Open browser login for Rudder Cloud |
-| `/cloud` | Start a cloud worker with a generated name; requires `/login` first |
-| `/cloud <name or task>` | Start a named cloud worker; with BYOC runtime, use the argument as the task |
+| `/cloud` | Ask whether to start a fresh Fly cloud worker or upload the selected local run |
+| `/cloud <name>` | Ask the same question, using the name for the fresh Fly worker |
 | `/cloud setup-byoc <ssh-host>` | Use an SSH host from `~/.ssh/config` for future cloud workers |
 | `/cloud runtime [fly\|byoc]` | Show or set the saved cloud runtime |
 | `/cloud list` | List cloud workers |
