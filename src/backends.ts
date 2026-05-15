@@ -354,6 +354,9 @@ function textFromBackendData(data: unknown, sawStreamingText: boolean): string {
     }
     return "";
   }
+  if (isRecord(record.error) && typeof record.error.message === "string") {
+    return record.error.message;
+  }
   if (record.type === "assistant") {
     if (sawStreamingText) {
       return "";
