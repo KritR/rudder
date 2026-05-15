@@ -24,6 +24,7 @@ function claudeBackend(): BackendAdapter {
         : { ok: false, message: "claude is not on PATH" };
     },
     async run(request, emit) {
+      const prompt = stripRudderPromptWrappers(request.prompt);
       const existingSessionId = request.run.session?.nativeSessionId;
       const isFollowUp = (request.run.turns?.length ?? 0) > 1;
       const sessionId = existingSessionId ?? randomUUID();
@@ -36,7 +37,7 @@ function claudeBackend(): BackendAdapter {
       const effort = normalizeEffortForBackend("claude", request.run.effort);
       const args = compact([
         "-p",
-        request.prompt,
+        prompt,
         "--model",
         request.run.model || "sonnet",
         effort ? "--effort" : undefined,
@@ -75,6 +76,7 @@ function codexBackend(): BackendAdapter {
         : { ok: false, message: "codex is not on PATH" };
     },
     async run(request, emit) {
+      const prompt = stripRudderPromptWrappers(request.prompt);
       const env = await backendEnv("openai");
       const effort = normalizeEffortForBackend("codex", request.run.effort);
       const args = compact([
@@ -93,7 +95,7 @@ function codexBackend(): BackendAdapter {
         'model_reasoning_summary="detailed"',
         "-c",
         "model_supports_reasoning_summaries=true",
-        `${request.contract}\n\nEND RUDDER PROMPT INJECTION\n\nUSER TASK:\n${request.prompt}`,
+        `${request.contract}\n\n${prompt}`,
       ]);
       return await spawnAndStream({
         command: "codex",
@@ -120,6 +122,7 @@ function acpxBackend(): BackendAdapter {
         : { ok: false, message: "acpx is not on PATH" };
     },
     async run(request, emit) {
+      const prompt = stripRudderPromptWrappers(request.prompt);
       const sessionName = request.run.session?.sessionName ?? request.run.id;
       const env = process.env;
       const model = acpxCodexModel(request.run.model, request.run.effort);
@@ -142,7 +145,7 @@ function acpxBackend(): BackendAdapter {
         "codex",
         "-s",
         sessionName,
-        `${request.contract}\n\nEND RUDDER PROMPT INJECTION\n\nUSER TASK:\n${request.prompt}`,
+        `${request.contract}\n\n${prompt}`,
       ];
       return await spawnAndStream({
         command: "acpx",
@@ -154,6 +157,24 @@ function acpxBackend(): BackendAdapter {
       });
     },
   };
+}
+
+function stripRudderPromptWrappers(prompt: string): string {
+  let value = prompt.trimStart();
+  for (;;) {
+    if (value.startsWith("USER TASK:")) {
+      value = value.slice("USER TASK:".length).trimStart();
+      continue;
+    }
+    if (value.startsWith("[RUDDER PROMPT INJECTION]")) {
+      const end = value.indexOf("[END RUDDER PROMPT INJECTION]");
+      if (end >= 0) {
+        value = value.slice(end + "[END RUDDER PROMPT INJECTION]".length).trimStart();
+        continue;
+      }
+    }
+    return value;
+  }
 }
 
 function acpxCodexModel(model: string | undefined, effort: EffortLevel | undefined): string | undefined {

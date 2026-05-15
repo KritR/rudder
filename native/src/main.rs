@@ -719,12 +719,16 @@ impl App {
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B')
-                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
             {
                 self.task_cursor = previous_word_position(&self.task_input, self.task_cursor);
             }
             KeyCode::Char('f') | KeyCode::Char('F')
-                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
             {
                 self.task_cursor = next_word_position(&self.task_input, self.task_cursor);
             }
@@ -1845,8 +1849,8 @@ impl App {
             }
         }
         let known = [
-            "help", "login", "list", "ls", "onload", "sail", "launch", "pause", "resume",
-            "status", "stop", "logs",
+            "help", "login", "list", "ls", "onload", "sail", "launch", "pause", "resume", "status",
+            "stop", "logs",
         ];
         let mut command = vec!["cloud".to_string()];
         if known.contains(&args[0]) {
@@ -2260,7 +2264,7 @@ impl App {
             prompt.conflicted_files.join("\n")
         };
         Some(format!(
-            "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first. A git merge for this Rudder task stopped with conflicts:\n\n{}\n\nConflicted files:\n{}\n\nGit reported:\n{}\n\nResolve the merge conflicts in this checkout. Inspect git status and the conflicted files, keep the intended changes from both sides where appropriate, run the relevant checks if possible, and tell me what you changed. Do not abort the merge unless resolving is impossible.\n[END RUDDER PROMPT INJECTION]",
+            "A git merge for this Rudder task stopped with conflicts:\n\n{}\n\nConflicted files:\n{}\n\nGit reported:\n{}\n\nResolve the merge conflicts in this checkout. Inspect git status and the conflicted files, keep the intended changes from both sides where appropriate, run the relevant checks if possible, and tell me what you changed. Do not abort the merge unless resolving is impossible.",
             prompt.task, files, prompt.error
         ))
     }
@@ -2390,7 +2394,7 @@ impl App {
             }
 
             let prompt = format!(
-                "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first. Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.\n[END RUDDER PROMPT INJECTION]",
+                "Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.",
                 run.task
             );
             let command = agent_command(
@@ -2656,6 +2660,43 @@ mod app_tests {
         assert!(!permission_text_needs_attention(
             "inspect and annotate the live review, then show when waiting for permission"
         ));
+    }
+
+    #[test]
+    fn execution_prompt_does_not_label_user_task_or_nest_rudder_blocks() {
+        let prompt = execution_prompt("fix the tests");
+        assert!(prompt.contains("Rudder-specific context injected by Rudder"));
+        assert!(prompt.contains("fix the tests"));
+        assert!(!prompt.contains("USER TASK"));
+        assert!(!prompt.contains("[RUDDER PROMPT INJECTION]"));
+    }
+
+    #[test]
+    fn execution_prompt_strips_old_rudder_wrappers_from_followups() {
+        let prompt = execution_prompt(
+            "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first.\n[END RUDDER PROMPT INJECTION]\n\nUSER TASK:\nship the cloud setup",
+        );
+        assert_eq!(
+            prompt
+                .matches("Rudder-specific context injected by Rudder")
+                .count(),
+            1
+        );
+        assert!(prompt.contains("ship the cloud setup"));
+        assert!(!prompt.contains("USER TASK"));
+        assert!(!prompt.contains("[END RUDDER PROMPT INJECTION]"));
+    }
+
+    #[test]
+    fn auto_steer_prompt_is_plain_task_text() {
+        let task = "add bring your own vm";
+        let prompt = format!(
+            "Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.",
+            task
+        );
+        assert!(!prompt.contains("USER TASK"));
+        assert!(!prompt.contains("[RUDDER PROMPT INJECTION]"));
+        assert!(execution_prompt(&prompt).contains(task));
     }
 
     #[test]
@@ -3571,6 +3612,21 @@ mod app_tests {
         assert!(app.delete_pending.is_none());
     }
 
+    #[test]
+    fn merge_confirm_hint_highlights_merge_action() {
+        let line = merge_confirm_hint_line();
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "Press y to merge, n to cancel.");
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].style.fg, Some(FAILED_COLOR));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
     fn test_agent_run(id: &str, task: &str) -> AgentRun {
         AgentRun {
             id: id.to_string(),
@@ -3617,7 +3673,10 @@ mod app_tests {
 
     #[test]
     fn merged_status_is_distinct_and_labeled() {
-        assert_eq!(agent_status_from_record(Some("merged")), AgentStatus::Merged);
+        assert_eq!(
+            agent_status_from_record(Some("merged")),
+            AgentStatus::Merged
+        );
         assert_eq!(run_record_status(AgentStatus::Merged), "merged");
 
         let mut run = test_agent_run("run-1", "test task");
@@ -4507,7 +4566,7 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
 }
 
 fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (title, body, border_color) = if let Some(confirm) = &app.merge_confirm {
+    let (title, lines, border_color) = if let Some(confirm) = &app.merge_confirm {
         let summary = match &confirm.intent {
             MergeIntent::Selected { task, .. } => {
                 format!("Merge selected worktree: {}", short_task(task))
@@ -4521,9 +4580,12 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (
             " confirm merge ",
             vec![
-                summary,
-                "This will run git merge into the current branch.".to_string(),
-                "Press y to merge, n to cancel.".to_string(),
+                Line::from(Span::styled(summary, app_style())),
+                Line::from(Span::styled(
+                    "This will run git merge into the current branch.",
+                    app_style(),
+                )),
+                merge_confirm_hint_line(),
             ],
             RUNNING_COLOR,
         )
@@ -4532,21 +4594,30 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (
             " merge conflict ",
             vec![
-                format!(
-                    "Merge stopped with {} conflicted file{}.",
-                    prompt.conflicted_files.len(),
-                    if prompt.conflicted_files.len() == 1 {
-                        ""
+                Line::from(Span::styled(
+                    format!(
+                        "Merge stopped with {} conflicted file{}.",
+                        prompt.conflicted_files.len(),
+                        if prompt.conflicted_files.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                    app_style(),
+                )),
+                Line::from(Span::styled(
+                    if files.is_empty() {
+                        "Git did not report conflicted files.".to_string()
                     } else {
-                        "s"
-                    }
-                ),
-                if files.is_empty() {
-                    "Git did not report conflicted files.".to_string()
-                } else {
-                    format!("Files: {files}")
-                },
-                "Press y to start an AI resolver, n to handle manually.".to_string(),
+                        format!("Files: {files}")
+                    },
+                    app_style(),
+                )),
+                Line::from(Span::styled(
+                    "Press y to start an AI resolver, n to handle manually.",
+                    app_style(),
+                )),
             ],
             FAILED_COLOR,
         )
@@ -4554,13 +4625,7 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let modal = centered_modal(area, 74, (body.len() as u16).saturating_add(2));
-    let inner_width = modal.width.saturating_sub(4).max(1);
-    let lines = body
-        .into_iter()
-        .flat_map(|line| wrap_text(&line, inner_width))
-        .map(|line| Line::from(Span::styled(line, app_style())))
-        .collect::<Vec<_>>();
+    let modal = centered_modal(area, 74, (lines.len() as u16).saturating_add(2));
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -4576,6 +4641,19 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(Clear, modal);
     frame.render_widget(paragraph, modal);
+}
+
+fn merge_confirm_hint_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Press ", app_style()),
+        Span::styled(
+            "y to merge",
+            Style::default()
+                .fg(FAILED_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(", n to cancel.", app_style()),
+    ])
 }
 
 fn centered_modal(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
@@ -6043,15 +6121,37 @@ fn agent_command(
 }
 
 fn execution_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
     format!(
-        "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo. If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n[END RUDDER PROMPT INJECTION]\n\nUSER TASK:\n{task}"
+        "Rudder-specific context injected by Rudder:\n- Read RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo.\n- If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n\n{task}"
     )
 }
 
 fn plan_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
     format!(
-        "Plan this task before implementation. Inspect the repository and relevant read-only context first. Ask follow-up questions if the plan cannot be made decision-complete from inspection alone.\n\nUSER TASK:\n{task}"
+        "Plan this task before implementation. Inspect the repository and relevant read-only context first. Ask follow-up questions if the plan cannot be made decision-complete from inspection alone.\n\n{task}"
     )
+}
+
+fn strip_rudder_prompt_wrappers(task: &str) -> String {
+    let mut value = task.trim().to_string();
+    loop {
+        let trimmed = value.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("USER TASK:") {
+            value = rest.trim_start().to_string();
+            continue;
+        }
+        if trimmed.starts_with("[RUDDER PROMPT INJECTION]") {
+            if let Some(index) = trimmed.find("[END RUDDER PROMPT INJECTION]") {
+                value = trimmed[index + "[END RUDDER PROMPT INJECTION]".len()..]
+                    .trim_start()
+                    .to_string();
+                continue;
+            }
+        }
+        return trimmed.to_string();
+    }
 }
 
 fn short_task(task: &str) -> String {
@@ -7003,7 +7103,7 @@ fn write_rudder_context(
     pending: Option<&WorktreeInfo>,
 ) -> Result<()> {
     ensure_gitignore_contains(repo_root, "RUDDER.md")?;
-    let mut body = String::from("# RUDDER PROMPT INJECTION CONTEXT\n\nThis file is generated and prompt-injected by Rudder. It is not user-authored repo documentation. Use it to coordinate with other Rudder agents in this checkout.\n\n## Active local Rudder agents\n");
+    let mut body = String::from("# Rudder-Specific Context\n\nThis file is generated by Rudder. It is not user-authored repo documentation. Use it to coordinate with other Rudder agents in this checkout.\n\n## Active local Rudder agents\n");
     if agents.is_empty() && pending.is_none() {
         body.push_str("- none\n");
     }

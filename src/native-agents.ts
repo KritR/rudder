@@ -10,11 +10,12 @@ export function nativeAgentCommand(params: {
   mode?: "execute" | "plan";
 }): string {
   const mode = params.mode ?? params.run.mode ?? "execute";
+  const prompt = stripRudderPromptWrappers(params.prompt);
   const args = mode === "plan"
-    ? planArgs(params.run, params.prompt)
+    ? planArgs(params.run, prompt)
     : params.run.backend === "codex"
-      ? codexArgs(params.run, params.prompt, params.contract)
-      : claudeArgs(params.run, params.prompt, params.contract);
+      ? codexArgs(params.run, prompt, params.contract)
+      : claudeArgs(params.run, prompt, params.contract);
   return args.map(shellQuote).join(" ");
 }
 
@@ -120,7 +121,7 @@ function codexPlanArgs(run: RunRecord, prompt: string): string[] {
     "model_supports_reasoning_summaries=true",
     "--cd",
     run.worktree.path,
-    `${PLAN_MODE_CONTRACT}\n\nUSER TASK:\n${prompt}`,
+    `${PLAN_MODE_CONTRACT}\n\n${prompt}`,
   ]);
 }
 
@@ -131,6 +132,24 @@ function paneTitle(run: RunRecord): string {
 
 function compact(values: Array<string | undefined>): string[] {
   return values.filter((value): value is string => Boolean(value));
+}
+
+function stripRudderPromptWrappers(prompt: string): string {
+  let value = prompt.trimStart();
+  for (;;) {
+    if (value.startsWith("USER TASK:")) {
+      value = value.slice("USER TASK:".length).trimStart();
+      continue;
+    }
+    if (value.startsWith("[RUDDER PROMPT INJECTION]")) {
+      const end = value.indexOf("[END RUDDER PROMPT INJECTION]");
+      if (end >= 0) {
+        value = value.slice(end + "[END RUDDER PROMPT INJECTION]".length).trimStart();
+        continue;
+      }
+    }
+    return value;
+  }
 }
 
 const CLAUDE_PLAN_TOOLS = [
