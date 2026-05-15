@@ -34,7 +34,8 @@ use rudder_native::pty_terminal::{
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-const TICK_RATE: Duration = Duration::from_millis(50);
+const TICK_RATE: Duration = Duration::from_millis(16);
+const MAX_EVENTS_PER_FRAME: usize = 16;
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
 const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
@@ -2898,6 +2899,17 @@ mod app_tests {
     }
 
     #[test]
+    fn event_dispatch_handles_paste_and_ctrl_c() {
+        let mut app = App::new();
+        assert!(!handle_event(&mut app, Event::Paste("hello".to_string())));
+        assert_eq!(app.task_input, "hello");
+        assert!(handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        ));
+    }
+
+    #[test]
     fn v_and_escape_leave_review_view() {
         let mut app = App::new();
         app.worker_view = WorkerView::Diff;
@@ -2961,22 +2973,40 @@ fn run(terminal: &mut Tui) -> Result<()> {
         terminal.draw(|frame| render(frame, &mut app))?;
 
         if event::poll(TICK_RATE)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if app.handle_key(key) {
-                        app.shutdown();
-                        break;
-                    }
+            if handle_event(&mut app, event::read()?) {
+                app.shutdown();
+                break;
+            }
+
+            for _ in 1..MAX_EVENTS_PER_FRAME {
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                Event::Key(_) => {}
-                Event::Paste(text) => app.handle_paste(text),
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                _ => {}
+                if handle_event(&mut app, event::read()?) {
+                    app.shutdown();
+                    return Ok(());
+                }
             }
         }
     }
 
     Ok(())
+}
+
+fn handle_event(app: &mut App, event: Event) -> bool {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+        Event::Key(_) => false,
+        Event::Paste(text) => {
+            app.handle_paste(text);
+            false
+        }
+        Event::Mouse(mouse) => {
+            app.handle_mouse(mouse);
+            false
+        }
+        _ => false,
+    }
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
