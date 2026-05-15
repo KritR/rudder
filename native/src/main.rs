@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env, fs,
     hash::{Hash, Hasher},
-    io::{self, Stdout, Write},
+    io::{self, Read, Stdout, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -12,10 +12,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -47,6 +46,7 @@ const FAILED_COLOR: Color = Color::Red;
 const MIN_WHEEL_SCROLL_ROWS: u16 = 6;
 const MAX_WHEEL_SCROLL_ROWS: u16 = 18;
 const TASK_HISTORY_LIMIT: usize = 100;
+const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -203,6 +203,8 @@ struct App {
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
+    mouse_debug: bool,
+    mouse_debug_last: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,6 +351,8 @@ impl App {
             agents_area: None,
             worker_area: None,
             task_area: None,
+            mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
+            mouse_debug_last: None,
         }
     }
 
@@ -1041,6 +1045,10 @@ impl App {
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
         {
             let inner = block_inner(area);
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=worker view={:?}",
+                mouse.kind, mouse.column, mouse.row, self.worker_view
+            ));
             if self.worker_view == WorkerView::Diff {
                 let _ = self.scroll_selected_review_or_forward(mouse, inner);
             } else {
@@ -1053,6 +1061,10 @@ impl App {
             .agents_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
         {
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=agents",
+                mouse.kind, mouse.column, mouse.row
+            ));
             if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 self.select_previous_agent();
             } else if matches!(mouse.kind, MouseEventKind::ScrollDown) {
@@ -1065,7 +1077,22 @@ impl App {
             .task_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
         {
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=task route=ignored",
+                mouse.kind, mouse.column, mouse.row
+            ));
             return;
+        }
+
+        self.set_mouse_debug(format!(
+            "mouse {:?} @{},{} pane=none route=ignored",
+            mouse.kind, mouse.column, mouse.row
+        ));
+    }
+
+    fn set_mouse_debug(&mut self, message: String) {
+        if self.mouse_debug {
+            self.mouse_debug_last = Some(message);
         }
     }
 
@@ -1226,20 +1253,51 @@ impl App {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let mouse_bytes = mouse_event_to_sgr(mouse, area);
         let Some(terminal) = self.selected_terminal_mut() else {
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=worker route=no-terminal",
+                mouse.kind, mouse.column, mouse.row
+            ));
             return false;
         };
         let before = terminal.scrollback();
+        let alternate = terminal.uses_alternate_screen();
         terminal.scrollback_by(rows);
-        let moved = terminal.scrollback() != before;
-        if moved {
-            return true;
-        }
-        if rows != 0 && terminal.wants_sgr_mouse_events() {
+        let after = terminal.scrollback();
+        let moved = after != before;
+        let wants_mouse = if moved || rows == 0 {
+            false
+        } else {
+            terminal.wants_sgr_mouse_events()
+        };
+        let mut forwarded = false;
+        let mut write_error = None;
+        if !moved && rows != 0 && wants_mouse {
             if let Some(bytes) = mouse_bytes {
                 if let Err(error) = terminal.write_input(&bytes) {
-                    self.set_selected_error(error.to_string());
+                    write_error = Some(error.to_string());
+                } else {
+                    forwarded = true;
                 }
             }
+        }
+        self.set_mouse_debug(format!(
+            "mouse {:?} @{},{} pane=worker rows={} before={} after={} moved={} alt={} wants_mouse={} forwarded={}",
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+            rows,
+            before,
+            after,
+            moved,
+            alternate,
+            wants_mouse,
+            forwarded
+        ));
+        if let Some(error) = write_error {
+            self.set_selected_error(error);
+            return true;
+        }
+        if moved || forwarded {
             return true;
         }
         if rows != 0 {
@@ -1272,20 +1330,51 @@ impl App {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let mouse_bytes = mouse_event_to_sgr(mouse, area);
         let Some(review) = self.selected_review_terminal_mut() else {
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=review route=no-terminal",
+                mouse.kind, mouse.column, mouse.row
+            ));
             return false;
         };
         let before = review.scrollback();
+        let alternate = review.uses_alternate_screen();
         review.scrollback_by(rows);
-        let moved = review.scrollback() != before;
-        if moved {
-            return true;
-        }
-        if rows != 0 && review.wants_sgr_mouse_events() {
+        let after = review.scrollback();
+        let moved = after != before;
+        let wants_mouse = if moved || rows == 0 {
+            false
+        } else {
+            review.wants_sgr_mouse_events()
+        };
+        let mut forwarded = false;
+        let mut write_error = None;
+        if !moved && rows != 0 && wants_mouse {
             if let Some(bytes) = mouse_bytes {
                 if let Err(error) = review.write_input(&bytes) {
-                    self.set_selected_review_error(error.to_string());
+                    write_error = Some(error.to_string());
+                } else {
+                    forwarded = true;
                 }
             }
+        }
+        self.set_mouse_debug(format!(
+            "mouse {:?} @{},{} pane=review rows={} before={} after={} moved={} alt={} wants_mouse={} forwarded={}",
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+            rows,
+            before,
+            after,
+            moved,
+            alternate,
+            wants_mouse,
+            forwarded
+        ));
+        if let Some(error) = write_error {
+            self.set_selected_review_error(error);
+            return true;
+        }
+        if moved || forwarded {
             return true;
         }
         if rows != 0 {
@@ -3412,6 +3501,10 @@ fn main() -> Result<()> {
         println!("rudder-native smoke ok");
         return Ok(());
     }
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "mouse-test") {
+        return run_mouse_test(args.get(1).map(String::as_str).unwrap_or("parsed"));
+    }
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal);
@@ -3425,15 +3518,132 @@ fn setup_terminal() -> Result<Tui> {
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     )?;
+    enable_rudder_mouse_capture(&mut stdout)?;
     stdout.flush()?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
+    // Minimum required modes: button press/release, drag/button motion, SGR coordinates.
+    // Avoid all-motion (?1003h), which creates noisy mouse-move traffic.
+    write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn run_mouse_test(mode: &str) -> Result<()> {
+    match mode {
+        "raw" => run_mouse_test_raw(),
+        "parsed" | "" => run_mouse_test_parsed(),
+        other => {
+            eprintln!("unknown mouse-test mode: {other}");
+            eprintln!("usage: rudder mouse-test [raw|parsed]");
+            Ok(())
+        }
+    }
+}
+
+fn run_mouse_test_raw() -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    enable_rudder_mouse_capture(&mut stdout)?;
+    writeln!(
+        stdout,
+        "rudder mouse-test raw\r\nScroll/click inside this terminal. Press q to quit.\r\n"
+    )?;
+    stdout.flush()?;
+
+    let result = (|| -> Result<()> {
+        let mut stdin = io::stdin();
+        let mut buf = [0_u8; 64];
+        loop {
+            let n = stdin.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            for byte in &buf[..n] {
+                if *byte == b'q' || *byte == 3 {
+                    return Ok(());
+                }
+            }
+            let printable = buf[..n]
+                .iter()
+                .map(|byte| match *byte {
+                    0x1b => "ESC".to_string(),
+                    b'\r' => "CR".to_string(),
+                    b'\n' => "LF".to_string(),
+                    0x20..=0x7e => format!("'{}'", *byte as char),
+                    _ => format!("0x{byte:02x}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(stdout, "{printable}\r")?;
+            stdout.flush()?;
+        }
+        Ok(())
+    })();
+
+    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = disable_raw_mode();
+    result
+}
+
+fn run_mouse_test_parsed() -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    enable_rudder_mouse_capture(&mut stdout)?;
+    writeln!(
+        stdout,
+        "rudder mouse-test parsed\r\nScroll/click inside this terminal. Press q to quit.\r\n"
+    )?;
+    stdout.flush()?;
+
+    let result = (|| -> Result<()> {
+        loop {
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    writeln!(stdout, "key {:?} modifiers={:?}\r", key.code, key.modifiers)?;
+                    stdout.flush()?;
+                    if key.code == KeyCode::Char('q')
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                    {
+                        break;
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    writeln!(
+                        stdout,
+                        "mouse {:?} col={} row={} modifiers={:?}\r",
+                        mouse.kind, mouse.column, mouse.row, mouse.modifiers
+                    )?;
+                    stdout.flush()?;
+                }
+                Event::Resize(cols, rows) => {
+                    writeln!(stdout, "resize cols={cols} rows={rows}\r")?;
+                    stdout.flush()?;
+                }
+                other => {
+                    writeln!(stdout, "event {other:?}\r")?;
+                    stdout.flush()?;
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = disable_raw_mode();
+    result
 }
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
@@ -3527,6 +3737,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_task(frame, rows[2], app);
     render_suggestions(frame, rows[2], app);
     render_merge_prompt(frame, area, app);
+    render_mouse_debug(frame, area, app);
 }
 
 #[derive(Clone, Copy)]
@@ -3544,6 +3755,37 @@ fn render_gutter(frame: &mut Frame<'_>, area: Rect, gutter: Gutter) {
 
     let lines = vec![Line::from(Span::styled(line, style)); area.height as usize];
     frame.render_widget(Paragraph::new(lines).style(app_style()), area);
+}
+
+fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if !app.mouse_debug {
+        return;
+    }
+    let text = app
+        .mouse_debug_last
+        .as_deref()
+        .unwrap_or("waiting for mouse event");
+    let width = area.width.saturating_sub(4).min(120).max(20);
+    let height = 3_u16.min(area.height);
+    let x = area.right().saturating_sub(width + 2);
+    let y = area.bottom().saturating_sub(height + 1);
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Yellow),
+        )))
+        .block(Block::default().borders(Borders::ALL).title("mouse debug"))
+        .style(app_style())
+        .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {

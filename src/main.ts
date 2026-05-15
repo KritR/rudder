@@ -139,6 +139,9 @@ export async function main(): Promise<void> {
       await maybeOnboard();
       await openDashboard(parsed);
       return;
+    case "mouse-test":
+      await runNativeCommand(["mouse-test", ...parsed.args]);
+      return;
     case "tui":
       await maybeOnboard();
       await runInteractiveTui({
@@ -553,6 +556,22 @@ async function runNativeDashboard(): Promise<boolean> {
   }
 }
 
+async function runNativeCommand(args: string[]): Promise<void> {
+  const nativeBinary = resolveNativeBinaryPath();
+  if (!nativeBinary) {
+    throw new Error("rudder-native binary is not available in this package");
+  }
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const child = spawn(nativeBinary, args, {
+      stdio: "inherit",
+      env: process.env,
+    });
+    child.on("error", reject);
+    child.on("exit", (exitCode) => resolve(exitCode));
+  });
+  process.exitCode = code ?? 1;
+}
+
 async function openTmuxDashboard(parsed: Parsed): Promise<void> {
   if (!hasTmux()) {
     await runInteractiveTui({
@@ -634,6 +653,7 @@ Run management:
 Setup:
   rudder onboard
   rudder doctor [--json]
+  rudder mouse-test [raw|parsed]    Show whether your terminal sends wheel events
 
 Cloud:
   rudder login                    Open browser login and store cloud token

@@ -200,6 +200,11 @@ or another full-screen app can scroll its own view.
 Use `Ctrl-G` before a Rudder shortcut if the worker pane is focused and you want
 the key handled by Rudder instead of by Claude Code or Codex.
 
+If trackpad scrolling does not behave as expected, run
+`rudder mouse-test parsed` to confirm your terminal is sending `ScrollUp` and
+`ScrollDown` events. For lower-level escape bytes, run `rudder mouse-test raw`.
+To inspect live dashboard routing, start Rudder with `RUDDER_MOUSE_DEBUG=1`.
+
 ## Models
 
 Run `/model` in the task pane. Rudder first asks for the provider, then the
