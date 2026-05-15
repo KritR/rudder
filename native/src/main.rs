@@ -371,6 +371,11 @@ impl App {
             return true;
         }
 
+        if is_copy_key(key) {
+            self.copy_focused_selection();
+            return false;
+        }
+
         if self.handle_merge_prompt_key(key) {
             return false;
         }
@@ -497,7 +502,6 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
-        self.worker_selection = None;
         if self.worker_view == WorkerView::Diff {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => {
@@ -526,6 +530,7 @@ impl App {
             return false;
         }
 
+        self.worker_selection = None;
         if self.selected_terminal_mut().is_none() {
             match key.code {
                 KeyCode::Char('r') => {
@@ -569,6 +574,45 @@ impl App {
             self.record_selected_worker_prompt(prompt);
         }
         false
+    }
+
+    fn copy_focused_selection(&mut self) {
+        let text = match self.focus {
+            FocusPane::Worker if self.worker_view == WorkerView::Terminal => {
+                let Some(selection) = self.worker_selection else {
+                    return;
+                };
+                self.selected_worker_selection_text(selection)
+            }
+            FocusPane::Task => {
+                let Some(selection) = self.task_selection else {
+                    return;
+                };
+                let width = self
+                    .task_area
+                    .map(block_inner)
+                    .map(task_inner_width)
+                    .unwrap_or(80);
+                let lines = task_input_lines(&self.task_input, self.task_cursor, width);
+                selected_text_from_lines(&lines, selection)
+            }
+            _ => return,
+        };
+
+        if text.trim().is_empty() {
+            return;
+        }
+
+        match copy_text_to_clipboard(&text) {
+            Ok(()) => {
+                self.notice = Some(match self.focus {
+                    FocusPane::Worker => "copied worker selection".to_string(),
+                    FocusPane::Task => "copied task selection".to_string(),
+                    FocusPane::Agents => "copied selection".to_string(),
+                });
+            }
+            Err(error) => self.notice = Some(format!("copy failed: {error}")),
+        }
     }
 
     fn select_previous_agent(&mut self) {
@@ -1088,11 +1132,8 @@ impl App {
                     );
                     return true;
                 }
-                let input_lines = task_input_lines(
-                    &self.task_input,
-                    self.task_cursor,
-                    task_inner_width(area),
-                );
+                let input_lines =
+                    task_input_lines(&self.task_input, self.task_cursor, task_inner_width(area));
                 let text = selected_text_from_lines(&input_lines, selection);
                 if text.trim().is_empty() {
                     self.notice = Some("selection empty".to_string());
@@ -1167,23 +1208,22 @@ impl App {
             return false;
         };
 
-        let alternate_screen = terminal.uses_alternate_screen();
-        if alternate_screen {
-            if terminal.wants_sgr_mouse_events() {
-                return self.write_scroll_to_selected_worker(mouse, area);
-            }
-            return self.write_scroll_key_to_selected_worker(mouse);
-        }
-
         let before = terminal.scrollback();
         terminal.scrollback_by(rows);
         let after = terminal.scrollback();
-        if after != before {
+        let moved_scrollback = after != before;
+        let wants_mouse = terminal.wants_sgr_mouse_events();
+        let alternate_screen = terminal.uses_alternate_screen();
+
+        if moved_scrollback {
             return true;
         }
 
-        if terminal.wants_sgr_mouse_events() {
+        if wants_mouse {
             return self.write_scroll_to_selected_worker(mouse, area);
+        }
+        if alternate_screen {
+            return self.write_scroll_key_to_selected_worker(mouse);
         }
         self.write_scroll_key_to_selected_worker(mouse)
     }
@@ -2589,6 +2629,19 @@ mod app_tests {
     }
 
     #[test]
+    fn command_copy_is_not_forwarded_to_embedded_terminal() {
+        let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let meta_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::META);
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(is_copy_key(command_c));
+        assert!(is_copy_key(meta_c));
+        assert_eq!(terminal_bytes_for_key(command_c), None);
+        assert_eq!(terminal_bytes_for_key(meta_c), None);
+        assert_eq!(terminal_bytes_for_key(control_c), Some(vec![0x03]));
+    }
+
+    #[test]
     fn plan_commands_use_read_only_backend_profiles() {
         let execute_codex = agent_command(
             Backend::Codex,
@@ -3916,7 +3969,11 @@ fn selection_point_from_mouse(mouse: MouseEvent, area: Rect) -> SelectionPoint {
     }
 }
 
-fn task_selection_point_from_mouse(app: &App, mouse: MouseEvent, area: Rect) -> Option<SelectionPoint> {
+fn task_selection_point_from_mouse(
+    app: &App,
+    mouse: MouseEvent,
+    area: Rect,
+) -> Option<SelectionPoint> {
     if !rect_contains(area, mouse.column, mouse.row) {
         return None;
     }
@@ -5342,11 +5399,25 @@ fn byte_index_for_char(input: &str, char_index: usize) -> usize {
         .unwrap_or(input.len())
 }
 
+fn is_copy_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
+    if is_copy_key(key) {
+        return None;
+    }
+
     let bytes = match key.code {
         KeyCode::Char(ch) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 control_char_bytes(ch)?
+            } else if key.modifiers.contains(KeyModifiers::SUPER) {
+                return None;
             } else if key
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::META)
