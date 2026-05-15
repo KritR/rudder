@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
 import { permissionAttentionFromOutput, type AgentAttention } from "./agent-attention.js";
-import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
+import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import {
   eventsPath,
@@ -41,7 +41,6 @@ type FocusPane = "agents" | "worker" | "task";
 
 type DeletePrompt = {
   runId: string;
-  canMerge: boolean;
 };
 
 type MergePrompt =
@@ -75,7 +74,7 @@ const COMMANDS: CommandOption[] = [
   { name: "new", detail: "return to new-agent mode", insert: "/new" },
   { name: "worktree", detail: "toggle worktree policy", insert: "/worktree " },
   { name: "stop", detail: "stop the selected run", insert: "/stop" },
-  { name: "delete", detail: "delete selected run, offering merge first when relevant", insert: "/delete" },
+  { name: "delete", detail: "delete selected run and its worktree", insert: "/delete" },
   { name: "copy", detail: "copy selected worker transcript", insert: "/copy" },
   { name: "merge", detail: "merge the selected completed worktree", insert: "/merge" },
   { name: "merge-all", detail: "merge all completed worktrees", insert: "/merge-all" },
@@ -233,31 +232,27 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
   }, [backend, model, refresh, submitting, targetRun, worktreeMode]);
 
-  const requestDeleteSelectedRun = useCallback(async (runOverride?: UiRun) => {
+  const requestDeleteSelectedRun = useCallback((runOverride?: UiRun) => {
     const run = runOverride ?? selectedRun;
     if (!run) {
       setNotice("No agent selected");
       return;
     }
-    const changed = run.worktree.enabled && await hasChanges(run.worktree.path).catch(() => false);
-    const mergeable = changed && run.status === "completed";
-    setDeletePrompt({ runId: run.id, canMerge: mergeable });
-    setNotice(mergeable
-      ? `Delete ${shortId(run.id)}? press m to merge first, d to discard, Esc to cancel`
-      : `Delete ${shortId(run.id)}? press d to confirm, Esc to cancel`);
+    setDeletePrompt({ runId: run.id });
+    setNotice(`Delete ${shortId(run.id)}? press d to confirm, Esc to cancel`);
   }, [selectedRun]);
 
-  const confirmDelete = useCallback(async (mergeFirst: boolean) => {
+  const confirmDelete = useCallback(async () => {
     if (!deletePrompt) {
       return;
     }
     const runId = deletePrompt.runId;
     try {
-      await deleteRun(runId, { mergeFirst, force: true, silent: true });
+      await deleteRun(runId, { force: true, silent: true });
       setDeletePrompt(null);
       setSelectedRunId(undefined);
       setTargetRunId(undefined);
-      setNotice(`${mergeFirst ? "Merged and deleted" : "Deleted"} ${shortId(runId)}`);
+      setNotice(`Deleted ${shortId(runId)}`);
       await refresh();
     } catch (error) {
       setDeletePrompt(null);
@@ -566,12 +561,8 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setNotice("Delete cancelled");
         return;
       }
-      if (value === "m" && deletePrompt.canMerge) {
-        void confirmDelete(true);
-        return;
-      }
-      if (value === "d" || key.delete || key.backspace) {
-        void confirmDelete(false);
+      if (value === "d") {
+        void confirmDelete();
         return;
       }
       return;
@@ -937,7 +928,7 @@ function Help(): React.ReactElement {
       <Text bold color="yellow">keys</Text>
       <Text><Text color="cyan">Tab</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">j/k</Text> select run</Text>
       <Text><Text color="cyan">worker focus</Text> type to selected agent; running agents are interrupted on Enter   <Text color="cyan">n</Text> new task   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
-      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">d</Text> delete   <Text color="cyan">y</Text> copy transcript   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
+      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">dd</Text> delete   <Text color="cyan">y</Text> copy transcript   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
       <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit</Text>
     </Box>
   );
@@ -1007,9 +998,7 @@ function CommandMenu(props: { options: CommandOption[]; selectedIndex: number; w
 
 function DeletePromptBox(props: { prompt: DeletePrompt; width: number }): React.ReactElement {
   const contentWidth = Math.max(24, props.width - 4);
-  const action = props.prompt.canMerge
-    ? "m merge first, d discard run, Esc cancel"
-    : "d delete run, Esc cancel";
+  const action = "d delete run + worktree, Esc cancel";
   return (
     <Box width={props.width} borderStyle="double" borderColor="yellow" paddingX={1}>
       <Text color="yellow" bold>{fitLine(`delete ${shortId(props.prompt.runId)}?  ${action}`, contentWidth)}</Text>
@@ -1080,7 +1069,7 @@ function StatusDock(props: { notice: string }): React.ReactElement {
 function Footer(props: { focusPane: FocusPane }): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">focus:{props.focusPane}  Tab focus  / commands  o model  n new  c worker  d delete  y copy  m/M merge  ? help</Text>
+      <Text color="gray">focus:{props.focusPane}  Tab focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help</Text>
     </Box>
   );
 }
@@ -1595,7 +1584,10 @@ function statusWord(run: UiRun): string {
     return "permission:";
   }
   const status = run.status;
-  if (status === "completed" || status === "merged") {
+  if (status === "merged") {
+    return "merged:";
+  }
+  if (status === "completed") {
     return "done:";
   }
   if (status === "failed" || status === "merge-conflict") {

@@ -5,7 +5,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Box, Text, render, useInput, useWindowSize } from "ink";
 import { permissionAttentionFromOutput, type AgentAttention } from "./agent-attention.js";
 import { discoverEffortOptions, fallbackEffortOptions, type EffortOption } from "./effort.js";
-import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
+import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
 import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
 import { listRuns, loadConfig, outputPath, rememberBackendSelection } from "./state.js";
@@ -89,7 +89,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
   const [runs, setRuns] = useState<AgentPaneRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const [notice, setNotice] = useState("");
-  const [deleteIntent, setDeleteIntent] = useState<{ runId: string; canMerge: boolean } | null>(null);
+  const [deleteIntent, setDeleteIntent] = useState<{ runId: string } | null>(null);
   const alertRef = useRef<AlertState | null>(null);
 
   const refresh = useCallback(async () => {
@@ -140,16 +140,6 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
         setNotice("");
         return;
       }
-      if (chunk === "m" && deleteIntent.canMerge) {
-        void deleteRun(deleteIntent.runId, { mergeFirst: true, force: true, silent: true })
-          .then(() => {
-            setDeleteIntent(null);
-            setNotice(`deleted ${shortId(deleteIntent.runId)}`);
-            return refresh();
-          })
-          .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
-        return;
-      }
       if (chunk === "d") {
         void deleteRun(deleteIntent.runId, { force: true, silent: true })
           .then(() => {
@@ -176,7 +166,12 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
     }
     if (chunk === "m" && selectedRun) {
       void mergeRun(selectedRun.id, false, { silent: true })
-        .then(() => setNotice(`merged ${shortId(selectedRun.id)}`))
+        .then((merged) => {
+          setNotice(merged.merge?.status === "conflict"
+            ? `merge conflict ${shortId(selectedRun.id)}`
+            : `merged ${shortId(selectedRun.id)}`);
+          return refresh();
+        })
         .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
       return;
     }
@@ -185,14 +180,8 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
       return;
     }
     if (chunk === "d" && selectedRun) {
-      void hasChanges(selectedRun.worktree.path)
-        .then((canMerge) => {
-          setDeleteIntent({ runId: selectedRun.id, canMerge: selectedRun.worktree.enabled && canMerge });
-          setNotice(selectedRun.worktree.enabled && canMerge
-            ? "delete? press m to merge then delete, d to delete, Esc cancel"
-            : "delete? press d to delete, Esc cancel");
-        })
-        .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+      setDeleteIntent({ runId: selectedRun.id });
+      setNotice("delete? press d to delete run + worktree, Esc cancel");
       return;
     }
     if (chunk === "q") {
@@ -222,7 +211,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
         </Box>
       ))}
       {notice ? <Text color={deleteIntent ? "red" : "yellow"}>{summarize(notice, width)}</Text> : null}
-      <Text color="gray">j/k select  Enter focus  m merge  d delete</Text>
+      <Text color="gray">j/k select  Enter focus  m merge  dd delete</Text>
     </Box>
   );
 }
