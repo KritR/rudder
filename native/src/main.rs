@@ -977,6 +977,21 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.focus == FocusPane::Worker && is_scroll_mouse_event(mouse.kind) {
+            let worker_area = self.worker_area.map(block_inner).unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 24,
+            });
+            if self.worker_view == WorkerView::Diff {
+                let _ = self.scroll_selected_review_or_forward(mouse, worker_area);
+            } else {
+                let _ = self.scroll_selected_worker_or_forward(mouse, worker_area);
+            }
+            return;
+        }
+
         if self
             .agents_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
@@ -1218,7 +1233,18 @@ impl App {
         let before = terminal.scrollback();
         terminal.scrollback_by(rows);
         let moved = terminal.scrollback() != before;
-        if !moved && rows != 0 {
+        if moved {
+            return true;
+        }
+        if rows != 0 && terminal.uses_alternate_screen() {
+            if let Some(bytes) = scroll_page_key_bytes(mouse) {
+                if let Err(error) = terminal.write_input(&bytes) {
+                    self.set_selected_error(error.to_string());
+                }
+            }
+            return true;
+        }
+        if rows != 0 {
             self.notice = Some("worker scrollback is at the edge".to_string());
         }
         true
@@ -1251,7 +1277,18 @@ impl App {
         let before = review.scrollback();
         review.scrollback_by(rows);
         let moved = review.scrollback() != before;
-        if !moved && rows != 0 {
+        if moved {
+            return true;
+        }
+        if rows != 0 && review.uses_alternate_screen() {
+            if let Some(bytes) = scroll_page_key_bytes(mouse) {
+                if let Err(error) = review.write_input(&bytes) {
+                    self.set_selected_review_error(error.to_string());
+                }
+            }
+            return true;
+        }
+        if rows != 0 {
             self.notice = Some("review scrollback is at the edge".to_string());
         }
         true
@@ -2506,6 +2543,60 @@ mod app_tests {
             modifiers: KeyModifiers::empty(),
         };
         assert_eq!(mouse_scrollback_delta(down, 30), -10);
+        assert_eq!(scroll_page_key_bytes(down), Some(b"\x1b[6~".to_vec()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn focused_worker_wheel_sends_page_key_in_alternate_screen() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            ["-lc", "stty raw -echo; printf '\\033[?1049h'; cat -v"],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.uses_alternate_screen() {
+                break;
+            }
+        }
+
+        assert!(pane.uses_alternate_screen());
+
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        app.worker_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 7,
+        });
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("^[[5~"), "output was {output:?}");
     }
 
     #[cfg(not(windows))]
@@ -2564,6 +2655,65 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
         assert_ne!(after, before);
+        assert!(after.contains("line035"), "after was {after:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn focused_worker_wheel_scrolls_worker_even_when_pointer_is_over_agents() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("line040") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        app.agents_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 20,
+        });
+        app.worker_area = Some(Rect {
+            x: 20,
+            y: 0,
+            width: 40,
+            height: 7,
+        });
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let after = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
         assert!(after.contains("line035"), "after was {after:?}");
     }
 
@@ -4024,6 +4174,14 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
         .min(MAX_WHEEL_SCROLL_ROWS)
         .min(page)
         .max(1)
+}
+
+fn scroll_page_key_bytes(mouse: MouseEvent) -> Option<Vec<u8>> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(b"\x1b[5~".to_vec()),
+        MouseEventKind::ScrollDown => Some(b"\x1b[6~".to_vec()),
+        _ => None,
+    }
 }
 
 fn page_scroll_rows(area: Option<Rect>) -> isize {

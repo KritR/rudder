@@ -160,12 +160,14 @@ Codex. Their slash commands, cursor movement, copy/paste, and terminal UI
 continue to work normally. `Ctrl-C` is reserved by Rudder and leaves the
 dashboard from any pane.
 
-Rudder owns mouse input inside the dashboard. Wheel or trackpad scrolling over a
-worker or review pane scrolls Rudder's captured pane output, not the underlying
-Claude Code, Codex, or Hunk chat. Use the worker's up and down arrow keys when
-you want to move through the agent's own prompt history or menus. Drag selection
-inside the worker pane copies selected text, including when you drag upward past
-the top of the pane.
+Rudder owns mouse input inside the dashboard. When the worker or review pane is
+focused, wheel or trackpad scrolling scrolls Rudder's captured pane output, not
+the underlying Claude Code, Codex, or Hunk chat. Use the worker's up and down
+arrow keys when you want to move through the agent's own prompt history or
+menus. Drag selection inside the worker pane copies selected text, including
+when you drag upward past the top of the pane.
+For full-screen alternate-screen workers, wheel or trackpad scrolling is mapped
+to PageUp/PageDown so the focused worker can still move.
 
 ## Keys
 
