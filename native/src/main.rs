@@ -2688,6 +2688,16 @@ mod app_tests {
     }
 
     #[test]
+    fn execution_prompt_preserves_task_inside_legacy_rudder_wrapper() {
+        let prompt = execution_prompt(
+            "[RUDDER PROMPT INJECTION]\nRead RUDDER.md first. Review the current diff and tests.\n[END RUDDER PROMPT INJECTION]",
+        );
+        assert!(prompt.contains("Read RUDDER.md first. Review the current diff and tests."));
+        assert!(!prompt.contains("[RUDDER PROMPT INJECTION]"));
+        assert!(!prompt.contains("[END RUDDER PROMPT INJECTION]"));
+    }
+
+    #[test]
     fn auto_steer_prompt_is_plain_task_text() {
         let task = "add bring your own vm";
         let prompt = format!(
@@ -6135,6 +6145,9 @@ fn plan_prompt(task: &str) -> String {
 }
 
 fn strip_rudder_prompt_wrappers(task: &str) -> String {
+    const START: &str = "[RUDDER PROMPT INJECTION]";
+    const END: &str = "[END RUDDER PROMPT INJECTION]";
+
     let mut value = task.trim().to_string();
     loop {
         let trimmed = value.trim_start();
@@ -6142,11 +6155,11 @@ fn strip_rudder_prompt_wrappers(task: &str) -> String {
             value = rest.trim_start().to_string();
             continue;
         }
-        if trimmed.starts_with("[RUDDER PROMPT INJECTION]") {
-            if let Some(index) = trimmed.find("[END RUDDER PROMPT INJECTION]") {
-                value = trimmed[index + "[END RUDDER PROMPT INJECTION]".len()..]
-                    .trim_start()
-                    .to_string();
+        if let Some(after_start) = trimmed.strip_prefix(START) {
+            if let Some(index) = after_start.find(END) {
+                let body = after_start[..index].trim();
+                let rest = after_start[index + END.len()..].trim_start();
+                value = if rest.is_empty() { body } else { rest }.to_string();
                 continue;
             }
         }

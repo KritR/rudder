@@ -3,11 +3,12 @@ import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { shellQuote } from "./util.js";
 export function nativeAgentCommand(params) {
     const mode = params.mode ?? params.run.mode ?? "execute";
+    const prompt = stripRudderPromptWrappers(params.prompt);
     const args = mode === "plan"
-        ? planArgs(params.run, params.prompt)
+        ? planArgs(params.run, prompt)
         : params.run.backend === "codex"
-            ? codexArgs(params.run, params.prompt, params.contract)
-            : claudeArgs(params.run, params.prompt, params.contract);
+            ? codexArgs(params.run, prompt, params.contract)
+            : claudeArgs(params.run, prompt, params.contract);
     return args.map(shellQuote).join(" ");
 }
 function claudeArgs(run, prompt, contract) {
@@ -108,7 +109,7 @@ function codexPlanArgs(run, prompt) {
         "model_supports_reasoning_summaries=true",
         "--cd",
         run.worktree.path,
-        `${PLAN_MODE_CONTRACT}\n\nUSER TASK:\n${prompt}`,
+        `${PLAN_MODE_CONTRACT}\n\n${prompt}`,
     ]);
 }
 function paneTitle(run) {
@@ -117,6 +118,28 @@ function paneTitle(run) {
 }
 function compact(values) {
     return values.filter((value) => Boolean(value));
+}
+function stripRudderPromptWrappers(prompt) {
+    const start = "[RUDDER PROMPT INJECTION]";
+    const endMarker = "[END RUDDER PROMPT INJECTION]";
+    let value = prompt.trimStart();
+    for (;;) {
+        if (value.startsWith("USER TASK:")) {
+            value = value.slice("USER TASK:".length).trimStart();
+            continue;
+        }
+        if (value.startsWith(start)) {
+            const afterStart = value.slice(start.length);
+            const end = afterStart.indexOf(endMarker);
+            if (end >= 0) {
+                const body = afterStart.slice(0, end).trim();
+                const rest = afterStart.slice(end + endMarker.length).trimStart();
+                value = rest.length ? rest : body;
+                continue;
+            }
+        }
+        return value;
+    }
 }
 const CLAUDE_PLAN_TOOLS = [
     "Read",

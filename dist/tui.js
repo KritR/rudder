@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
 import { permissionAttentionFromOutput } from "./agent-attention.js";
-import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
+import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions } from "./models.js";
 import { eventsPath, listRuns, loadConfig, outputPath, rememberBackendSelection, } from "./state.js";
 import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
@@ -20,7 +20,7 @@ const COMMANDS = [
     { name: "new", detail: "return to new-agent mode", insert: "/new" },
     { name: "worktree", detail: "toggle worktree policy", insert: "/worktree " },
     { name: "stop", detail: "stop the selected run", insert: "/stop" },
-    { name: "delete", detail: "delete selected run, offering merge first when relevant", insert: "/delete" },
+    { name: "delete", detail: "delete selected run and its worktree", insert: "/delete" },
     { name: "copy", detail: "copy selected worker transcript", insert: "/copy" },
     { name: "merge", detail: "merge the selected completed worktree", insert: "/merge" },
     { name: "merge-all", detail: "merge all completed worktrees", insert: "/merge-all" },
@@ -171,30 +171,26 @@ function RudderTui({ defaults }) {
             setSubmitting(false);
         }
     }, [backend, model, refresh, submitting, targetRun, worktreeMode]);
-    const requestDeleteSelectedRun = useCallback(async (runOverride) => {
+    const requestDeleteSelectedRun = useCallback((runOverride) => {
         const run = runOverride ?? selectedRun;
         if (!run) {
             setNotice("No agent selected");
             return;
         }
-        const changed = run.worktree.enabled && await hasChanges(run.worktree.path).catch(() => false);
-        const mergeable = changed && run.status === "completed";
-        setDeletePrompt({ runId: run.id, canMerge: mergeable });
-        setNotice(mergeable
-            ? `Delete ${shortId(run.id)}? press m to merge first, d to discard, Esc to cancel`
-            : `Delete ${shortId(run.id)}? press d to confirm, Esc to cancel`);
+        setDeletePrompt({ runId: run.id });
+        setNotice(`Delete ${shortId(run.id)}? press d to confirm, Esc to cancel`);
     }, [selectedRun]);
-    const confirmDelete = useCallback(async (mergeFirst) => {
+    const confirmDelete = useCallback(async () => {
         if (!deletePrompt) {
             return;
         }
         const runId = deletePrompt.runId;
         try {
-            await deleteRun(runId, { mergeFirst, force: true, silent: true });
+            await deleteRun(runId, { force: true, silent: true });
             setDeletePrompt(null);
             setSelectedRunId(undefined);
             setTargetRunId(undefined);
-            setNotice(`${mergeFirst ? "Merged and deleted" : "Deleted"} ${shortId(runId)}`);
+            setNotice(`Deleted ${shortId(runId)}`);
             await refresh();
         }
         catch (error) {
@@ -503,12 +499,8 @@ function RudderTui({ defaults }) {
                 setNotice("Delete cancelled");
                 return;
             }
-            if (value === "m" && deletePrompt.canMerge) {
-                void confirmDelete(true);
-                return;
-            }
-            if (value === "d" || key.delete || key.backspace) {
-                void confirmDelete(false);
+            if (value === "d") {
+                void confirmDelete();
                 return;
             }
             return;
@@ -746,7 +738,7 @@ function WorkerComposer(props) {
     return (_jsxs(Box, { flexDirection: "column", marginTop: 1, borderStyle: "single", borderColor: "cyan", paddingX: 1, children: [_jsxs(Box, { justifyContent: "space-between", children: [_jsxs(Text, { children: [_jsx(FocusPill, { label: label }), _jsxs(Text, { color: props.submitting ? "yellow" : "cyan", children: [" ", props.submitting ? "sending" : shortId(props.run.id)] }), _jsxs(Text, { children: ["  ", truncate(value, Math.max(8, props.width - 28))] }), _jsx(Text, { color: "cyan", children: "_" })] }), _jsx(Text, { color: "gray", children: active ? "running" : "resumable" })] }), _jsx(Text, { color: "gray", children: fitLine(`${helper}. Tab changes pane, Esc returns to task.`, props.width) })] }));
 }
 function Help() {
-    return (_jsxs(Box, { borderStyle: "single", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { bold: true, color: "yellow", children: "keys" }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "Tab" }), " focus agents/worker/task   ", _jsx(Text, { color: "cyan", children: "Enter" }), " submit focused input   ", _jsx(Text, { color: "cyan", children: "j/k" }), " select run"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "worker focus" }), " type to selected agent; running agents are interrupted on Enter   ", _jsx(Text, { color: "cyan", children: "n" }), " new task   ", _jsx(Text, { color: "cyan", children: "x" }), " expand   ", _jsx(Text, { color: "cyan", children: "l" }), " transcript"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "o" }), " model picker   ", _jsx(Text, { color: "cyan", children: "/" }), " command search   ", _jsx(Text, { color: "cyan", children: "d" }), " delete   ", _jsx(Text, { color: "cyan", children: "y" }), " copy transcript   ", _jsx(Text, { color: "cyan", children: "s" }), " stop   ", _jsx(Text, { color: "cyan", children: "m/M" }), " merge"] }), _jsx(Text, { color: "gray", children: "Slash: /backend claude|codex, /model, /model <name>, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit" })] }));
+    return (_jsxs(Box, { borderStyle: "single", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { bold: true, color: "yellow", children: "keys" }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "Tab" }), " focus agents/worker/task   ", _jsx(Text, { color: "cyan", children: "Enter" }), " submit focused input   ", _jsx(Text, { color: "cyan", children: "j/k" }), " select run"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "worker focus" }), " type to selected agent; running agents are interrupted on Enter   ", _jsx(Text, { color: "cyan", children: "n" }), " new task   ", _jsx(Text, { color: "cyan", children: "x" }), " expand   ", _jsx(Text, { color: "cyan", children: "l" }), " transcript"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "o" }), " model picker   ", _jsx(Text, { color: "cyan", children: "/" }), " command search   ", _jsx(Text, { color: "cyan", children: "dd" }), " delete   ", _jsx(Text, { color: "cyan", children: "y" }), " copy transcript   ", _jsx(Text, { color: "cyan", children: "s" }), " stop   ", _jsx(Text, { color: "cyan", children: "m/M" }), " merge"] }), _jsx(Text, { color: "gray", children: "Slash: /backend claude|codex, /model, /model <name>, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit" })] }));
 }
 function FocusPill(props) {
     return (_jsxs(Text, { backgroundColor: "cyan", color: "black", bold: true, children: [" ", props.label.toUpperCase(), " "] }));
@@ -779,9 +771,7 @@ function CommandMenu(props) {
 }
 function DeletePromptBox(props) {
     const contentWidth = Math.max(24, props.width - 4);
-    const action = props.prompt.canMerge
-        ? "m merge first, d discard run, Esc cancel"
-        : "d delete run, Esc cancel";
+    const action = "d delete run + worktree, Esc cancel";
     return (_jsx(Box, { width: props.width, borderStyle: "double", borderColor: "yellow", paddingX: 1, children: _jsx(Text, { color: "yellow", bold: true, children: fitLine(`delete ${shortId(props.prompt.runId)}?  ${action}`, contentWidth) }) }));
 }
 function MergePromptBox(props) {
@@ -789,7 +779,11 @@ function MergePromptBox(props) {
     const subject = props.prompt.kind === "selected"
         ? `merge ${shortId(props.prompt.runId)}  ${props.prompt.label}`
         : `merge ${props.prompt.runIds.length} completed run${props.prompt.runIds.length === 1 ? "" : "s"}`;
-    return (_jsxs(Box, { width: props.width, borderStyle: "double", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { color: "yellow", bold: true, children: fitLine(subject, contentWidth) }), _jsx(Text, { color: "gray", children: fitLine("press y to merge, n to cancel", contentWidth) })] }));
+    const prefix = "press ";
+    const action = "y to merge";
+    const suffix = ", n to cancel";
+    const hint = fitLine(`${prefix}${action}${suffix}`, contentWidth);
+    return (_jsxs(Box, { width: props.width, borderStyle: "double", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { color: "yellow", bold: true, children: fitLine(subject, contentWidth) }), _jsxs(Text, { children: [_jsx(Text, { color: "gray", children: hint.slice(0, prefix.length) }), _jsx(Text, { color: "red", bold: true, children: hint.slice(prefix.length, prefix.length + action.length) }), _jsx(Text, { color: "gray", children: hint.slice(prefix.length + action.length) })] })] }));
 }
 function MergeConflictPromptBox(props) {
     const contentWidth = Math.max(24, props.width - 4);
@@ -805,7 +799,7 @@ function StatusDock(props) {
     return (_jsxs(Box, { borderStyle: "single", borderColor: "gray", paddingX: 1, justifyContent: "space-between", children: [_jsx(Text, { color: "gray", children: "worker input is active inside the selected agent pane" }), _jsx(Text, { color: "gray", children: props.notice })] }));
 }
 function Footer(props) {
-    return (_jsx(Box, { children: _jsxs(Text, { color: "gray", children: ["focus:", props.focusPane, "  Tab focus  / commands  o model  n new  c worker  d delete  y copy  m/M merge  ? help"] }) }));
+    return (_jsx(Box, { children: _jsxs(Text, { color: "gray", children: ["focus:", props.focusPane, "  Tab focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help"] }) }));
 }
 async function loadUiRuns(repoRoot) {
     const runs = await listRuns(repoRoot);
@@ -1262,7 +1256,10 @@ function statusWord(run) {
         return "permission:";
     }
     const status = run.status;
-    if (status === "completed" || status === "merged") {
+    if (status === "merged") {
+        return "merged:";
+    }
+    if (status === "completed") {
         return "done:";
     }
     if (status === "failed" || status === "merge-conflict") {

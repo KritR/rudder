@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useInput, useWindowSize } from "ink";
 import { permissionAttentionFromOutput } from "./agent-attention.js";
 import { discoverEffortOptions, fallbackEffortOptions } from "./effort.js";
-import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
+import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions } from "./models.js";
 import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
 import { listRuns, loadConfig, outputPath, rememberBackendSelection } from "./state.js";
@@ -102,16 +102,6 @@ function AgentPane({ defaults }) {
                 setNotice("");
                 return;
             }
-            if (chunk === "m" && deleteIntent.canMerge) {
-                void deleteRun(deleteIntent.runId, { mergeFirst: true, force: true, silent: true })
-                    .then(() => {
-                    setDeleteIntent(null);
-                    setNotice(`deleted ${shortId(deleteIntent.runId)}`);
-                    return refresh();
-                })
-                    .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
-                return;
-            }
             if (chunk === "d") {
                 void deleteRun(deleteIntent.runId, { force: true, silent: true })
                     .then(() => {
@@ -138,7 +128,12 @@ function AgentPane({ defaults }) {
         }
         if (chunk === "m" && selectedRun) {
             void mergeRun(selectedRun.id, false, { silent: true })
-                .then(() => setNotice(`merged ${shortId(selectedRun.id)}`))
+                .then((merged) => {
+                setNotice(merged.merge?.status === "conflict"
+                    ? `merge conflict ${shortId(selectedRun.id)}`
+                    : `merged ${shortId(selectedRun.id)}`);
+                return refresh();
+            })
                 .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
             return;
         }
@@ -147,14 +142,8 @@ function AgentPane({ defaults }) {
             return;
         }
         if (chunk === "d" && selectedRun) {
-            void hasChanges(selectedRun.worktree.path)
-                .then((canMerge) => {
-                setDeleteIntent({ runId: selectedRun.id, canMerge: selectedRun.worktree.enabled && canMerge });
-                setNotice(selectedRun.worktree.enabled && canMerge
-                    ? "delete? press m to merge then delete, d to delete, Esc cancel"
-                    : "delete? press d to delete, Esc cancel");
-            })
-                .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+            setDeleteIntent({ runId: selectedRun.id });
+            setNotice("delete? press d to delete run + worktree, Esc cancel");
             return;
         }
         if (chunk === "q") {
@@ -164,7 +153,7 @@ function AgentPane({ defaults }) {
     const width = Math.max(24, size.columns);
     const maxRuns = Math.max(1, Math.floor((size.rows - 5) / 3));
     const visibleRuns = runs.slice(0, maxRuns);
-    return (_jsxs(Box, { flexDirection: "column", children: [_jsx(Text, { bold: true, children: "rudder" }), _jsx(Text, { color: "gray", children: summarize(`${shortenHome(repoRoot)} ${branch}`, width) }), _jsxs(Text, { children: ["agents ", _jsxs(Text, { color: "gray", children: [runs.length, " runs"] })] }), visibleRuns.length === 0 ? _jsx(Text, { color: "gray", children: "No agents yet." }) : visibleRuns.map((run) => (_jsxs(Box, { flexDirection: "column", children: [_jsxs(Text, { color: run.id === selectedRun?.id ? "cyan" : taskColor(run), children: [run.id === selectedRun?.id ? "> " : "  ", summarize(run.task, width - 3)] }), _jsxs(Text, { children: [_jsxs(Text, { color: runStatusColor(run), children: ["  ", statusMark(run)] }), _jsxs(Text, { color: "gray", children: ["  ", run.backend, " "] }), _jsx(Text, { color: "magenta", children: modelLabel(run, config) })] })] }, run.id))), notice ? _jsx(Text, { color: deleteIntent ? "red" : "yellow", children: summarize(notice, width) }) : null, _jsx(Text, { color: "gray", children: "j/k select  Enter focus  m merge  d delete" })] }));
+    return (_jsxs(Box, { flexDirection: "column", children: [_jsx(Text, { bold: true, children: "rudder" }), _jsx(Text, { color: "gray", children: summarize(`${shortenHome(repoRoot)} ${branch}`, width) }), _jsxs(Text, { children: ["agents ", _jsxs(Text, { color: "gray", children: [runs.length, " runs"] })] }), visibleRuns.length === 0 ? _jsx(Text, { color: "gray", children: "No agents yet." }) : visibleRuns.map((run) => (_jsxs(Box, { flexDirection: "column", children: [_jsxs(Text, { color: run.id === selectedRun?.id ? "cyan" : taskColor(run), children: [run.id === selectedRun?.id ? "> " : "  ", summarize(run.task, width - 3)] }), _jsxs(Text, { children: [_jsxs(Text, { color: runStatusColor(run), children: ["  ", statusMark(run)] }), _jsxs(Text, { color: "gray", children: ["  ", run.backend, " "] }), _jsx(Text, { color: "magenta", children: modelLabel(run, config) })] })] }, run.id))), notice ? _jsx(Text, { color: deleteIntent ? "red" : "yellow", children: summarize(notice, width) }) : null, _jsx(Text, { color: "gray", children: "j/k select  Enter focus  m merge  dd delete" })] }));
 }
 function TaskPane({ defaults }) {
     const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
