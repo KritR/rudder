@@ -1329,7 +1329,7 @@ async function byoVmBootstrapCommand(params: {
     ["RUDDER_REPO_NAME", params.repoName || ""],
   ];
   const lines = [
-    "docker run --rm -it",
+    "docker run --rm",
     ...env.map(([key, value]) => `  -e ${key}=${shellQuote(value)}`),
     `  ${shellQuote(flyWorkerImage)}`,
   ];

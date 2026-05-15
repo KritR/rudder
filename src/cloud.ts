@@ -13,6 +13,7 @@ import {
   nowIso,
   pathExists,
   promptText,
+  promptSelect,
   promptSecret,
   readJson,
   runCommand,
@@ -542,7 +543,9 @@ async function setupOAuthProvider(
 }
 
 async function setupByoc(args: string[], options: CloudCommandOptions): Promise<void> {
-  const host = (options.sshHost ?? args.join(" ").trim()) || await promptText("SSH host from ~/.ssh/config");
+  const sshConfigPath = path.join(os.homedir(), ".ssh", "config");
+  const configuredHosts = await listSshConfigHosts(sshConfigPath);
+  const host = (options.sshHost ?? args.join(" ").trim()) || await chooseByocHost(configuredHosts);
   if (!host) {
     throw new Error([
       "Missing BYOC SSH host.",
@@ -555,11 +558,14 @@ async function setupByoc(args: string[], options: CloudCommandOptions): Promise<
       "    HostName 203.0.113.10",
       "    User ubuntu",
       "    IdentityFile ~/.ssh/id_ed25519",
+      "",
+      configuredHosts.length
+        ? `Detected SSH hosts: ${configuredHosts.slice(0, 12).join(", ")}`
+        : `No usable hosts found in ${shortenHome(sshConfigPath)}.`,
     ].join("\n"));
   }
 
-  const sshConfigPath = path.join(os.homedir(), ".ssh", "config");
-  const configMentionsHost = await sshConfigMentions(sshConfigPath, host);
+  const configMentionsHost = configuredHosts.includes(host) || await sshConfigMentions(sshConfigPath, host);
   const diagnostics = await checkByocHost(host);
   await configureDefaultRuntime("byo-vm", options, host);
 
@@ -580,6 +586,17 @@ async function setupByoc(args: string[], options: CloudCommandOptions): Promise<
     console.log(`\nSSH check did not fully pass for ${host}: ${diagnostics.message}`);
     console.log("Fix SSH/Docker before launching, or run the printed Docker command manually on that host.");
   }
+}
+
+async function chooseByocHost(hosts: string[]): Promise<string> {
+  if (hosts.length === 0) {
+    return await promptText("SSH host from ~/.ssh/config");
+  }
+  return await promptSelect(
+    "Choose a BYOC SSH host from ~/.ssh/config",
+    hosts.slice(0, 24).map((host) => ({ value: host, label: host })),
+    hosts[0],
+  );
 }
 
 async function configureDefaultRuntime(runtime: CloudRuntime, options: CloudCommandOptions, byocSshHost?: string): Promise<void> {
@@ -693,6 +710,33 @@ async function sshConfigMentions(configPath: string, host: string): Promise<bool
   return false;
 }
 
+async function listSshConfigHosts(configPath: string): Promise<string[]> {
+  const text = await fsp.readFile(configPath, "utf8").catch(() => "");
+  const hosts: string[] = [];
+  const seen = new Set<string>();
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const match = /^Host\s+(.+)$/i.exec(trimmed);
+    if (!match) {
+      continue;
+    }
+    for (const host of match[1].split(/\s+/)) {
+      if (!host || host.includes("*") || host.includes("?") || host.startsWith("!")) {
+        continue;
+      }
+      if (seen.has(host)) {
+        continue;
+      }
+      seen.add(host);
+      hosts.push(host);
+    }
+  }
+  return hosts;
+}
+
 async function checkByocHost(host: string): Promise<{ ok: boolean; message: string }> {
   if (!commandExists("ssh")) {
     return { ok: false, message: "ssh is not installed or not on PATH" };
@@ -718,7 +762,7 @@ async function startByocWorkerOverSsh(host: string, bootstrapCommand: string): P
   }
   const remoteCommand = [
     "mkdir -p ~/.rudder/byoc",
-    `nohup sh -lc ${shellQuote(bootstrapCommand)} > ~/.rudder/byoc/worker.log 2>&1 < /dev/null &`,
+    `nohup sh -lc ${shellQuote(nonInteractiveDockerCommand(bootstrapCommand))} > ~/.rudder/byoc/worker.log 2>&1 < /dev/null &`,
   ].join(" && ");
   await runCommand("ssh", [
     "-o",
@@ -728,6 +772,13 @@ async function startByocWorkerOverSsh(host: string, bootstrapCommand: string): P
     host,
     remoteCommand,
   ]);
+}
+
+function nonInteractiveDockerCommand(command: string): string {
+  return command
+    .replace(/\bdocker run --rm -it\b/g, "docker run --rm")
+    .replace(/\bdocker run --rm -i -t\b/g, "docker run --rm")
+    .replace(/\bdocker run --rm -t -i\b/g, "docker run --rm");
 }
 
 async function cloudClient(options: { requireToken: boolean }): Promise<CloudClient> {

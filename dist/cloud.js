@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { currentBranch, currentCommit, findRepoRoot } from "./git.js";
 import { cloudAuthPath } from "./state.js";
-import { ensureDir, commandExists, expandHome, newRunId, nowIso, pathExists, promptText, promptSecret, readJson, runCommand, shortenHome, shellQuote, writeJson, } from "./util.js";
+import { ensureDir, commandExists, expandHome, newRunId, nowIso, pathExists, promptText, promptSelect, promptSecret, readJson, runCommand, shortenHome, shellQuote, writeJson, } from "./util.js";
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CLOUD_URL = "https://mpd2pmnpep.us-east-1.awsapprunner.com";
@@ -433,7 +433,9 @@ async function setupOAuthProvider(provider, args, options) {
     await printResult(result, options);
 }
 async function setupByoc(args, options) {
-    const host = (options.sshHost ?? args.join(" ").trim()) || await promptText("SSH host from ~/.ssh/config");
+    const sshConfigPath = path.join(os.homedir(), ".ssh", "config");
+    const configuredHosts = await listSshConfigHosts(sshConfigPath);
+    const host = (options.sshHost ?? args.join(" ").trim()) || await chooseByocHost(configuredHosts);
     if (!host) {
         throw new Error([
             "Missing BYOC SSH host.",
@@ -446,10 +448,13 @@ async function setupByoc(args, options) {
             "    HostName 203.0.113.10",
             "    User ubuntu",
             "    IdentityFile ~/.ssh/id_ed25519",
+            "",
+            configuredHosts.length
+                ? `Detected SSH hosts: ${configuredHosts.slice(0, 12).join(", ")}`
+                : `No usable hosts found in ${shortenHome(sshConfigPath)}.`,
         ].join("\n"));
     }
-    const sshConfigPath = path.join(os.homedir(), ".ssh", "config");
-    const configMentionsHost = await sshConfigMentions(sshConfigPath, host);
+    const configMentionsHost = configuredHosts.includes(host) || await sshConfigMentions(sshConfigPath, host);
     const diagnostics = await checkByocHost(host);
     await configureDefaultRuntime("byo-vm", options, host);
     if (options.json) {
@@ -470,6 +475,12 @@ async function setupByoc(args, options) {
         console.log(`\nSSH check did not fully pass for ${host}: ${diagnostics.message}`);
         console.log("Fix SSH/Docker before launching, or run the printed Docker command manually on that host.");
     }
+}
+async function chooseByocHost(hosts) {
+    if (hosts.length === 0) {
+        return await promptText("SSH host from ~/.ssh/config");
+    }
+    return await promptSelect("Choose a BYOC SSH host from ~/.ssh/config", hosts.slice(0, 24).map((host) => ({ value: host, label: host })), hosts[0]);
 }
 async function configureDefaultRuntime(runtime, options, byocSshHost) {
     const client = await cloudClient({ requireToken: true });
@@ -583,6 +594,32 @@ async function sshConfigMentions(configPath, host) {
     }
     return false;
 }
+async function listSshConfigHosts(configPath) {
+    const text = await fsp.readFile(configPath, "utf8").catch(() => "");
+    const hosts = [];
+    const seen = new Set();
+    for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) {
+            continue;
+        }
+        const match = /^Host\s+(.+)$/i.exec(trimmed);
+        if (!match) {
+            continue;
+        }
+        for (const host of match[1].split(/\s+/)) {
+            if (!host || host.includes("*") || host.includes("?") || host.startsWith("!")) {
+                continue;
+            }
+            if (seen.has(host)) {
+                continue;
+            }
+            seen.add(host);
+            hosts.push(host);
+        }
+    }
+    return hosts;
+}
 async function checkByocHost(host) {
     if (!commandExists("ssh")) {
         return { ok: false, message: "ssh is not installed or not on PATH" };
@@ -607,7 +644,7 @@ async function startByocWorkerOverSsh(host, bootstrapCommand) {
     }
     const remoteCommand = [
         "mkdir -p ~/.rudder/byoc",
-        `nohup sh -lc ${shellQuote(bootstrapCommand)} > ~/.rudder/byoc/worker.log 2>&1 < /dev/null &`,
+        `nohup sh -lc ${shellQuote(nonInteractiveDockerCommand(bootstrapCommand))} > ~/.rudder/byoc/worker.log 2>&1 < /dev/null &`,
     ].join(" && ");
     await runCommand("ssh", [
         "-o",
@@ -617,6 +654,12 @@ async function startByocWorkerOverSsh(host, bootstrapCommand) {
         host,
         remoteCommand,
     ]);
+}
+function nonInteractiveDockerCommand(command) {
+    return command
+        .replace(/\bdocker run --rm -it\b/g, "docker run --rm")
+        .replace(/\bdocker run --rm -i -t\b/g, "docker run --rm")
+        .replace(/\bdocker run --rm -t -i\b/g, "docker run --rm");
 }
 async function cloudClient(options) {
     const baseUrl = normalizeCloudUrl(process.env.RUDDER_CLOUD_URL);
