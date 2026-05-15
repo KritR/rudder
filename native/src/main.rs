@@ -4196,9 +4196,9 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off  /run"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /model"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -4297,9 +4297,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off  /run"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /model"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -4794,9 +4794,9 @@ fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> us
 
 fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off  /run"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /model"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
