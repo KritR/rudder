@@ -1220,7 +1220,11 @@ impl App {
         }
 
         if wants_mouse {
-            return self.write_scroll_to_selected_worker(mouse, area);
+            let wrote_mouse = self.write_scroll_to_selected_worker(mouse, area);
+            if alternate_screen && is_vertical_scroll_mouse_event(mouse.kind) {
+                return self.write_scroll_key_to_selected_worker(mouse) || wrote_mouse;
+            }
+            return wrote_mouse;
         }
         if alternate_screen {
             return self.write_scroll_key_to_selected_worker(mouse);
@@ -2549,6 +2553,65 @@ mod app_tests {
         assert_eq!(scroll_key_bytes(down), Some(b"\x1b[6~".to_vec()));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_wheel_scroll_sends_key_fallback_in_alternate_screen() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "stty raw -echo; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; cat -v",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.uses_alternate_screen() && pane.wants_sgr_mouse_events() {
+                break;
+            }
+        }
+
+        assert!(pane.uses_alternate_screen());
+        assert!(pane.wants_sgr_mouse_events());
+
+        let mut app = App::new();
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.scroll_selected_worker_or_forward(
+            mouse,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+        ));
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("^[[5~"), "output was {output:?}");
+    }
+
     #[test]
     fn extracts_selected_worker_text_across_visible_lines() {
         let lines = vec![
@@ -2887,6 +2950,43 @@ mod app_tests {
         app.task_cursor = app.task_input.chars().count();
 
         assert!(task_pane_height(&app, 40) > base_height);
+    }
+
+    fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
+        AgentRun {
+            id: "run-1".to_string(),
+            created_at: "1".to_string(),
+            mode: AgentMode::Execute,
+            task: "test task".to_string(),
+            current_prompt: "test task".to_string(),
+            turns: vec![AgentTurn {
+                ts: "1".to_string(),
+                prompt: "test task".to_string(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: "1".to_string(),
+            backend: Backend::Claude,
+            model: "sonnet".to_string(),
+            effort: None,
+            status: AgentStatus::Running,
+            cwd: app.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            terminal: Some(terminal),
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: false,
+            needs_permission: false,
+            permission_notified: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+        }
     }
 
     #[test]
@@ -3867,6 +3967,10 @@ fn is_scroll_mouse_event(kind: MouseEventKind) -> bool {
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight
     )
+}
+
+fn is_vertical_scroll_mouse_event(kind: MouseEventKind) -> bool {
+    matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
 }
 
 fn mouse_scrollback_delta(mouse: MouseEvent, viewport_height: u16) -> isize {
