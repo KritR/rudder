@@ -176,10 +176,34 @@ impl AgentMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseMode {
+    Native,
+    Rudder,
+}
+
+impl MouseMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Rudder => "rudder",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "native" | "ghostty" | "terminal" => Some(Self::Native),
+            "rudder" | "app" | "capture" => Some(Self::Rudder),
+            _ => None,
+        }
+    }
+}
+
 struct App {
     focus: FocusPane,
     nav_mode: bool,
     worker_view: WorkerView,
+    mouse_mode: MouseMode,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -296,6 +320,7 @@ enum SuggestionAction {
         model: String,
         effort: Option<EffortLevel>,
     },
+    SetMouseMode(MouseMode),
     ShowHelp,
 }
 
@@ -326,6 +351,7 @@ impl App {
             focus: FocusPane::Task,
             nav_mode: false,
             worker_view: WorkerView::Terminal,
+            mouse_mode: MouseMode::Native,
             cwd,
             branch: current_branch(),
             task_input: String::new(),
@@ -854,13 +880,48 @@ impl App {
                     ))
                 });
             }
+            SuggestionAction::SetMouseMode(mode) => {
+                self.task_input.clear();
+                self.task_cursor = 0;
+                self.picker_index = 0;
+                self.set_mouse_mode(mode);
+            }
             SuggestionAction::ShowHelp => {
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  m merge  M merge all  dd delete".to_string(),
+                    "Tab focus  Enter start/focus  /mouse native|rudder  m/M merge  dd delete"
+                        .to_string(),
                 );
+            }
+        }
+    }
+
+    fn set_mouse_mode(&mut self, mode: MouseMode) {
+        if self.mouse_mode == mode {
+            self.notice = Some(format!("mouse mode already {}", mode.as_str()));
+            return;
+        }
+
+        let result = set_terminal_mouse_capture(mode == MouseMode::Rudder);
+        match result {
+            Ok(()) => {
+                self.mouse_mode = mode;
+                self.worker_selection = None;
+                self.task_selection = None;
+                self.notice = Some(match mode {
+                    MouseMode::Native => {
+                        "mouse:native  Ghostty handles selection; use keyboard for panes"
+                            .to_string()
+                    }
+                    MouseMode::Rudder => {
+                        "mouse:rudder  Rudder handles clicks, wheel, and selection".to_string()
+                    }
+                });
+            }
+            Err(error) => {
+                self.notice = Some(format!("mouse mode failed: {error}"));
             }
         }
     }
@@ -976,6 +1037,10 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.mouse_mode == MouseMode::Native {
+            return;
+        }
+
         if self
             .agents_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
@@ -990,6 +1055,21 @@ impl App {
                 self.select_next_agent();
             }
             return;
+        }
+
+        if self.worker_selection.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            if let Some(worker_area) = self.worker_area {
+                self.focus = FocusPane::Worker;
+                self.task_selection = None;
+                if self.handle_worker_selection_mouse(mouse, block_inner(worker_area)) {
+                    return;
+                }
+            }
         }
 
         if let Some(task_area) = self
@@ -1057,6 +1137,7 @@ impl App {
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                self.autoscroll_worker_selection(mouse, area);
                 if let Some(selection) = self.worker_selection.as_mut() {
                     selection.end = selection_point_from_mouse(mouse, area);
                     true
@@ -1086,6 +1167,22 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn autoscroll_worker_selection(&mut self, mouse: MouseEvent, area: Rect) {
+        let rows = if mouse.row < area.y {
+            1
+        } else if mouse.row >= area.bottom() {
+            -1
+        } else {
+            0
+        };
+        if rows == 0 {
+            return;
+        }
+        if let Some(terminal) = self.selected_terminal_mut() {
+            terminal.scrollback_by(rows);
         }
     }
 
@@ -1633,6 +1730,23 @@ impl App {
                 }
                 true
             }
+            Some("/mouse") => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [] => {
+                        self.notice = Some(format!(
+                            "mouse:{}  usage: /mouse native|rudder",
+                            self.mouse_mode.as_str()
+                        ));
+                    }
+                    [mode] => match MouseMode::parse(mode) {
+                        Some(mode) => self.set_mouse_mode(mode),
+                        None => self.notice = Some("usage: /mouse native|rudder".to_string()),
+                    },
+                    _ => self.notice = Some("usage: /mouse native|rudder".to_string()),
+                }
+                true
+            }
             Some("/plan") => {
                 let task = parts.collect::<Vec<_>>().join(" ");
                 if task.trim().is_empty() {
@@ -1658,7 +1772,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  /plan  /run  /model  /login  /cloud  m/M merge"
+                    "Tab focus  Enter start/focus  /plan  /run  /model  /mouse native|rudder  m/M merge"
                         .to_string(),
                 );
                 true
@@ -2708,6 +2822,63 @@ mod app_tests {
         assert!(after.contains("line035"), "after was {after:?}");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_drag_selection_above_pane_autoscrolls() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("line040") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
+        app.mouse_mode = MouseMode::Rudder;
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+        app.worker_selection = Some(WorkerSelection {
+            start: SelectionPoint { row: 4, col: 0 },
+            end: SelectionPoint { row: 4, col: 4 },
+        });
+        let area = Rect {
+            x: 0,
+            y: 5,
+            width: 20,
+            height: 5,
+        };
+
+        assert!(app.handle_worker_selection_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 1,
+                row: 4,
+                modifiers: KeyModifiers::empty(),
+            },
+            area,
+        ));
+        assert!(app
+            .selected_terminal_mut()
+            .is_some_and(|terminal| terminal.scrollback() > 0));
+    }
+
     #[test]
     fn extracts_selected_worker_text_across_visible_lines() {
         let lines = vec![
@@ -3154,6 +3325,45 @@ mod app_tests {
     }
 
     #[test]
+    fn mouse_command_toggles_capture_mode() {
+        let mut app = App::new();
+        assert_eq!(app.mouse_mode, MouseMode::Native);
+
+        assert!(app.handle_command("/mouse rudder"));
+        assert_eq!(app.mouse_mode, MouseMode::Rudder);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("mouse:rudder")));
+
+        assert!(app.handle_command("/mouse native"));
+        assert_eq!(app.mouse_mode, MouseMode::Native);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("mouse:native")));
+
+        assert!(app.handle_command("/mouse nonsense"));
+        assert_eq!(app.mouse_mode, MouseMode::Native);
+        assert_eq!(app.notice.as_deref(), Some("usage: /mouse native|rudder"));
+    }
+
+    #[test]
+    fn mouse_suggestions_include_modes() {
+        let mut app = App::new();
+        app.task_input = "/mouse r".to_string();
+        app.task_cursor = app.task_input.chars().count();
+
+        let suggestions = suggestions_for(&app);
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion.label == "/mouse rudder"));
+        assert!(!suggestions
+            .iter()
+            .any(|suggestion| suggestion.label == "/mouse native"));
+    }
+
+    #[test]
     fn ctrl_c_exits_from_every_focus_pane() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let mut app = App::new();
@@ -3212,7 +3422,7 @@ fn setup_terminal() -> Result<Tui> {
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture,
+        DisableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -3220,6 +3430,20 @@ fn setup_terminal() -> Result<Tui> {
         )
     )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn set_terminal_mouse_capture(enabled: bool) -> Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let mut stdout = io::stdout();
+    if enabled {
+        execute!(stdout, EnableMouseCapture)?;
+    } else {
+        execute!(stdout, DisableMouseCapture)?;
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
@@ -3618,9 +3842,9 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run  /mouse"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model  /mouse"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -3694,6 +3918,11 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("({})", effort_label(app.effort)),
                 model_style(focused),
             ),
+            Span::raw("  "),
+            Span::styled(
+                format!("mouse:{}", app.mouse_mode.as_str()),
+                muted_style(focused),
+            ),
         ]));
         for line in wrapped_hint.into_iter().skip(1) {
             lines.push(Line::from(Span::styled(line, muted_style(focused))));
@@ -3719,9 +3948,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run  /mouse"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model  /mouse"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -4864,6 +5093,10 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
         );
     }
 
+    if input.starts_with("/mouse") {
+        return mouse_mode_suggestions(input.strip_prefix("/mouse").unwrap_or_default());
+    }
+
     let query = input.trim_start_matches('/').to_ascii_lowercase();
     command_suggestions()
         .into_iter()
@@ -4898,6 +5131,11 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/model ".to_string()),
         },
         Suggestion {
+            label: "/mouse".to_string(),
+            detail: "switch Ghostty native selection or Rudder mouse capture".to_string(),
+            action: SuggestionAction::Insert("/mouse ".to_string()),
+        },
+        Suggestion {
             label: "/login".to_string(),
             detail: "authenticate Rudder Cloud in the browser".to_string(),
             action: SuggestionAction::Insert("/login".to_string()),
@@ -4918,6 +5156,28 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::ShowHelp,
         },
     ]
+}
+
+fn mouse_mode_suggestions(rest: &str) -> Vec<Suggestion> {
+    let query = rest.trim_start().to_ascii_lowercase();
+    [
+        (
+            "native",
+            "Ghostty handles selection and scrollback; keyboard controls panes",
+        ),
+        (
+            "rudder",
+            "Rudder captures mouse for pane clicks, wheel, and custom selection",
+        ),
+    ]
+    .into_iter()
+    .filter(|(mode, _)| query.is_empty() || mode.starts_with(&query))
+    .map(|(mode, detail)| Suggestion {
+        label: format!("/mouse {mode}"),
+        detail: detail.to_string(),
+        action: SuggestionAction::SetMouseMode(MouseMode::parse(mode).unwrap()),
+    })
+    .collect()
 }
 
 fn model_provider_or_model_suggestions(rest: &str) -> Vec<Suggestion> {
