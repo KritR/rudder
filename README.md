@@ -178,7 +178,7 @@ or another full-screen app can scroll its own view.
 | --- | --- |
 | `Enter` | Start the typed task, or focus the selected worker when the task input is empty |
 | `Tab` / `Shift+Tab` | Cycle focus across agents, worker, and task panes |
-| `Alt-1` / `Alt-2` / `Alt-3` | Focus agents, worker, or task directly |
+| `Option-1` / `Option-2` / `Option-3` | Focus agents, worker, or task directly |
 | `Ctrl-G` | Toggle Rudder nav mode while focused inside a worker |
 | `Alt-v` | Toggle the selected agent's review view from any pane |
 | `Shift+Enter` | Insert a new line in the focused worker prompt |
