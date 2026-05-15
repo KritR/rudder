@@ -46,6 +46,7 @@ const FAILED_COLOR: Color = Color::Red;
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
+const AGENT_LIST_RUN_START_ROW: u16 = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -1050,6 +1051,17 @@ impl App {
             return;
         }
 
+        if let Some(agents_area) = self
+            .agents_area
+            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+        {
+            self.focus = FocusPane::Agents;
+            self.worker_selection = None;
+            self.task_selection = None;
+            self.handle_agents_mouse(mouse, agents_area);
+            return;
+        }
+
         let Some(worker_area) = self
             .worker_area
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
@@ -1073,6 +1085,22 @@ impl App {
         }
         if self.write_mouse_to_selected_worker(mouse, inner) {
             return;
+        }
+    }
+
+    fn handle_agents_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.set_mouse_debug(format!(
+            "mouse {:?} @{},{} pane=agents",
+            mouse.kind, mouse.column, mouse.row
+        ));
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        self.delete_pending = None;
+        if let Some(index) = agent_index_from_mouse(self, mouse, area) {
+            self.selected_agent = index;
         }
     }
 
@@ -3491,16 +3519,64 @@ mod app_tests {
         assert!(task_pane_height(&app, 40) > base_height);
     }
 
-    fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
+    #[test]
+    fn click_in_agent_pane_focuses_agents() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.agents_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 34,
+            height: 20,
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.focus, FocusPane::Agents);
+    }
+
+    #[test]
+    fn click_on_agent_row_selects_that_agent() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.agents_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 34,
+            height: 20,
+        });
+        app.agents.push(test_agent_run("run-1", "first task"));
+        app.agents.push(test_agent_run("run-2", "second task"));
+        app.selected_agent = 0;
+        app.delete_pending = Some("run-1".to_string());
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 14,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.focus, FocusPane::Agents);
+        assert_eq!(app.selected_agent, 1);
+        assert!(app.delete_pending.is_none());
+    }
+
+    fn test_agent_run(id: &str, task: &str) -> AgentRun {
         AgentRun {
-            id: "run-1".to_string(),
+            id: id.to_string(),
             created_at: "1".to_string(),
             mode: AgentMode::Execute,
-            task: "test task".to_string(),
-            current_prompt: "test task".to_string(),
+            task: task.to_string(),
+            current_prompt: task.to_string(),
             turns: vec![AgentTurn {
                 ts: "1".to_string(),
-                prompt: "test task".to_string(),
+                prompt: task.to_string(),
                 source: "user".to_string(),
             }],
             last_user_input_at: "1".to_string(),
@@ -3508,10 +3584,10 @@ mod app_tests {
             model: "sonnet".to_string(),
             effort: None,
             status: AgentStatus::Running,
-            cwd: app.cwd.clone(),
+            cwd: std::env::temp_dir(),
             worktree_branch: None,
             worktree_path: None,
-            terminal: Some(terminal),
+            terminal: None,
             terminal_size: None,
             review_terminal: None,
             review_size: None,
@@ -3526,6 +3602,13 @@ mod app_tests {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
         }
+    }
+
+    fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
+        let mut run = test_agent_run("run-1", "test task");
+        run.cwd = app.cwd.clone();
+        run.terminal = Some(terminal);
+        run
     }
 
     #[test]
@@ -4778,6 +4861,29 @@ fn task_selection_point_from_mouse(
             .saturating_sub(area.x)
             .min(width.saturating_sub(1)) as usize,
     })
+}
+
+fn agent_index_from_mouse(app: &App, mouse: MouseEvent, area: Rect) -> Option<usize> {
+    let inner = block_inner(area);
+    if !rect_contains(inner, mouse.column, mouse.row) {
+        return None;
+    }
+
+    let mut row = mouse.row.saturating_sub(inner.y);
+    if row < AGENT_LIST_RUN_START_ROW {
+        return None;
+    }
+
+    row -= AGENT_LIST_RUN_START_ROW;
+    for (index, agent) in app.agents.iter().enumerate() {
+        let row_count = 2 + u16::from(diff_short_summary(agent).is_some());
+        if row < row_count {
+            return Some(index);
+        }
+        row = row.saturating_sub(row_count);
+    }
+
+    None
 }
 
 fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> usize {
