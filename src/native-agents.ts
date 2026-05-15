@@ -135,16 +135,21 @@ function compact(values: Array<string | undefined>): string[] {
 }
 
 function stripRudderPromptWrappers(prompt: string): string {
+  const start = "[RUDDER PROMPT INJECTION]";
+  const endMarker = "[END RUDDER PROMPT INJECTION]";
   let value = prompt.trimStart();
   for (;;) {
     if (value.startsWith("USER TASK:")) {
       value = value.slice("USER TASK:".length).trimStart();
       continue;
     }
-    if (value.startsWith("[RUDDER PROMPT INJECTION]")) {
-      const end = value.indexOf("[END RUDDER PROMPT INJECTION]");
+    if (value.startsWith(start)) {
+      const afterStart = value.slice(start.length);
+      const end = afterStart.indexOf(endMarker);
       if (end >= 0) {
-        value = value.slice(end + "[END RUDDER PROMPT INJECTION]".length).trimStart();
+        const body = afterStart.slice(0, end).trim();
+        const rest = afterStart.slice(end + endMarker.length).trimStart();
+        value = rest.length ? rest : body;
         continue;
       }
     }
