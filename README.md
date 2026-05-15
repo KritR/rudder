@@ -81,6 +81,7 @@ should run locally or be handed to a cloud worker.
 rudder login
 rudder cloud
 rudder cloud list
+rudder cloud setup-vm
 rudder cloud onload <runId>
 rudder cloud migration-lab
 rudder sail staging-worker
@@ -94,6 +95,21 @@ Inside the dashboard, `/login` starts browser auth, `/cloud list` lists cloud
 workers after you are logged in, and `/cloud` starts a cloud worker with a
 generated memorable name. `/cloud <name>` and `/sail <name>` start named cloud
 workers. `/cloud help` shows the cloud command reference.
+
+Cloud workers use Fly Machines by default. To bring your own workstation or
+server instead, run:
+
+```bash
+rudder cloud setup-vm
+```
+
+After that, `rudder cloud <task>`, `/cloud <task>`, and `/sail <task>` prepare
+a BYO VM run and print a Docker command. Run that command on your server to
+download the encrypted snapshot, restore the selected HOME config, execute the
+task, and report heartbeats back to Rudder Cloud. Use `rudder cloud setup-fly`
+to switch future launches back to Fly, or `rudder cloud runtime [fly|byo-vm]`
+to inspect or change the saved runtime. For one launch without changing the
+default, use `rudder cloud vm "<task>"`.
 
 `rudder login` connects this machine to Rudder Cloud by opening the browser for
 the control plane's Better Auth login. If that browser login endpoint is
@@ -212,10 +228,12 @@ through suggestions and `Enter` to choose one.
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/login` | Open browser login for Rudder Cloud |
 | `/cloud` | Start a cloud worker with a generated name; requires `/login` first |
-| `/cloud <name>` | Start a named cloud worker from the current repo snapshot |
+| `/cloud <name or task>` | Start a named cloud worker; with BYO VM runtime, use the argument as the task |
+| `/cloud setup-vm` | Use your own VM for future cloud workers |
+| `/cloud runtime [fly\|byo-vm]` | Show or set the saved cloud runtime |
 | `/cloud list` | List cloud workers |
 | `/cloud help` | Show cloud command help |
-| `/sail <name>` | Short alias for starting a named cloud worker |
+| `/sail <name or task>` | Short alias for starting a cloud worker |
 | `/help` | Show the short command hint |
 
 Use `Ctrl-G` before a Rudder shortcut if the worker pane is focused and you want

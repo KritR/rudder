@@ -1850,7 +1850,8 @@ impl App {
         }
         let known = [
             "help", "login", "list", "ls", "onload", "sail", "launch", "pause", "resume", "status",
-            "stop", "logs",
+            "stop", "logs", "vm", "byo-vm", "bootstrap", "runtime", "setup", "setup-vm",
+            "setup-fly",
         ];
         let mut command = vec!["cloud".to_string()];
         if known.contains(&args[0]) {
@@ -3380,6 +3381,31 @@ mod app_tests {
         assert_eq!(
             app.cloud_command_args(vec!["visualization"]),
             vec!["cloud".to_string(), "visualization".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["setup", "vm"]),
+            vec!["cloud".to_string(), "setup".to_string(), "vm".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["setup-vm"]),
+            vec!["cloud".to_string(), "setup-vm".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["vm", "fix", "tests"]),
+            vec![
+                "cloud".to_string(),
+                "vm".to_string(),
+                "fix".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["bootstrap", "sail_123"]),
+            vec![
+                "cloud".to_string(),
+                "bootstrap".to_string(),
+                "sail_123".to_string()
+            ]
         );
     }
 
@@ -5791,6 +5817,11 @@ fn command_suggestions() -> Vec<Suggestion> {
             label: "/cloud".to_string(),
             detail: "list cloud workers, requires /login first".to_string(),
             action: SuggestionAction::RunCommand("/cloud".to_string()),
+        },
+        Suggestion {
+            label: "/cloud setup-vm".to_string(),
+            detail: "use your own VM for cloud workers".to_string(),
+            action: SuggestionAction::RunCommand("/cloud setup-vm".to_string()),
         },
         Suggestion {
             label: "/sail".to_string(),

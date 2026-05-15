@@ -33,10 +33,12 @@ type GithubBrowserLogin = {
 };
 
 type SailStatus = "queued" | "running" | "paused" | "completed" | "failed";
+type SailRuntime = "fly" | "byo-vm";
 
 type Sail = {
   id: string;
   status: SailStatus;
+  runtime: SailRuntime;
   repoName?: string;
   task?: string;
   branch?: string;
@@ -46,6 +48,7 @@ type Sail = {
   lastHeartbeatAt?: string;
   createdAt: string;
   updatedAt: string;
+  bootstrapCommand?: string;
 };
 
 type FlyMachine = {
@@ -146,6 +149,7 @@ database.exec(`
     id text primary key,
     account_id text not null,
     status text not null,
+    runtime text,
     repo_name text,
     task text,
     branch text,
@@ -166,6 +170,7 @@ database.exec(`
 `);
 ensureColumn("rudder_sails", "worker_token_hash", "text");
 ensureColumn("rudder_sails", "last_heartbeat_at", "text");
+ensureColumn("rudder_sails", "runtime", "text");
 
 const insertToken = database.prepare(`
   insert or replace into rudder_tokens (token_hash, account_id, email, created_at, last_used_at)
@@ -175,10 +180,10 @@ const findToken = database.prepare("select * from rudder_tokens where token_hash
 const touchToken = database.prepare("update rudder_tokens set last_used_at = ? where token_hash = ?");
 const insertSail = database.prepare(`
   insert into rudder_sails (
-    id, account_id, status, repo_name, task, branch, machine_id, machine_state,
+    id, account_id, status, runtime, repo_name, task, branch, machine_id, machine_state,
     snapshot_key, manifest_json, worker_token_hash, last_heartbeat_at, created_at, updated_at
   ) values (
-    @id, @accountId, @status, @repoName, @task, @branch, @machineId, @machineState,
+    @id, @accountId, @status, @runtime, @repoName, @task, @branch, @machineId, @machineState,
     @snapshotKey, @manifestJson, @workerTokenHash, @lastHeartbeatAt, @createdAt, @updatedAt
   )
 `);
@@ -198,9 +203,16 @@ const listSailsForAccount = database.prepare(
 const updateHeartbeat = database.prepare(`
   update rudder_sails
   set status = @status,
+      machine_state = @machineState,
       last_heartbeat_at = @lastHeartbeatAt,
       updated_at = @updatedAt
   where id = @id
+`);
+const updateWorkerToken = database.prepare(`
+  update rudder_sails
+  set worker_token_hash = @workerTokenHash,
+      updated_at = @updatedAt
+  where id = @id and account_id = @accountId
 `);
 const getSetting = database.prepare("select value from rudder_settings where key = ?");
 const upsertSetting = database.prepare(`
@@ -229,6 +241,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         s3: Boolean(snapshotBucket),
         fly: Boolean(flyApiToken && flyAppName && flyWorkerImage),
+        byoVm: Boolean(snapshotBucket && flyWorkerImage),
         state: Boolean(snapshotBucket && persistStateToS3),
         auth: configuredProviders(),
       });
@@ -994,6 +1007,17 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     sendJson(res, 200, sail);
     return;
   }
+  const bootstrapMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/bootstrap$/);
+  if (req.method === "POST" && bootstrapMatch) {
+    const sail = getAccountSail(bootstrapMatch[1], authContext.accountId);
+    if (!sail) {
+      sendJson(res, 404, { error: "sail not found" });
+      return;
+    }
+    const next = await refreshByoVmBootstrap(sail, authContext.accountId);
+    sendJson(res, 200, next);
+    return;
+  }
   const match = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/(pause|resume|onload|stop)$/);
   if (req.method === "POST" && match) {
     const sail = getAccountSail(match[1], authContext.accountId);
@@ -1001,7 +1025,7 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
       sendJson(res, 404, { error: "sail not found" });
       return;
     }
-    const next = await mutateFlySail(sail, authContext.accountId, match[2]);
+    const next = await mutateSail(sail, authContext.accountId, match[2]);
     sendJson(res, 200, next);
     return;
   }
@@ -1009,7 +1033,8 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
 }
 
 async function createSail(accountId: string, body: Json, preferredId?: string): Promise<Sail> {
-  ensureCloudRuntimeConfigured();
+  const runtime = sailRuntimeFromBody(body);
+  ensureCloudRuntimeConfigured(runtime);
   const now = new Date().toISOString();
   const snapshot = await storeSnapshot(accountId, body);
   const id = preferredId || uniqueSailId(stringField(body, "name"));
@@ -1024,11 +1049,12 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
     id,
     accountId,
     status: "queued",
+    runtime,
     repoName: repoName ?? null,
     task: task ?? null,
     branch: branch ?? null,
     machineId: null,
-    machineState: null,
+    machineState: runtime === "byo-vm" ? "bootstrap-pending" : null,
     snapshotKey: snapshot.key,
     manifestJson: JSON.stringify(manifest ?? {}),
     workerTokenHash: tokenHash(workerToken),
@@ -1036,6 +1062,32 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
     createdAt: now,
     updatedAt: now,
   });
+
+  if (runtime === "byo-vm") {
+    const sail = getAccountSail(id, accountId) ?? {
+      id,
+      status: "queued",
+      runtime,
+      repoName,
+      task,
+      branch,
+      machineState: "bootstrap-pending",
+      snapshotKey: snapshot.key,
+      createdAt: now,
+      updatedAt: now,
+    };
+    return {
+      ...sail,
+      bootstrapCommand: await byoVmBootstrapCommand({
+        sailId: id,
+        accountId,
+        snapshotKey: snapshot.key,
+        workerToken,
+        task,
+        repoName,
+      }),
+    };
+  }
 
   const snapshotUrl = await signedSnapshotUrl(snapshot.key);
   const machine = await createFlyMachine({
@@ -1058,6 +1110,7 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
   return getAccountSail(id, accountId) ?? {
     id,
     status,
+    runtime,
     repoName,
     task,
     branch,
@@ -1187,6 +1240,13 @@ async function createFlyMachine(params: {
   ).catch(() => machine);
 }
 
+async function mutateSail(sail: Sail, accountId: string, action: string): Promise<Sail> {
+  if (sail.runtime === "fly") {
+    return await mutateFlySail(sail, accountId, action);
+  }
+  throw badRequest("BYO VM sails cannot be paused, resumed, or stopped from Rudder Cloud. Stop the worker on your VM instead.");
+}
+
 async function mutateFlySail(sail: Sail, accountId: string, action: string): Promise<Sail> {
   if (!sail.machineId) {
     throw badRequest("sail does not have a Fly machine yet");
@@ -1221,6 +1281,61 @@ async function mutateFlySail(sail: Sail, accountId: string, action: string): Pro
   return getAccountSail(sail.id, accountId) ?? sail;
 }
 
+async function refreshByoVmBootstrap(sail: Sail, accountId: string): Promise<Sail> {
+  if (sail.runtime !== "byo-vm") {
+    throw badRequest("bootstrap is only available for BYO VM sails");
+  }
+  if (!sail.snapshotKey) {
+    throw badRequest("sail does not have a snapshot");
+  }
+  const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
+  const now = new Date().toISOString();
+  updateWorkerToken.run({
+    id: sail.id,
+    accountId,
+    workerTokenHash: tokenHash(workerToken),
+    updatedAt: now,
+  });
+  const next = getAccountSail(sail.id, accountId) ?? { ...sail, updatedAt: now };
+  return {
+    ...next,
+    bootstrapCommand: await byoVmBootstrapCommand({
+      sailId: sail.id,
+      accountId,
+      snapshotKey: sail.snapshotKey,
+      workerToken,
+      task: sail.task,
+      repoName: sail.repoName,
+    }),
+  };
+}
+
+async function byoVmBootstrapCommand(params: {
+  sailId: string;
+  accountId: string;
+  snapshotKey: string;
+  workerToken: string;
+  task?: string;
+  repoName?: string;
+}): Promise<string> {
+  const snapshotUrl = await signedSnapshotUrl(params.snapshotKey);
+  const env: Array<[string, string]> = [
+    ["RUDDER_SAIL_ID", params.sailId],
+    ["RUDDER_ACCOUNT_ID", params.accountId],
+    ["RUDDER_CLOUD_URL", baseURL],
+    ["RUDDER_WORKER_TOKEN", params.workerToken],
+    ["RUDDER_SNAPSHOT_URL", snapshotUrl],
+    ["RUDDER_TASK", params.task || ""],
+    ["RUDDER_REPO_NAME", params.repoName || ""],
+  ];
+  const lines = [
+    "docker run --rm -it",
+    ...env.map(([key, value]) => `  -e ${key}=${shellQuote(value)}`),
+    `  ${shellQuote(flyWorkerImage)}`,
+  ];
+  return lines.map((line, index) => index < lines.length - 1 ? `${line} \\` : line).join("\n");
+}
+
 async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, sailId: string): Promise<void> {
   const sailRow = findSailById.get(sailId) as Record<string, unknown> | undefined;
   if (!sailRow) {
@@ -1239,6 +1354,7 @@ async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, 
   updateHeartbeat.run({
     id: sailId,
     status,
+    machineState: state || status,
     lastHeartbeatAt: now,
     updatedAt: now,
   });
@@ -1246,11 +1362,11 @@ async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, 
 }
 
 async function refreshAccountSails(accountId: string): Promise<void> {
-  if (!flyApiToken || !flyAppName) {
-    return;
-  }
   const sails = listAccountSails(accountId);
   for (const sail of sails) {
+    if (sail.runtime !== "fly" || !flyApiToken || !flyAppName) {
+      continue;
+    }
     if (sail.status === "completed" || sail.status === "failed") {
       continue;
     }
@@ -1364,6 +1480,7 @@ function rowToSail(row: unknown): Sail {
   return {
     id: String(value.id),
     status: String(value.status) as SailStatus,
+    runtime: sailRuntimeValue(optionalString(value.runtime)),
     repoName: optionalString(value.repo_name),
     task: optionalString(value.task),
     branch: optionalString(value.branch),
@@ -1374,6 +1491,23 @@ function rowToSail(row: unknown): Sail {
     createdAt: String(value.created_at),
     updatedAt: String(value.updated_at),
   };
+}
+
+function sailRuntimeFromBody(body: Json): SailRuntime {
+  const worker = objectField(body, "worker");
+  const raw = stringField(body, "runtime") || stringField(worker, "type") || stringField(worker, "runtime");
+  return sailRuntimeValue(raw);
+}
+
+function sailRuntimeValue(raw: string | undefined): SailRuntime {
+  const value = (raw || "fly").trim().toLowerCase();
+  if (value === "fly" || value === "fly-machine" || value === "fly-machines") {
+    return "fly";
+  }
+  if (value === "byo" || value === "byo-vm" || value === "manual" || value === "self-hosted" || value === "vm") {
+    return "byo-vm";
+  }
+  throw badRequest(`unsupported cloud runtime: ${raw}`);
 }
 
 function flyStateToSailStatus(state: string | undefined): SailStatus {
@@ -1561,7 +1695,7 @@ async function readJsonBody(req: IncomingMessage): Promise<Json> {
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Json;
 }
 
-function objectField(value: Json, field: string): JsonRecord | undefined {
+function objectField(value: Json | undefined, field: string): JsonRecord | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
@@ -1569,7 +1703,7 @@ function objectField(value: Json, field: string): JsonRecord | undefined {
   return next && typeof next === "object" && !Array.isArray(next) ? next : undefined;
 }
 
-function stringField(value: Json, field: string): string | undefined {
+function stringField(value: Json | undefined, field: string): string | undefined {
   return value && typeof value === "object" && !Array.isArray(value) && typeof value[field] === "string"
     ? value[field]
     : undefined;
@@ -1595,6 +1729,10 @@ function escapeHtml(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 async function getBetterAuthSession(req: IncomingMessage): Promise<{ user?: { id?: string; email?: string } } | null> {
@@ -1654,9 +1792,11 @@ function splitSetCookieHeader(value: string | null): string[] {
   return value.split(/,(?=\s*[^;,]+=)/).map((cookie) => cookie.trim()).filter(Boolean);
 }
 
-function ensureCloudRuntimeConfigured(): void {
+function ensureCloudRuntimeConfigured(runtime: SailRuntime): void {
   ensureS3Configured();
-  ensureFlyConfigured();
+  if (runtime === "fly") {
+    ensureFlyConfigured();
+  }
 }
 
 function ensureS3Configured(): void {

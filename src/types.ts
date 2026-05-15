@@ -230,6 +230,7 @@ export type CloudAuthState = {
   version: 1;
   token: string;
   cloudUrl: string;
+  defaultRuntime?: "fly" | "byo-vm";
   accountId?: string;
   email?: string;
   expiresAt?: string;
