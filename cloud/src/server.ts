@@ -1328,12 +1328,20 @@ async function byoVmBootstrapCommand(params: {
     ["RUDDER_TASK", params.task || ""],
     ["RUDDER_REPO_NAME", params.repoName || ""],
   ];
-  const lines = [
+  const armWorkerImage = imageWithTag(flyWorkerImage, "arm64");
+  const dockerLines = [
     "docker run --rm",
     ...env.map(([key, value]) => `  -e ${key}=${shellQuote(value)}`),
-    `  ${shellQuote(flyWorkerImage)}`,
+    "  \"$RUDDER_WORKER_IMAGE\"",
   ];
-  return lines.map((line, index) => index < lines.length - 1 ? `${line} \\` : line).join("\n");
+  const dockerCommand = dockerLines.map((line, index) => index < dockerLines.length - 1 ? `${line} \\` : line).join("\n");
+  return [
+    `RUDDER_WORKER_IMAGE=${shellQuote(flyWorkerImage)}`,
+    "case \"$(uname -m)\" in",
+    `  aarch64|arm64) RUDDER_WORKER_IMAGE=${shellQuote(armWorkerImage)} ;;`,
+    "esac",
+    dockerCommand,
+  ].join("\n");
 }
 
 async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, sailId: string): Promise<void> {
@@ -1729,6 +1737,18 @@ function escapeHtml(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function imageWithTag(image: string, tag: string): string {
+  if (image.includes("@")) {
+    return image;
+  }
+  const slashIndex = image.lastIndexOf("/");
+  const tagIndex = image.lastIndexOf(":");
+  if (tagIndex > slashIndex) {
+    return `${image.slice(0, tagIndex + 1)}${tag}`;
+  }
+  return `${image}:${tag}`;
 }
 
 function shellQuote(value: string): string {

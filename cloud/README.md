@@ -167,9 +167,14 @@ Rudder Cloud creates one Fly Machine per sail through the Fly Machines API.
 should be an image built from `worker/Dockerfile`.
 
 ```bash
-docker buildx build --platform linux/amd64 \
+docker buildx build --platform linux/amd64,linux/arm64 \
   -f cloud/worker/Dockerfile \
   -t public.ecr.aws/exla/rudder-worker:latest \
+  --push .
+
+docker buildx build --platform linux/arm64 \
+  -f cloud/worker/Dockerfile \
+  -t public.ecr.aws/exla/rudder-worker:arm64 \
   --push .
 ```
 
