@@ -665,6 +665,9 @@ async function shouldIncludeSnapshotPath(candidate: string): Promise<boolean> {
   const normalized = path.resolve(candidate);
   const parts = normalized.split(path.sep).map((part) => part.toLowerCase());
   const basename = path.basename(normalized).toLowerCase();
+  if (basename.startsWith("._")) {
+    return false;
+  }
   if (parts.some((part) => SECRET_PATH_PARTS.has(part)) || SECRET_BASENAMES.has(basename)) {
     return false;
   }

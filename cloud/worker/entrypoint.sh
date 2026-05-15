@@ -24,6 +24,7 @@ tar -xzf snapshot.tgz -C unpacked
 if [ -d unpacked/home ]; then
   echo "Restoring selected HOME config..."
   cp -R unpacked/home/. "$HOME"/ 2>/dev/null || true
+  find "$HOME" -name '._*' -delete 2>/dev/null || true
 fi
 
 if [ -d unpacked/repo ]; then
