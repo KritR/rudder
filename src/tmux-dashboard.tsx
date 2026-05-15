@@ -7,7 +7,7 @@ import { permissionAttentionFromOutput, type AgentAttention } from "./agent-atte
 import { discoverEffortOptions, fallbackEffortOptions, type EffortOption } from "./effort.js";
 import { currentBranch, findRepoRoot, hasChanges } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
-import { startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
+import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
 import { listRuns, loadConfig, outputPath, rememberBackendSelection } from "./state.js";
 import {
   loadTmuxDashboardState,
@@ -47,6 +47,9 @@ type SlashCommand = {
 const SLASH_COMMANDS: SlashCommand[] = [
   { label: "/backend claude", detail: "use Claude Code for new tasks", value: "/backend claude" },
   { label: "/backend codex", detail: "use Codex for new tasks", value: "/backend codex" },
+  { label: "/plan", detail: "toggle Rudder read-only plan mode", value: "/plan" },
+  { label: "/plan <task>", detail: "plan one task without toggling", value: "/plan ", complete: "/plan " },
+  { label: "/run <task>", detail: "start implementation even when plan mode is on", value: "/run ", complete: "/run " },
   { label: "/model", detail: "pick from available models", value: "/model" },
   { label: "/model <id>", detail: "set model for new tasks", value: "/model ", complete: "/model " },
   { label: "/clear", detail: "clear the task input", value: "/clear" },
@@ -231,6 +234,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
   const [model, setModel] = useState<string | undefined>(defaults.model);
   const [effort, setEffort] = useState<EffortLevel | undefined>();
   const [input, setInput] = useState("");
+  const [planMode, setPlanMode] = useState(false);
   const inputRef = useRef("");
   const taskHistoryRef = useRef<string[]>([]);
   const taskHistoryIndexRef = useRef<number | null>(null);
@@ -420,6 +424,34 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setPendingModel(null);
       return;
     }
+    if (task === "/plan") {
+      setPlanMode((current) => {
+        const next = !current;
+        setNotice(next ? "Plan mode on: Enter starts a read-only planner" : "Plan mode off");
+        return next;
+      });
+      setTaskInput("");
+      setModelPickerOpen(false);
+      return;
+    }
+    if (task.startsWith("/plan ")) {
+      const planTask = task.slice("/plan ".length).trim();
+      if (!planTask) {
+        setNotice("Usage: /plan <task>");
+        return;
+      }
+      await startPlanner(planTask);
+      return;
+    }
+    if (task.startsWith("/run ")) {
+      const runTask = task.slice("/run ".length).trim();
+      if (!runTask) {
+        setNotice("Usage: /run <task>");
+        return;
+      }
+      await startWorker(runTask);
+      return;
+    }
     if (task.startsWith("/model ")) {
       const nextModel = task.slice("/model ".length).trim() || undefined;
       setModel(nextModel);
@@ -454,7 +486,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     }
     if (task === "/help") {
       setTaskInput("");
-      setNotice("/backend claude|codex, /model, /model <id>, /clear, /detach");
+      setNotice("/plan toggles read-only planning, /run bypasses it, /backend claude|codex, /model");
       return;
     }
     if (task === "/detach") {
@@ -465,6 +497,14 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       setNotice("Unknown command. Type / to see commands.");
       return;
     }
+    if (planMode) {
+      await startPlanner(task);
+      return;
+    }
+    await startWorker(task);
+  }, [backend, config, defaults.tmuxSessionName, effort, effortOptionsFor, model, modelIndex, modelOptions, modelPickerStep, pendingModel, planMode, rememberTaskHistory, repoRoot, setTaskInput, submitting]);
+
+  async function startWorker(task: string): Promise<void> {
     const state = await loadTmuxDashboardState(repoRoot, defaults.tmuxSessionName);
     if (!state) {
       setNotice("Rudder tmux state is missing. Reopen rudder.");
@@ -490,7 +530,35 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     } finally {
       setSubmitting(false);
     }
-  }, [backend, config, defaults.tmuxSessionName, effort, effortOptionsFor, model, modelIndex, modelOptions, modelPickerStep, pendingModel, rememberTaskHistory, repoRoot, setTaskInput, submitting]);
+  }
+
+  async function startPlanner(task: string): Promise<void> {
+    const state = await loadTmuxDashboardState(repoRoot, defaults.tmuxSessionName);
+    if (!state) {
+      setNotice("Rudder tmux state is missing. Reopen rudder.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const run = await startNativePlan({
+        task,
+        backend,
+        model,
+        effort,
+        tmuxSessionName: defaults.tmuxSessionName,
+        workerPaneId: state.workerPaneId,
+        focus: true,
+        silent: true,
+      });
+      await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model, effort });
+      setTaskInput("");
+      setNotice("Read-only planner started");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   useInput((chunk, key) => {
     if (key.ctrl && chunk === "c") {
@@ -633,6 +701,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
 
   const configured = model || (backend === "claude" ? config?.backends.claude?.model : config?.backends.codex?.model) || "default";
   const configuredEffort = effort || effortForBackend(backend, config) || "auto";
+  const entryMode = planMode ? "plan" : "run";
 
   return (
     <Box flexDirection="column">
@@ -648,7 +717,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
           ? <EffortMenu option={pendingModel ?? modelOptions[modelIndex]} selected={effortIndex} backend={toNativeBackend(pendingModel?.backend ?? backend)} options={effortOptionsFor(toNativeBackend(pendingModel?.backend ?? backend))} />
           : <ModelMenu options={modelOptions} selected={modelIndex} backend={backend} />
       ) : (
-        <Text color="gray">Enter start  Up/Down history  Tab focus pane  / commands  {backend} {configured} {configuredEffort}</Text>
+        <Text color="gray">Enter {entryMode}  Up/Down history  Tab focus pane  /plan  /run  {backend} {configured} {configuredEffort}</Text>
       )}
     </Box>
   );
@@ -793,6 +862,7 @@ function playCompletionSound(): void {
 
 function statusMark(run: AgentPaneRun): string {
   if (runNeedsPermission(run)) return "needs permission";
+  if (run.mode === "plan" && isActiveRun(run)) return "planning";
   if (run.status === "merged") return "merged";
   if (run.status === "completed") return "done";
   if (run.status === "failed" || run.status === "merge-conflict") return "failed";
@@ -824,7 +894,8 @@ function modelLabel(run: RunRecord, config: RudderConfig | null): string {
       : config?.backends.codex?.model)
     ?? "default";
   const effort = run.effort ?? effortForBackend(toNativeBackend(run.backend), config);
-  return summarize(`${model} ${effort ?? "auto"}`, 18);
+  const mode = run.mode === "plan" ? "plan " : "";
+  return summarize(`${mode}${model} ${effort ?? "auto"}`, 18);
 }
 
 function modelForBackend(backend: NativeBackendId, config: RudderConfig | null): string | undefined {
@@ -878,7 +949,7 @@ function isExactRunnableCommand(input: string): boolean {
 }
 
 function resolveSlashCommand(input: string): SlashCommand | undefined {
-  if (!input.startsWith("/") || input.startsWith("/model ")) {
+  if (!input.startsWith("/") || input.startsWith("/model ") || input.startsWith("/plan ") || input.startsWith("/run ")) {
     return undefined;
   }
   if (isExactRunnableCommand(input)) {

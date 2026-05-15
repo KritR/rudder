@@ -172,6 +172,9 @@ dashboard from any pane.
 | `PageUp` / `PageDown` | Scroll the focused worker pane by roughly one page |
 | `j` / `k` or arrows | Move through agents when the agents pane is focused |
 | `Ctrl-C` | Leave Rudder from any pane |
+| `/plan` | Toggle Rudder's read-only plan mode for task pane submissions |
+| `/plan <task>` | Start one read-only planning session without toggling plan mode |
+| `/run <task>` | Start an implementation run even when plan mode is on |
 | `/model` | Open the provider-first model picker |
 | `/help` | Show the short command hint |
 | `v` | Toggle the selected agent's review view |
@@ -227,6 +230,29 @@ codex --ask-for-approval never --sandbox danger-full-access \
 ```
 
 The exact model and effort flags are omitted when set to `auto`.
+
+## Plan Mode
+
+Rudder has its own plan mode in the task pane. Type `/plan` to toggle it on or
+off. While it is on, pressing `Enter` starts a planner instead of an
+implementation run. You can also use `/plan <task>` for a one-off plan, or
+`/run <task>` to bypass plan mode and start a normal worktree agent.
+
+Planning sessions use the currently selected Claude or Codex model, but Rudder
+owns the behavior:
+
+- The planner runs in the current checkout instead of creating a worktree.
+- The prompt tells the model to inspect first, ask follow-up questions when the
+  plan cannot be made decision-complete from read-only context, and return the
+  final answer in a `<proposed_plan>` block.
+- Codex planners launch with `--sandbox read-only`, `--ask-for-approval never`,
+  and `--search`, so filesystem writes are blocked and the native Responses
+  `web_search` tool is available.
+- Claude planners launch with default permission mode, only file/search/web
+  tools enabled, and Bash plus write/edit tools denied so shell writes and
+  destructive commands are not available.
+- Normal implementation runs are unchanged: they still create worktrees and use
+  the full-permission worker launch described above.
 
 ## Worktrees And Merging
 
