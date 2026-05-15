@@ -198,6 +198,7 @@ struct App {
     conflict_prompt: Option<MergeConflictPrompt>,
     picker_index: usize,
     worker_selection: Option<WorkerSelection>,
+    task_selection: Option<WorkerSelection>,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
@@ -343,6 +344,7 @@ impl App {
             conflict_prompt: None,
             picker_index: 0,
             worker_selection: None,
+            task_selection: None,
             agents_area: None,
             worker_area: None,
             task_area: None,
@@ -595,6 +597,7 @@ impl App {
     }
 
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
+        self.task_selection = None;
         if self.task_history_index.is_some() {
             match key.code {
                 KeyCode::Up => {
@@ -722,6 +725,7 @@ impl App {
     fn replace_task_input(&mut self, value: String) {
         self.task_input = value;
         self.task_cursor = self.task_input.chars().count();
+        self.task_selection = None;
         self.picker_index = 0;
         self.clamp_picker_index();
     }
@@ -943,6 +947,18 @@ impl App {
             return;
         }
 
+        if let Some(task_area) = self
+            .task_area
+            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+        {
+            self.focus = FocusPane::Task;
+            self.worker_selection = None;
+            if self.handle_task_selection_mouse(mouse, block_inner(task_area)) {
+                return;
+            }
+            return;
+        }
+
         let Some(worker_area) = self
             .worker_area
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
@@ -951,6 +967,7 @@ impl App {
         };
 
         self.focus = FocusPane::Worker;
+        self.task_selection = None;
         let inner = block_inner(worker_area);
 
         if self.worker_view == WorkerView::Diff {
@@ -968,10 +985,9 @@ impl App {
         }
 
         if is_scroll_mouse_event(mouse.kind) {
-            if self.write_scroll_to_selected_worker(mouse, inner) {
+            if self.scroll_selected_worker_or_forward(mouse, inner) {
                 return;
             }
-            self.scroll_worker(mouse_scrollback_delta(mouse, inner.height));
             return;
         }
         if self.handle_worker_selection_mouse(mouse, inner) {
@@ -1021,6 +1037,68 @@ impl App {
                 }
                 match copy_text_to_clipboard(&text) {
                     Ok(()) => self.notice = Some("copied worker selection".to_string()),
+                    Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_task_selection_mouse(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let Some(point) = task_selection_point_from_mouse(self, mouse, area) else {
+            return false;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.task_selection = Some(WorkerSelection {
+                    start: point,
+                    end: point,
+                });
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = self.task_selection.as_mut() {
+                    selection.end = point;
+                    true
+                } else {
+                    false
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(mut selection) = self.task_selection else {
+                    self.task_cursor = task_cursor_from_selection_point(
+                        &self.task_input,
+                        point,
+                        task_inner_width(area),
+                    );
+                    return true;
+                };
+                selection.end = point;
+                self.task_selection = Some(selection);
+                let normalized = normalize_selection(selection);
+                if selection_is_empty(normalized) {
+                    self.task_selection = None;
+                    self.task_cursor = task_cursor_from_selection_point(
+                        &self.task_input,
+                        point,
+                        task_inner_width(area),
+                    );
+                    return true;
+                }
+                let input_lines = task_input_lines(
+                    &self.task_input,
+                    self.task_cursor,
+                    task_inner_width(area),
+                );
+                let text = selected_text_from_lines(&input_lines, selection);
+                if text.trim().is_empty() {
+                    self.notice = Some("selection empty".to_string());
+                    return true;
+                }
+                match copy_text_to_clipboard(&text) {
+                    Ok(()) => self.notice = Some("copied task selection".to_string()),
                     Err(error) => self.notice = Some(format!("copy failed: {error}")),
                 }
                 true
@@ -1080,6 +1158,22 @@ impl App {
             self.set_selected_error(error.to_string());
         }
         true
+    }
+
+    fn scroll_selected_worker_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let rows = mouse_scrollback_delta(mouse, area.height);
+        let Some(terminal) = self.selected_terminal_mut() else {
+            return false;
+        };
+
+        let before = terminal.scrollback();
+        terminal.scrollback_by(rows);
+        let after = terminal.scrollback();
+        if after != before {
+            return true;
+        }
+
+        self.write_scroll_to_selected_worker(mouse, area)
     }
 
     fn write_mouse_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
@@ -1142,12 +1236,6 @@ impl App {
         };
         if let Err(error) = result {
             self.set_selected_error(error.to_string());
-        }
-    }
-
-    fn scroll_worker(&mut self, rows: isize) {
-        if let Some(terminal) = self.selected_terminal_mut() {
-            terminal.scrollback_by(rows);
         }
     }
 
@@ -2421,6 +2509,35 @@ mod app_tests {
     }
 
     #[test]
+    fn maps_task_mouse_selection_to_wrapped_input() {
+        let mut app = App::new();
+        app.task_input = "abcdef".to_string();
+        app.task_cursor = app.task_input.chars().count();
+        app.notice = Some("hint".to_string());
+        let area = Rect {
+            x: 10,
+            y: 4,
+            width: 3,
+            height: 8,
+        };
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 11,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert_eq!(
+            task_selection_point_from_mouse(&app, mouse, area),
+            Some(SelectionPoint { row: 1, col: 1 })
+        );
+        assert_eq!(
+            task_cursor_from_selection_point(&app.task_input, SelectionPoint { row: 1, col: 1 }, 3),
+            4
+        );
+    }
+
+    #[test]
     fn wraps_worker_paste_as_single_bracketed_paste_payload() {
         assert_eq!(
             bracketed_paste_bytes("hello\nworld"),
@@ -3194,11 +3311,19 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         0
     };
     let input_start = input_start.min(input_lines.len().saturating_sub(1));
+    let task_selection = if app.task_input.is_empty() {
+        None
+    } else {
+        app.task_selection
+            .map(normalize_selection)
+            .filter(|selection| !selection_is_empty(*selection))
+    };
     let mut lines = input_lines
         .iter()
         .skip(input_start)
         .take(max_input_lines)
-        .map(|line| {
+        .enumerate()
+        .map(|(offset, line)| {
             let display = if app.task_input.is_empty() {
                 if app.plan_mode {
                     "Type a task to plan or /run"
@@ -3213,7 +3338,12 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 pane_text_style(focused)
             };
-            Line::from(Span::styled(display.to_string(), style))
+            let row = input_start + offset;
+            styled_plain_line(
+                display,
+                style,
+                selection_for_row(task_selection, row).filter(|_| !app.task_input.is_empty()),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -3720,6 +3850,74 @@ fn selection_point_from_mouse(mouse: MouseEvent, area: Rect) -> SelectionPoint {
     }
 }
 
+fn task_selection_point_from_mouse(app: &App, mouse: MouseEvent, area: Rect) -> Option<SelectionPoint> {
+    if !rect_contains(area, mouse.column, mouse.row) {
+        return None;
+    }
+    let width = task_inner_width(area);
+    let input_lines = task_input_lines(&app.task_input, app.task_cursor, width);
+    let input_start = task_visible_input_start(app, area, &input_lines);
+    let visible_count = task_visible_input_count(app, area, input_lines.len());
+    let rel_row = mouse.row.saturating_sub(area.y) as usize;
+    if rel_row >= visible_count {
+        return None;
+    }
+    let row = input_start.saturating_add(rel_row);
+    if row >= input_lines.len() {
+        return None;
+    }
+    Some(SelectionPoint {
+        row,
+        col: mouse
+            .column
+            .saturating_sub(area.x)
+            .min(width.saturating_sub(1)) as usize,
+    })
+}
+
+fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> usize {
+    let width = task_inner_width(area);
+    let (cursor_line, _) = task_cursor_position(&app.task_input, app.task_cursor, width);
+    let max_input_lines = task_visible_input_count(app, area, input_lines.len());
+    let input_start = if input_lines.len() > max_input_lines {
+        cursor_line.saturating_sub(max_input_lines.saturating_sub(1))
+    } else {
+        0
+    };
+    input_start.min(input_lines.len().saturating_sub(1))
+}
+
+fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
+    let default_hint = if app.plan_mode {
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
+    } else {
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
+    };
+    let hint = app.notice.as_deref().unwrap_or(default_hint);
+    let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
+    (area.height.max(1) as usize)
+        .saturating_sub(hint_line_count)
+        .max(1)
+        .min(input_line_count.max(1))
+}
+
+fn task_inner_width(area: Rect) -> u16 {
+    area.width.max(1)
+}
+
+fn task_cursor_from_selection_point(value: &str, point: SelectionPoint, width: u16) -> usize {
+    let lines = wrap_input_text(value, width);
+    let mut cursor = 0;
+    for (row, line) in lines.iter().enumerate() {
+        let line_len = line.chars().count();
+        if row == point.row {
+            return cursor + point.col.min(line_len);
+        }
+        cursor += line_len;
+    }
+    value.chars().count()
+}
+
 fn normalize_selection(selection: WorkerSelection) -> NormalizedSelection {
     let (start, end) =
         if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
@@ -3852,6 +4050,38 @@ fn styled_terminal_line(
             Span::styled(cell.contents, style)
         })
         .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn styled_plain_line(text: &str, style: Style, selection: Option<(usize, usize)>) -> Line<'static> {
+    let Some((start, end)) = selection else {
+        return Line::from(Span::styled(text.to_string(), style));
+    };
+    let mut spans = Vec::new();
+    let chars = text.chars().collect::<Vec<_>>();
+    let clamped_start = start.min(chars.len());
+    let clamped_end = end.saturating_add(1).min(chars.len());
+    if clamped_start > 0 {
+        spans.push(Span::styled(
+            chars[..clamped_start].iter().collect::<String>(),
+            style,
+        ));
+    }
+    if clamped_end > clamped_start {
+        spans.push(Span::styled(
+            chars[clamped_start..clamped_end].iter().collect::<String>(),
+            style.fg(Color::Black).bg(FOCUS_COLOR),
+        ));
+    }
+    if clamped_end < chars.len() {
+        spans.push(Span::styled(
+            chars[clamped_end..].iter().collect::<String>(),
+            style,
+        ));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), style));
+    }
     Line::from(spans)
 }
 
