@@ -80,6 +80,7 @@ should run locally or be handed to a cloud worker.
 ```bash
 rudder login
 rudder cloud list
+rudder cloud setup-vm
 rudder cloud onload <runId>
 rudder cloud "fix the long-running migration"
 rudder sail "try the alternate parser"
@@ -92,6 +93,21 @@ override it for local development or another deployment.
 Inside the dashboard, `/login` starts browser auth, `/cloud` lists cloud
 workers after you are logged in, and `/sail <task>` starts a cloud worker.
 `/cloud <task>` also starts a cloud worker for that task.
+
+Cloud workers use Fly Machines by default. To bring your own workstation or
+server instead, run:
+
+```bash
+rudder cloud setup-vm
+```
+
+After that, `rudder cloud <task>`, `/cloud <task>`, and `/sail <task>` prepare
+a BYO VM run and print a Docker command. Run that command on your server to
+download the encrypted snapshot, restore the selected HOME config, execute the
+task, and report heartbeats back to Rudder Cloud. Use `rudder cloud setup-fly`
+to switch future launches back to Fly, or `rudder cloud runtime [fly|byo-vm]`
+to inspect or change the saved runtime. For one launch without changing the
+default, use `rudder cloud vm "<task>"`.
 
 `rudder login` connects this machine to Rudder Cloud by opening the browser for
 the control plane's Better Auth login. If that browser login endpoint is
@@ -210,6 +226,7 @@ through suggestions and `Enter` to choose one.
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/login` | Open browser login for Rudder Cloud |
 | `/cloud` | List cloud workers; requires `/login` first |
+| `/cloud setup-vm` | Use your own VM for future cloud workers |
 | `/cloud <task>` | Start a cloud worker for a task |
 | `/sail <task>` | Short alias for starting a cloud worker |
 | `/help` | Show the short command hint |

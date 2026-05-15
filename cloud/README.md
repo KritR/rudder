@@ -26,6 +26,11 @@ FLY_REGION=iad
 RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
 ```
 
+`FLY_API_TOKEN` and `FLY_APP_NAME` are only required for the managed Fly
+Machines runtime. BYO VM runs still require `RUDDER_S3_BUCKET` and
+`RUDDER_WORKER_IMAGE` so the control plane can store a snapshot and print a
+worker command for the user's server.
+
 Current hosted control plane:
 
 ```text
@@ -171,3 +176,31 @@ docker buildx build --platform linux/amd64 \
 The worker image installs Rudder, acpx, and Hunk at startup, downloads the
 snapshot from S3, restores selected HOME config, and starts `rudder run
 --worktree "$RUDDER_TASK"` inside the unpacked repo.
+
+## Bring Your Own VM
+
+Users can run Rudder Cloud workers on their own workstation or server instead
+of Fly Machines:
+
+```bash
+rudder cloud login
+rudder cloud setup-vm
+rudder cloud "fix the failing migration"
+```
+
+`setup-vm` stores `byo-vm` as the local default runtime for that CLI login.
+Future `/cloud <task>`, `/sail <task>`, and `rudder cloud <task>` launches
+upload the same snapshot but return a `docker run` command instead of calling
+the Fly Machines API. Run that command on the VM to start the worker. It passes
+`RUDDER_SNAPSHOT_URL`, `RUDDER_WORKER_TOKEN`, `RUDDER_CLOUD_URL`, and task
+metadata into `cloud/worker/entrypoint.sh`, which already reports heartbeats and
+completion back to the control plane.
+
+Useful commands:
+
+```bash
+rudder cloud runtime            # show fly or byo-vm
+rudder cloud runtime fly        # switch back to Fly Machines
+rudder cloud vm "task"          # prepare one BYO VM run without changing default
+rudder cloud bootstrap <sailId> # regenerate an expired BYO VM command
+```

@@ -58,6 +58,8 @@ type CloudClient = {
   request<T>(pathOrUrl: string, init: { method: string; body?: JsonValue }): Promise<T>;
 };
 
+type CloudRuntime = "fly" | "byo-vm";
+
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CLOUD_URL = "https://mpd2pmnpep.us-east-1.awsapprunner.com";
@@ -141,12 +143,19 @@ export async function runCloudCommand(command: string, args: string[], options: 
     case "launch":
       await launch(rest, options);
       return;
+    case "vm":
+    case "byo-vm":
+      await launch(rest, options, "byo-vm");
+      return;
     case "list":
     case "ls":
       await listSails(options);
       return;
     case "onload":
       await onload(rest, options);
+      return;
+    case "bootstrap":
+      await bootstrap(rest, options);
       return;
     case "pause":
       await mutateSail("pause", rest, options);
@@ -159,6 +168,25 @@ export async function runCloudCommand(command: string, args: string[], options: 
       return;
     case "setup-google":
       await setupOAuthProvider("google", rest, options);
+      return;
+    case "setup-vm":
+      await configureDefaultRuntime("byo-vm", options);
+      return;
+    case "setup-fly":
+      await configureDefaultRuntime("fly", options);
+      return;
+    case "setup":
+      if (rest[0] === "vm" || rest[0] === "byo-vm") {
+        await configureDefaultRuntime("byo-vm", options);
+        return;
+      }
+      if (rest[0] === "fly") {
+        await configureDefaultRuntime("fly", options);
+        return;
+      }
+      throw new Error("Usage: rudder cloud setup vm | rudder cloud setup fly");
+    case "runtime":
+      await runtime(rest, options);
       return;
     default:
       await launch(command === "sail" ? args : [subcommand, ...rest], options);
@@ -335,10 +363,13 @@ async function saveCloudLogin(
   options: CloudCommandOptions,
   source: string,
 ): Promise<void> {
+  const previous = await loadCloudAuth();
+  const previousRuntime = previous?.cloudUrl === client.baseUrl ? parseCloudRuntime(previous.defaultRuntime) : undefined;
   await saveCloudAuth({
     version: 1,
     token,
     cloudUrl: client.baseUrl,
+    defaultRuntime: previousRuntime,
     accountId: login.accountId,
     email: login.email,
     expiresAt: login.expiresAt ?? (login.expiresIn ? new Date(Date.now() + login.expiresIn * 1000).toISOString() : undefined),
@@ -358,12 +389,13 @@ async function saveCloudLogin(
   }
 }
 
-async function launch(args: string[], options: CloudCommandOptions): Promise<void> {
+async function launch(args: string[], options: CloudCommandOptions, explicitRuntime?: CloudRuntime): Promise<void> {
   const task = args.join(" ").trim();
   const repoRoot = findRepoRoot();
   const snapshot = await createSnapshot(repoRoot, options.homePaths ?? []);
   try {
     const client = await cloudClient({ requireToken: true });
+    const runtime = await selectedCloudRuntime(explicitRuntime);
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
       snapshot: {
@@ -373,6 +405,9 @@ async function launch(args: string[], options: CloudCommandOptions): Promise<voi
         manifest: snapshot.manifest as unknown as JsonValue,
       },
     };
+    if (runtime !== "fly") {
+      body.runtime = runtime;
+    }
     if (task) {
       body.task = task;
     }
@@ -403,12 +438,14 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
   const snapshot = await createSnapshot(snapshotRoot, options.homePaths ?? []);
   try {
     const client = await cloudClient({ requireToken: true });
+    const runtime = await selectedCloudRuntime();
     const result = await client.request<JsonValue>("/api/rudder/sail/onload", {
       method: "POST",
       body: {
         runId,
         repoName: path.basename(repoRoot),
         run: runRecord ?? null,
+        ...(runtime !== "fly" ? { runtime } : {}),
         snapshot: {
           name: path.basename(snapshot.archivePath),
           contentType: "application/gzip",
@@ -426,6 +463,19 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
 async function listSails(options: CloudCommandOptions): Promise<void> {
   const client = await cloudClient({ requireToken: true });
   const result = await client.request<JsonValue>("/api/rudder/sail", { method: "GET" });
+  printResult(result, options);
+}
+
+async function bootstrap(args: string[], options: CloudCommandOptions): Promise<void> {
+  const sailId = args[0];
+  if (!sailId) {
+    throw new Error("Missing sail id. Usage: rudder cloud bootstrap <id>");
+  }
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<JsonValue>(`/api/rudder/sail/${encodeURIComponent(sailId)}/bootstrap`, {
+    method: "POST",
+    body: {},
+  });
   printResult(result, options);
 }
 
@@ -469,6 +519,80 @@ async function setupOAuthProvider(
     },
   });
   printResult(result, options);
+}
+
+async function configureDefaultRuntime(runtime: CloudRuntime, options: CloudCommandOptions): Promise<void> {
+  const client = await cloudClient({ requireToken: true });
+  const state = await loadCloudAuth();
+  if (!state || state.cloudUrl !== client.baseUrl) {
+    throw new Error("Not logged in to this Rudder Cloud control plane. Run `rudder login` first.");
+  }
+  await saveCloudAuth({
+    ...state,
+    defaultRuntime: runtime,
+    updatedAt: nowIso(),
+  });
+  const result: Record<string, JsonValue> = {
+    ok: true,
+    cloudUrl: client.baseUrl,
+    defaultRuntime: runtime,
+  };
+  const envRuntime = envCloudRuntime();
+  if (envRuntime) {
+    result.envOverride = envRuntime;
+  }
+  if (options.json) {
+    printJson(result);
+    return;
+  }
+  console.log(`Rudder Cloud runtime set to ${runtime}.`);
+  if (runtime === "byo-vm") {
+    console.log("Future `rudder cloud <task>` and `/sail <task>` launches will prepare a BYO VM worker command instead of creating a Fly Machine.");
+    console.log("Run that printed Docker command on your workstation/server to start the worker.");
+  } else {
+    console.log("Future `rudder cloud <task>` and `/sail <task>` launches will create Fly Machines.");
+  }
+  if (envRuntime) {
+    console.log(`RUDDER_CLOUD_RUNTIME=${envRuntime} is set and will override this saved default.`);
+  }
+}
+
+async function runtime(args: string[], options: CloudCommandOptions): Promise<void> {
+  const next = args[0] ? parseCloudRuntime(args[0]) : undefined;
+  if (args[0] && !next) {
+    throw new Error("Runtime must be `fly` or `byo-vm`.");
+  }
+  if (next) {
+    await configureDefaultRuntime(next, options);
+    return;
+  }
+  const client = await cloudClient({ requireToken: true });
+  const current = await selectedCloudRuntime();
+  const state = await loadCloudAuth();
+  const savedRuntime = parseCloudRuntime(state?.defaultRuntime);
+  const result: Record<string, JsonValue> = {
+    cloudUrl: client.baseUrl,
+    runtime: current,
+  };
+  const envRuntime = envCloudRuntime();
+  if (state?.cloudUrl === client.baseUrl && savedRuntime) {
+    result.savedDefaultRuntime = savedRuntime;
+  }
+  if (envRuntime) {
+    result.envOverride = envRuntime;
+  }
+  if (options.json) {
+    printJson(result);
+  } else {
+    console.log(`Rudder Cloud runtime: ${current}`);
+    if (envRuntime) {
+      console.log(`Set by RUDDER_CLOUD_RUNTIME=${envRuntime}.`);
+    } else if (state?.cloudUrl === client.baseUrl && savedRuntime) {
+      console.log("Set in local Rudder Cloud config.");
+    } else {
+      console.log("Using default Fly Machines runtime.");
+    }
+  }
 }
 
 async function cloudClient(options: { requireToken: boolean }): Promise<CloudClient> {
@@ -528,6 +652,42 @@ function normalizeCloudUrl(raw: string | undefined): string {
   } catch {
     throw new Error("RUDDER_CLOUD_URL must be a valid http(s) URL.");
   }
+}
+
+async function selectedCloudRuntime(explicit?: CloudRuntime): Promise<CloudRuntime> {
+  if (explicit) {
+    return explicit;
+  }
+  const envRuntime = envCloudRuntime();
+  if (envRuntime) {
+    return envRuntime;
+  }
+  const baseUrl = normalizeCloudUrl(process.env.RUDDER_CLOUD_URL);
+  const state = await loadCloudAuth();
+  const savedRuntime = parseCloudRuntime(state?.defaultRuntime);
+  return state?.cloudUrl === baseUrl && savedRuntime ? savedRuntime : "fly";
+}
+
+function parseCloudRuntime(raw: string | undefined): CloudRuntime | undefined {
+  const value = raw?.trim().toLowerCase();
+  if (!value) {
+    return undefined;
+  }
+  if (value === "fly" || value === "fly-machine" || value === "fly-machines") {
+    return "fly";
+  }
+  if (value === "byo" || value === "byo-vm" || value === "manual" || value === "self-hosted" || value === "vm") {
+    return "byo-vm";
+  }
+  return undefined;
+}
+
+function envCloudRuntime(): CloudRuntime | undefined {
+  const runtime = parseCloudRuntime(process.env.RUDDER_CLOUD_RUNTIME);
+  if (process.env.RUDDER_CLOUD_RUNTIME?.trim() && !runtime) {
+    throw new Error("RUDDER_CLOUD_RUNTIME must be `fly` or `byo-vm`.");
+  }
+  return runtime;
 }
 
 async function pollLogin(
@@ -761,6 +921,17 @@ function printResult(result: JsonValue, options: CloudCommandOptions): void {
   }
   if (result && typeof result === "object" && !Array.isArray(result)) {
     const record = result as Record<string, JsonValue>;
+    if (typeof record.bootstrapCommand === "string") {
+      const id = typeof record.id === "string" ? record.id : "BYO VM sail";
+      const status = typeof record.status === "string" ? record.status : undefined;
+      console.log(`${id}${status ? ` (${status})` : ""} is ready for your VM.`);
+      console.log("Run this on your workstation/server:");
+      console.log(record.bootstrapCommand);
+      if (typeof record.updatedAt === "string") {
+        console.log(`\nIf the command expires, run: rudder cloud bootstrap ${id}`);
+      }
+      return;
+    }
     const sails = record.sails ?? record.items;
     if (Array.isArray(sails)) {
       printSailList(sails);
@@ -784,6 +955,7 @@ function printSailList(items: JsonValue[]): void {
     console.log([
       sail.id,
       sail.status,
+      sail.runtime,
       sail.branch,
       sail.url,
       sail.updatedAt ?? sail.createdAt,
@@ -806,8 +978,13 @@ Usage:
   rudder cloud login
   rudder cloud <name or task>
   rudder cloud launch [--home-path <path>] ["task"]
+  rudder cloud vm ["task"]
   rudder cloud list
   rudder cloud onload <runId>
+  rudder cloud bootstrap <id>
+  rudder cloud runtime [fly|byo-vm]
+  rudder cloud setup-vm
+  rudder cloud setup-fly
   rudder sail <name or task>
   rudder sail list
   rudder sail pause <id>
@@ -817,6 +994,7 @@ Usage:
 
 Environment:
   RUDDER_CLOUD_URL              Cloud control plane URL (defaults to ${DEFAULT_CLOUD_URL})
+  RUDDER_CLOUD_RUNTIME          fly or byo-vm (overrides saved local default)
   RUDDER_CLOUD_HOME_PATHS       Extra comma-separated HOME paths to include in snapshots
   RUDDER_GITHUB_CLIENT_ID       GitHub App OAuth client ID for setup-github
   RUDDER_GITHUB_CLIENT_SECRET   GitHub App OAuth client secret for setup-github
