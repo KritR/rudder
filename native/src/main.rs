@@ -977,34 +977,8 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.focus == FocusPane::Worker && is_scroll_mouse_event(mouse.kind) {
-            let worker_area = self.worker_area.map(block_inner).unwrap_or(Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 24,
-            });
-            if self.worker_view == WorkerView::Diff {
-                let _ = self.scroll_selected_review_or_forward(mouse, worker_area);
-            } else {
-                let _ = self.scroll_selected_worker_or_forward(mouse, worker_area);
-            }
-            return;
-        }
-
-        if self
-            .agents_area
-            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
-            && matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            )
-        {
-            if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                self.select_previous_agent();
-            } else {
-                self.select_next_agent();
-            }
+        if is_scroll_mouse_event(mouse.kind) {
+            self.handle_focused_scroll(mouse);
             return;
         }
 
@@ -1047,29 +1021,43 @@ impl App {
         let inner = block_inner(worker_area);
 
         if self.worker_view == WorkerView::Diff {
-            if is_scroll_mouse_event(mouse.kind) {
-                if self.scroll_selected_review_or_forward(mouse, inner) {
-                    return;
-                }
-                return;
-            }
             if self.write_mouse_to_selected_review(mouse, inner) {
                 return;
             }
             return;
         }
 
-        if is_scroll_mouse_event(mouse.kind) {
-            if self.scroll_selected_worker_or_forward(mouse, inner) {
-                return;
-            }
-            return;
-        }
         if self.handle_worker_selection_mouse(mouse, inner) {
             return;
         }
         if self.write_mouse_to_selected_worker(mouse, inner) {
             return;
+        }
+    }
+
+    fn handle_focused_scroll(&mut self, mouse: MouseEvent) {
+        match self.focus {
+            FocusPane::Agents => {
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.select_previous_agent();
+                } else if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                    self.select_next_agent();
+                }
+            }
+            FocusPane::Worker => {
+                let worker_area = self.worker_area.map(block_inner).unwrap_or(Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 24,
+                });
+                if self.worker_view == WorkerView::Diff {
+                    let _ = self.scroll_selected_review_or_forward(mouse, worker_area);
+                } else {
+                    let _ = self.scroll_selected_worker_or_forward(mouse, worker_area);
+                }
+            }
+            FocusPane::Task => {}
         }
     }
 
@@ -1236,14 +1224,6 @@ impl App {
         if moved {
             return true;
         }
-        if rows != 0 && terminal.uses_alternate_screen() {
-            if let Some(bytes) = scroll_page_key_bytes(mouse) {
-                if let Err(error) = terminal.write_input(&bytes) {
-                    self.set_selected_error(error.to_string());
-                }
-            }
-            return true;
-        }
         if rows != 0 {
             self.notice = Some("worker scrollback is at the edge".to_string());
         }
@@ -1278,14 +1258,6 @@ impl App {
         review.scrollback_by(rows);
         let moved = review.scrollback() != before;
         if moved {
-            return true;
-        }
-        if rows != 0 && review.uses_alternate_screen() {
-            if let Some(bytes) = scroll_page_key_bytes(mouse) {
-                if let Err(error) = review.write_input(&bytes) {
-                    self.set_selected_review_error(error.to_string());
-                }
-            }
             return true;
         }
         if rows != 0 {
@@ -2543,15 +2515,17 @@ mod app_tests {
             modifiers: KeyModifiers::empty(),
         };
         assert_eq!(mouse_scrollback_delta(down, 30), -10);
-        assert_eq!(scroll_page_key_bytes(down), Some(b"\x1b[6~".to_vec()));
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn focused_worker_wheel_sends_page_key_in_alternate_screen() {
+    fn focused_worker_wheel_scrolls_alternate_screen_history() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
-            ["-lc", "stty raw -echo; printf '\\033[?1049h'; cat -v"],
+            [
+                "-lc",
+                "printf '\\033[?1049hfirst screen\\r\\n'; sleep 0.1; printf '\\033[2J\\033[Hsecond screen\\r\\n'; sleep 1",
+            ],
         );
         let mut pane = TerminalPane::spawn_shell_or_command(
             Some(command),
@@ -2566,12 +2540,21 @@ mod app_tests {
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(25));
             pane.drain_output();
-            if pane.uses_alternate_screen() {
+            if pane.uses_alternate_screen()
+                && pane
+                    .visible_lines_snapshot()
+                    .join("\n")
+                    .contains("second screen")
+            {
                 break;
             }
         }
 
         assert!(pane.uses_alternate_screen());
+        assert!(pane
+            .visible_lines_snapshot()
+            .join("\n")
+            .contains("second screen"));
 
         let mut app = App::new();
         app.focus = FocusPane::Worker;
@@ -2591,12 +2574,30 @@ mod app_tests {
             modifiers: KeyModifiers::empty(),
         });
 
-        std::thread::sleep(Duration::from_millis(50));
-        let output = app
+        let scrolled_up = app
             .selected_terminal_mut()
-            .map(|terminal| terminal.visible_lines().join("\n"))
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
-        assert!(output.contains("^[[5~"), "output was {output:?}");
+        assert!(
+            scrolled_up.contains("first screen"),
+            "scrolled_up was {scrolled_up:?}"
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let scrolled_down = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
+        assert!(
+            scrolled_down.contains("second screen"),
+            "scrolled_down was {scrolled_down:?}"
+        );
     }
 
     #[cfg(not(windows))]
@@ -2715,6 +2716,64 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
         assert!(after.contains("line035"), "after was {after:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn task_focus_wheel_does_not_scroll_worker_even_when_pointer_is_over_worker() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("line040") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.worker_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 7,
+        });
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+        let before = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let after = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
+        assert_eq!(after, before);
+        assert_eq!(app.focus, FocusPane::Task);
     }
 
     #[cfg(not(windows))]
@@ -4174,14 +4233,6 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
         .min(MAX_WHEEL_SCROLL_ROWS)
         .min(page)
         .max(1)
-}
-
-fn scroll_page_key_bytes(mouse: MouseEvent) -> Option<Vec<u8>> {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => Some(b"\x1b[5~".to_vec()),
-        MouseEventKind::ScrollDown => Some(b"\x1b[6~".to_vec()),
-        _ => None,
-    }
 }
 
 fn page_scroll_rows(area: Option<Rect>) -> isize {

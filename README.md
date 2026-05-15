@@ -166,8 +166,8 @@ the underlying Claude Code, Codex, or Hunk chat. Use the worker's up and down
 arrow keys when you want to move through the agent's own prompt history or
 menus. Drag selection inside the worker pane copies selected text, including
 when you drag upward past the top of the pane.
-For full-screen alternate-screen workers, wheel or trackpad scrolling is mapped
-to PageUp/PageDown so the focused worker can still move.
+For full-screen alternate-screen workers, Rudder keeps its own pane history so
+trackpad scrolling moves the focused pane instead of depending on the child app.
 
 ## Keys
 

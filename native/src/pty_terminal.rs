@@ -112,6 +112,10 @@ pub struct TerminalPane {
     reader_thread: Option<JoinHandle<()>>,
     parser: vt100::Parser,
     size: TerminalSize,
+    alternate_history: Vec<Vec<String>>,
+    alternate_history_offset: usize,
+    last_alternate_snapshot: Vec<String>,
+    alternate_history_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +205,10 @@ impl TerminalPane {
                 options.scrollback_lines,
             ),
             size: options.size,
+            alternate_history: Vec::new(),
+            alternate_history_offset: 0,
+            last_alternate_snapshot: Vec::new(),
+            alternate_history_limit: options.scrollback_lines.max(DEFAULT_ROWS as usize),
         })
     }
 
@@ -217,6 +225,7 @@ impl TerminalPane {
             .context("failed to resize PTY")?;
         self.parser.screen_mut().set_size(size.rows, size.cols);
         self.size = size;
+        self.last_alternate_snapshot.clear();
         Ok(())
     }
 
@@ -229,6 +238,9 @@ impl TerminalPane {
         while let Ok(chunk) = self.output_rx.try_recv() {
             self.parser.process(&chunk);
             drained.extend_from_slice(&chunk);
+        }
+        if !drained.is_empty() {
+            self.capture_alternate_snapshot();
         }
         drained
     }
@@ -245,6 +257,14 @@ impl TerminalPane {
     }
 
     pub fn visible_lines_snapshot(&self) -> Vec<String> {
+        if let Some(snapshot) = self.alternate_history_snapshot() {
+            return snapshot.clone();
+        }
+
+        self.current_visible_lines_snapshot()
+    }
+
+    fn current_visible_lines_snapshot(&self) -> Vec<String> {
         self.parser
             .screen()
             .rows(0, self.size.cols)
@@ -258,6 +278,17 @@ impl TerminalPane {
     }
 
     pub fn styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
+        if let Some(snapshot) = self.alternate_history_snapshot() {
+            return snapshot
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .map(|ch| StyledTerminalCell::plain(ch.to_string()))
+                        .collect()
+                })
+                .collect();
+        }
+
         let screen = self.parser.screen();
         let mut rows = Vec::with_capacity(self.size.rows as usize);
 
@@ -304,6 +335,9 @@ impl TerminalPane {
     }
 
     pub fn scrollback(&self) -> usize {
+        if self.parser.screen().alternate_screen() {
+            return self.alternate_history_offset;
+        }
         self.parser.screen().scrollback()
     }
 
@@ -320,6 +354,19 @@ impl TerminalPane {
     }
 
     pub fn scrollback_by(&mut self, rows: isize) {
+        if self.parser.screen().alternate_screen() {
+            self.capture_alternate_snapshot();
+            let max_offset = self.alternate_history.len().saturating_sub(1);
+            self.alternate_history_offset = if rows.is_negative() {
+                self.alternate_history_offset
+                    .saturating_sub(rows.unsigned_abs())
+            } else {
+                self.alternate_history_offset.saturating_add(rows as usize)
+            }
+            .min(max_offset);
+            return;
+        }
+
         let current = self.parser.screen().scrollback();
         let next = if rows.is_negative() {
             current.saturating_sub(rows.unsigned_abs())
@@ -330,6 +377,7 @@ impl TerminalPane {
     }
 
     pub fn reset_scrollback(&mut self) {
+        self.alternate_history_offset = 0;
         self.parser.screen_mut().set_scrollback(0);
     }
 
@@ -348,6 +396,60 @@ impl TerminalPane {
 
     pub fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>> {
         self.child.try_wait().context("failed to poll child status")
+    }
+}
+
+impl StyledTerminalCell {
+    fn plain(contents: String) -> Self {
+        Self {
+            contents,
+            fg: vt100::Color::Default,
+            bg: vt100::Color::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }
+    }
+}
+
+impl TerminalPane {
+    fn capture_alternate_snapshot(&mut self) {
+        if !self.parser.screen().alternate_screen() {
+            self.alternate_history_offset = 0;
+            self.last_alternate_snapshot.clear();
+            return;
+        }
+
+        let snapshot = self.current_visible_lines_snapshot();
+        if snapshot == self.last_alternate_snapshot {
+            return;
+        }
+
+        self.last_alternate_snapshot = snapshot.clone();
+        self.alternate_history.push(snapshot);
+        if self.alternate_history.len() > self.alternate_history_limit {
+            let overflow = self.alternate_history.len() - self.alternate_history_limit;
+            self.alternate_history.drain(0..overflow);
+            self.alternate_history_offset = self.alternate_history_offset.saturating_sub(overflow);
+        }
+
+        if self.alternate_history_offset > 0 {
+            self.alternate_history_offset =
+                (self.alternate_history_offset + 1).min(self.alternate_history.len() - 1);
+        }
+    }
+
+    fn alternate_history_snapshot(&self) -> Option<&Vec<String>> {
+        if !self.parser.screen().alternate_screen() || self.alternate_history_offset == 0 {
+            return None;
+        }
+        let index = self
+            .alternate_history
+            .len()
+            .checked_sub(1 + self.alternate_history_offset)?;
+        self.alternate_history.get(index)
     }
 }
 
