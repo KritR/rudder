@@ -978,7 +978,7 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if is_scroll_mouse_event(mouse.kind) {
-            self.handle_focused_scroll(mouse);
+            self.handle_pane_scroll(mouse);
             return;
         }
 
@@ -1035,29 +1035,37 @@ impl App {
         }
     }
 
-    fn handle_focused_scroll(&mut self, mouse: MouseEvent) {
-        match self.focus {
-            FocusPane::Agents => {
-                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    self.select_previous_agent();
-                } else if matches!(mouse.kind, MouseEventKind::ScrollDown) {
-                    self.select_next_agent();
-                }
+    fn handle_pane_scroll(&mut self, mouse: MouseEvent) {
+        if let Some(area) = self
+            .worker_area
+            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+        {
+            let inner = block_inner(area);
+            if self.worker_view == WorkerView::Diff {
+                let _ = self.scroll_selected_review_or_forward(mouse, inner);
+            } else {
+                let _ = self.scroll_selected_worker_or_forward(mouse, inner);
             }
-            FocusPane::Worker => {
-                let worker_area = self.worker_area.map(block_inner).unwrap_or(Rect {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 24,
-                });
-                if self.worker_view == WorkerView::Diff {
-                    let _ = self.scroll_selected_review_or_forward(mouse, worker_area);
-                } else {
-                    let _ = self.scroll_selected_worker_or_forward(mouse, worker_area);
-                }
+            return;
+        }
+
+        if self
+            .agents_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+        {
+            if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                self.select_previous_agent();
+            } else if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                self.select_next_agent();
             }
-            FocusPane::Task => {}
+            return;
+        }
+
+        if self
+            .task_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+        {
+            return;
         }
     }
 
@@ -1203,6 +1211,7 @@ impl App {
                 if !terminal.wants_sgr_mouse_events() {
                     return false;
                 }
+                terminal.reset_scrollback();
                 terminal.write_input(&bytes)
             }
             None => return false,
@@ -1239,6 +1248,7 @@ impl App {
                 if !review.wants_sgr_mouse_events() {
                     return false;
                 }
+                review.reset_scrollback();
                 review.write_input(&bytes)
             }
             None => return false,
@@ -2661,66 +2671,7 @@ mod app_tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn focused_worker_wheel_scrolls_worker_even_when_pointer_is_over_agents() {
-        let command = TerminalCommand::with_args(
-            "/bin/sh",
-            [
-                "-lc",
-                "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 1",
-            ],
-        );
-        let mut pane = TerminalPane::spawn_shell_or_command(
-            Some(command),
-            TerminalPaneOptions {
-                size: TerminalSize { rows: 5, cols: 20 },
-                scrollback_lines: 100,
-                ..Default::default()
-            },
-        )
-        .expect("spawn test pty");
-
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(25));
-            pane.drain_output();
-            if pane.visible_lines_snapshot().join("\n").contains("line040") {
-                break;
-            }
-        }
-
-        let mut app = App::new();
-        app.focus = FocusPane::Worker;
-        app.agents_area = Some(Rect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 20,
-        });
-        app.worker_area = Some(Rect {
-            x: 20,
-            y: 0,
-            width: 40,
-            height: 7,
-        });
-        app.agents.push(test_agent_run_with_terminal(&app, pane));
-        app.selected_agent = 0;
-
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 1,
-            row: 1,
-            modifiers: KeyModifiers::empty(),
-        });
-
-        let after = app
-            .selected_terminal_mut()
-            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
-            .unwrap_or_default();
-        assert!(after.contains("line035"), "after was {after:?}");
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn task_focus_wheel_does_not_scroll_worker_even_when_pointer_is_over_worker() {
+    fn wheel_scroll_routes_to_worker_under_pointer_even_when_task_is_focused() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
             [
@@ -2748,11 +2699,76 @@ mod app_tests {
 
         let mut app = App::new();
         app.focus = FocusPane::Task;
+        app.agents_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 20,
+        });
+        app.worker_area = Some(Rect {
+            x: 20,
+            y: 0,
+            width: 40,
+            height: 7,
+        });
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 21,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let after = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
+        assert!(after.contains("line035"), "after was {after:?}");
+        assert_eq!(app.focus, FocusPane::Task);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wheel_over_task_does_not_scroll_worker() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("line040") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
         app.worker_area = Some(Rect {
             x: 0,
             y: 0,
             width: 40,
             height: 7,
+        });
+        app.task_area = Some(Rect {
+            x: 0,
+            y: 8,
+            width: 40,
+            height: 3,
         });
         app.agents.push(test_agent_run_with_terminal(&app, pane));
         app.selected_agent = 0;
@@ -2764,7 +2780,7 @@ mod app_tests {
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 1,
-            row: 1,
+            row: 9,
             modifiers: KeyModifiers::empty(),
         });
 
@@ -2773,7 +2789,6 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
         assert_eq!(after, before);
-        assert_eq!(app.focus, FocusPane::Task);
     }
 
     #[cfg(not(windows))]
@@ -3343,6 +3358,7 @@ fn setup_terminal() -> Result<Tui> {
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     )?;
+    stdout.flush()?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 

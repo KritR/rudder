@@ -434,11 +434,6 @@ impl TerminalPane {
             self.alternate_history.drain(0..overflow);
             self.alternate_history_offset = self.alternate_history_offset.saturating_sub(overflow);
         }
-
-        if self.alternate_history_offset > 0 {
-            self.alternate_history_offset =
-                (self.alternate_history_offset + 1).min(self.alternate_history.len() - 1);
-        }
     }
 
     fn alternate_history_snapshot(&self) -> Option<&Vec<String>> {
