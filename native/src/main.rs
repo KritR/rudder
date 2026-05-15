@@ -1017,10 +1017,9 @@ impl App {
 
         if self.worker_view == WorkerView::Diff {
             if is_scroll_mouse_event(mouse.kind) {
-                if self.write_scroll_to_selected_review(mouse, inner) {
+                if self.scroll_selected_review_or_forward(mouse, inner) {
                     return;
                 }
-                self.scroll_review(mouse_scrollback_delta(mouse, inner.height));
                 return;
             }
             if self.write_mouse_to_selected_review(mouse, inner) {
@@ -1221,7 +1220,7 @@ impl App {
 
         if wants_mouse {
             let wrote_mouse = self.write_scroll_to_selected_worker(mouse, area);
-            if alternate_screen && is_vertical_scroll_mouse_event(mouse.kind) {
+            if is_vertical_scroll_mouse_event(mouse.kind) {
                 return self.write_scroll_key_to_selected_worker(mouse) || wrote_mouse;
             }
             return wrote_mouse;
@@ -1289,6 +1288,50 @@ impl App {
         true
     }
 
+    fn scroll_selected_review_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let rows = mouse_scrollback_delta(mouse, area.height);
+        let Some(review) = self.selected_review_terminal_mut() else {
+            return false;
+        };
+
+        let before = review.scrollback();
+        review.scrollback_by(rows);
+        let after = review.scrollback();
+        let moved_scrollback = after != before;
+        let wants_mouse = review.wants_sgr_mouse_events();
+        let alternate_screen = review.uses_alternate_screen();
+
+        if moved_scrollback {
+            return true;
+        }
+
+        if wants_mouse {
+            let wrote_mouse = self.write_scroll_to_selected_review(mouse, area);
+            if is_vertical_scroll_mouse_event(mouse.kind) {
+                return self.write_scroll_key_to_selected_review(mouse) || wrote_mouse;
+            }
+            return wrote_mouse;
+        }
+        if alternate_screen {
+            return self.write_scroll_key_to_selected_review(mouse);
+        }
+        self.write_scroll_key_to_selected_review(mouse)
+    }
+
+    fn write_scroll_key_to_selected_review(&mut self, mouse: MouseEvent) -> bool {
+        let Some(bytes) = scroll_key_bytes(mouse) else {
+            return false;
+        };
+        let result = match self.selected_review_terminal_mut() {
+            Some(review) => review.write_input(&bytes),
+            None => return false,
+        };
+        if let Err(error) = result {
+            self.set_selected_review_error(error.to_string());
+        }
+        true
+    }
+
     fn handle_worker_page_key(&mut self, key: KeyEvent, rows: isize) {
         let Some(bytes) = terminal_bytes_for_key(key) else {
             return;
@@ -1306,12 +1349,6 @@ impl App {
         };
         if let Err(error) = result {
             self.set_selected_error(error.to_string());
-        }
-    }
-
-    fn scroll_review(&mut self, rows: isize) {
-        if let Some(terminal) = self.selected_review_terminal_mut() {
-            terminal.scrollback_by(rows);
         }
     }
 
@@ -2610,6 +2647,65 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines().join("\n"))
             .unwrap_or_default();
         assert!(output.contains("^[[5~"), "output was {output:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_wheel_scroll_moves_normal_screen_scrollback() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("line040") {
+                break;
+            }
+        }
+
+        let before = pane.visible_lines_snapshot().join("\n");
+        assert!(before.contains("line040"), "before was {before:?}");
+
+        let mut app = App::new();
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.scroll_selected_worker_or_forward(
+            mouse,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+        ));
+
+        let after = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
+        assert_ne!(after, before);
+        assert!(after.contains("line035"), "after was {after:?}");
     }
 
     #[test]
