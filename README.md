@@ -160,11 +160,12 @@ Codex. Their slash commands, cursor movement, copy/paste, and terminal UI
 continue to work normally. `Ctrl-C` is reserved by Rudder and leaves the
 dashboard from any pane.
 
-Rudder starts in `mouse:native` mode. In Ghostty and other terminals, this means
-normal terminal text selection and trackpad behavior stay native. Use keyboard
-shortcuts for pane focus and agent actions. If you want Rudder to capture mouse
-clicks, wheel events, and custom worker selection instead, run `/mouse rudder`
-from the task pane. Switch back with `/mouse native`.
+Rudder owns mouse input inside the dashboard. Wheel or trackpad scrolling over a
+worker or review pane scrolls Rudder's captured pane output, not the underlying
+Claude Code, Codex, or Hunk chat. Use the worker's up and down arrow keys when
+you want to move through the agent's own prompt history or menus. Drag selection
+inside the worker pane copies selected text, including when you drag upward past
+the top of the pane.
 
 ## Keys
 
@@ -182,8 +183,6 @@ from the task pane. Switch back with `/mouse native`.
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/model` | Open the provider-first model picker |
-| `/mouse native` | Let Ghostty/the terminal handle mouse selection and scrollback |
-| `/mouse rudder` | Let Rudder capture mouse clicks, wheel scroll, and worker selection |
 | `/help` | Show the short command hint |
 | `v` | Toggle the selected agent's review view |
 | `Esc` | Leave the review view when it is focused |
@@ -307,9 +306,9 @@ hunk diff --watch
 
 Hunk provides the multi-file review UI, sidebar navigation, mouse support,
 watch mode, inline agent notes, and untracked-file handling. Rudder forwards
-keyboard input into Hunk while the review pane is focused. In `/mouse rudder`
-mode, Rudder also forwards accelerated mouse-wheel input. Press `v` or `Esc` to
-return to the live Claude Code or Codex worker.
+keyboard input into Hunk while the review pane is focused and keeps wheel or
+trackpad scrolling on Rudder's review scrollback. Press `v` or `Esc` to return
+to the live Claude Code or Codex worker.
 
 Rudder writes a per-worktree `.hunk/config.toml` in Hunk's light mode and
 ignores that config through git's local info exclude, so it does not get merged.

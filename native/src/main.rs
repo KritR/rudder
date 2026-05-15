@@ -176,34 +176,10 @@ impl AgentMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MouseMode {
-    Native,
-    Rudder,
-}
-
-impl MouseMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Rudder => "rudder",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "native" | "ghostty" | "terminal" => Some(Self::Native),
-            "rudder" | "app" | "capture" => Some(Self::Rudder),
-            _ => None,
-        }
-    }
-}
-
 struct App {
     focus: FocusPane,
     nav_mode: bool,
     worker_view: WorkerView,
-    mouse_mode: MouseMode,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -320,7 +296,6 @@ enum SuggestionAction {
         model: String,
         effort: Option<EffortLevel>,
     },
-    SetMouseMode(MouseMode),
     ShowHelp,
 }
 
@@ -351,7 +326,6 @@ impl App {
             focus: FocusPane::Task,
             nav_mode: false,
             worker_view: WorkerView::Terminal,
-            mouse_mode: MouseMode::Native,
             cwd,
             branch: current_branch(),
             task_input: String::new(),
@@ -880,48 +854,14 @@ impl App {
                     ))
                 });
             }
-            SuggestionAction::SetMouseMode(mode) => {
-                self.task_input.clear();
-                self.task_cursor = 0;
-                self.picker_index = 0;
-                self.set_mouse_mode(mode);
-            }
             SuggestionAction::ShowHelp => {
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  /mouse native|rudder  m/M merge  dd delete"
+                    "Tab focus  Enter start/focus  wheel scrolls worker  m/M merge  dd delete"
                         .to_string(),
                 );
-            }
-        }
-    }
-
-    fn set_mouse_mode(&mut self, mode: MouseMode) {
-        if self.mouse_mode == mode {
-            self.notice = Some(format!("mouse mode already {}", mode.as_str()));
-            return;
-        }
-
-        let result = set_terminal_mouse_capture(mode == MouseMode::Rudder);
-        match result {
-            Ok(()) => {
-                self.mouse_mode = mode;
-                self.worker_selection = None;
-                self.task_selection = None;
-                self.notice = Some(match mode {
-                    MouseMode::Native => {
-                        "mouse:native  Ghostty handles selection; use keyboard for panes"
-                            .to_string()
-                    }
-                    MouseMode::Rudder => {
-                        "mouse:rudder  Rudder handles clicks, wheel, and selection".to_string()
-                    }
-                });
-            }
-            Err(error) => {
-                self.notice = Some(format!("mouse mode failed: {error}"));
             }
         }
     }
@@ -1037,10 +977,6 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.mouse_mode == MouseMode::Native {
-            return;
-        }
-
         if self
             .agents_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
@@ -1274,70 +1210,16 @@ impl App {
         true
     }
 
-    fn write_scroll_to_selected_worker(&mut self, mouse: MouseEvent, area: Rect) -> bool {
-        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
-            return false;
-        };
-        let steps = terminal_scroll_steps(area.height, mouse.modifiers);
-        let Some(terminal) = self.selected_terminal_mut() else {
-            return false;
-        };
-        if !terminal.wants_sgr_mouse_events() {
-            return false;
-        }
-        let mut result: Result<()> = Ok(());
-        for _ in 0..steps {
-            if let Err(error) = terminal.write_input(&bytes) {
-                result = Err(error);
-                break;
-            }
-        }
-        if let Err(error) = result {
-            self.set_selected_error(error.to_string());
-        }
-        true
-    }
-
     fn scroll_selected_worker_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let Some(terminal) = self.selected_terminal_mut() else {
             return false;
         };
-
         let before = terminal.scrollback();
         terminal.scrollback_by(rows);
-        let after = terminal.scrollback();
-        let moved_scrollback = after != before;
-        let wants_mouse = terminal.wants_sgr_mouse_events();
-        let alternate_screen = terminal.uses_alternate_screen();
-
-        if moved_scrollback {
-            return true;
-        }
-
-        if wants_mouse {
-            let wrote_mouse = self.write_scroll_to_selected_worker(mouse, area);
-            if is_vertical_scroll_mouse_event(mouse.kind) {
-                return self.write_scroll_key_to_selected_worker(mouse) || wrote_mouse;
-            }
-            return wrote_mouse;
-        }
-        if alternate_screen {
-            return self.write_scroll_key_to_selected_worker(mouse);
-        }
-        self.write_scroll_key_to_selected_worker(mouse)
-    }
-
-    fn write_scroll_key_to_selected_worker(&mut self, mouse: MouseEvent) -> bool {
-        let Some(bytes) = scroll_key_bytes(mouse) else {
-            return false;
-        };
-        let result = match self.selected_terminal_mut() {
-            Some(terminal) => terminal.write_input(&bytes),
-            None => return false,
-        };
-        if let Err(error) = result {
-            self.set_selected_error(error.to_string());
+        let moved = terminal.scrollback() != before;
+        if !moved && rows != 0 {
+            self.notice = Some("worker scrollback is at the edge".to_string());
         }
         true
     }
@@ -1361,70 +1243,16 @@ impl App {
         true
     }
 
-    fn write_scroll_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
-        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
-            return false;
-        };
-        let steps = review_scroll_steps(area.height, mouse.modifiers);
-        let Some(review) = self.selected_review_terminal_mut() else {
-            return false;
-        };
-        if !review.wants_sgr_mouse_events() {
-            return false;
-        }
-        let mut result: Result<()> = Ok(());
-        for _ in 0..steps {
-            if let Err(error) = review.write_input(&bytes) {
-                result = Err(error);
-                break;
-            }
-        }
-        if let Err(error) = result {
-            self.set_selected_review_error(error.to_string());
-        }
-        true
-    }
-
     fn scroll_selected_review_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let Some(review) = self.selected_review_terminal_mut() else {
             return false;
         };
-
         let before = review.scrollback();
         review.scrollback_by(rows);
-        let after = review.scrollback();
-        let moved_scrollback = after != before;
-        let wants_mouse = review.wants_sgr_mouse_events();
-        let alternate_screen = review.uses_alternate_screen();
-
-        if moved_scrollback {
-            return true;
-        }
-
-        if wants_mouse {
-            let wrote_mouse = self.write_scroll_to_selected_review(mouse, area);
-            if is_vertical_scroll_mouse_event(mouse.kind) {
-                return self.write_scroll_key_to_selected_review(mouse) || wrote_mouse;
-            }
-            return wrote_mouse;
-        }
-        if alternate_screen {
-            return self.write_scroll_key_to_selected_review(mouse);
-        }
-        self.write_scroll_key_to_selected_review(mouse)
-    }
-
-    fn write_scroll_key_to_selected_review(&mut self, mouse: MouseEvent) -> bool {
-        let Some(bytes) = scroll_key_bytes(mouse) else {
-            return false;
-        };
-        let result = match self.selected_review_terminal_mut() {
-            Some(review) => review.write_input(&bytes),
-            None => return false,
-        };
-        if let Err(error) = result {
-            self.set_selected_review_error(error.to_string());
+        let moved = review.scrollback() != before;
+        if !moved && rows != 0 {
+            self.notice = Some("review scrollback is at the edge".to_string());
         }
         true
     }
@@ -1730,23 +1558,6 @@ impl App {
                 }
                 true
             }
-            Some("/mouse") => {
-                let args = parts.collect::<Vec<_>>();
-                match args.as_slice() {
-                    [] => {
-                        self.notice = Some(format!(
-                            "mouse:{}  usage: /mouse native|rudder",
-                            self.mouse_mode.as_str()
-                        ));
-                    }
-                    [mode] => match MouseMode::parse(mode) {
-                        Some(mode) => self.set_mouse_mode(mode),
-                        None => self.notice = Some("usage: /mouse native|rudder".to_string()),
-                    },
-                    _ => self.notice = Some("usage: /mouse native|rudder".to_string()),
-                }
-                true
-            }
             Some("/plan") => {
                 let task = parts.collect::<Vec<_>>().join(" ");
                 if task.trim().is_empty() {
@@ -1772,7 +1583,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  /plan  /run  /model  /mouse native|rudder  m/M merge"
+                    "Tab focus  Enter start/focus  /plan  /run  /model  wheel scrolls worker  m/M merge"
                         .to_string(),
                 );
                 true
@@ -2687,12 +2498,6 @@ mod app_tests {
         assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 10);
         assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 18);
         assert_eq!(wheel_scroll_rows(30, KeyModifiers::CONTROL), 29);
-        assert_eq!(review_scroll_steps(30, KeyModifiers::empty()), 3);
-        assert_eq!(review_scroll_steps(90, KeyModifiers::empty()), 8);
-        assert_eq!(review_scroll_steps(30, KeyModifiers::ALT), 24);
-        assert_eq!(terminal_scroll_steps(30, KeyModifiers::empty()), 3);
-        assert_eq!(terminal_scroll_steps(90, KeyModifiers::empty()), 8);
-        assert_eq!(terminal_scroll_steps(30, KeyModifiers::ALT), 24);
 
         let down = MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -2701,66 +2506,6 @@ mod app_tests {
             modifiers: KeyModifiers::empty(),
         };
         assert_eq!(mouse_scrollback_delta(down, 30), -10);
-        assert_eq!(scroll_key_bytes(down), Some(b"\x1b[6~".to_vec()));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn worker_wheel_scroll_sends_key_fallback_in_alternate_screen() {
-        let command = TerminalCommand::with_args(
-            "/bin/sh",
-            [
-                "-lc",
-                "stty raw -echo; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; cat -v",
-            ],
-        );
-        let mut pane = TerminalPane::spawn_shell_or_command(
-            Some(command),
-            TerminalPaneOptions {
-                size: TerminalSize { rows: 5, cols: 20 },
-                scrollback_lines: 100,
-                ..Default::default()
-            },
-        )
-        .expect("spawn test pty");
-
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(25));
-            pane.drain_output();
-            if pane.uses_alternate_screen() && pane.wants_sgr_mouse_events() {
-                break;
-            }
-        }
-
-        assert!(pane.uses_alternate_screen());
-        assert!(pane.wants_sgr_mouse_events());
-
-        let mut app = App::new();
-        app.agents.push(test_agent_run_with_terminal(&app, pane));
-        app.selected_agent = 0;
-
-        let mouse = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 1,
-            row: 1,
-            modifiers: KeyModifiers::empty(),
-        };
-        assert!(app.scroll_selected_worker_or_forward(
-            mouse,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 20,
-                height: 5,
-            },
-        ));
-
-        std::thread::sleep(Duration::from_millis(50));
-        let output = app
-            .selected_terminal_mut()
-            .map(|terminal| terminal.visible_lines().join("\n"))
-            .unwrap_or_default();
-        assert!(output.contains("^[[5~"), "output was {output:?}");
     }
 
     #[cfg(not(windows))]
@@ -2851,7 +2596,6 @@ mod app_tests {
         }
 
         let mut app = App::new();
-        app.mouse_mode = MouseMode::Rudder;
         app.agents.push(test_agent_run_with_terminal(&app, pane));
         app.selected_agent = 0;
         app.worker_selection = Some(WorkerSelection {
@@ -3325,45 +3069,6 @@ mod app_tests {
     }
 
     #[test]
-    fn mouse_command_toggles_capture_mode() {
-        let mut app = App::new();
-        assert_eq!(app.mouse_mode, MouseMode::Native);
-
-        assert!(app.handle_command("/mouse rudder"));
-        assert_eq!(app.mouse_mode, MouseMode::Rudder);
-        assert!(app
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("mouse:rudder")));
-
-        assert!(app.handle_command("/mouse native"));
-        assert_eq!(app.mouse_mode, MouseMode::Native);
-        assert!(app
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("mouse:native")));
-
-        assert!(app.handle_command("/mouse nonsense"));
-        assert_eq!(app.mouse_mode, MouseMode::Native);
-        assert_eq!(app.notice.as_deref(), Some("usage: /mouse native|rudder"));
-    }
-
-    #[test]
-    fn mouse_suggestions_include_modes() {
-        let mut app = App::new();
-        app.task_input = "/mouse r".to_string();
-        app.task_cursor = app.task_input.chars().count();
-
-        let suggestions = suggestions_for(&app);
-        assert!(suggestions
-            .iter()
-            .any(|suggestion| suggestion.label == "/mouse rudder"));
-        assert!(!suggestions
-            .iter()
-            .any(|suggestion| suggestion.label == "/mouse native"));
-    }
-
-    #[test]
     fn ctrl_c_exits_from_every_focus_pane() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let mut app = App::new();
@@ -3422,7 +3127,7 @@ fn setup_terminal() -> Result<Tui> {
     execute!(
         stdout,
         EnterAlternateScreen,
-        DisableMouseCapture,
+        EnableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -3430,20 +3135,6 @@ fn setup_terminal() -> Result<Tui> {
         )
     )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
-}
-
-fn set_terminal_mouse_capture(enabled: bool) -> Result<()> {
-    if cfg!(test) {
-        return Ok(());
-    }
-    let mut stdout = io::stdout();
-    if enabled {
-        execute!(stdout, EnableMouseCapture)?;
-    } else {
-        execute!(stdout, DisableMouseCapture)?;
-    }
-    stdout.flush()?;
-    Ok(())
 }
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
@@ -3842,9 +3533,9 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run  /mouse"
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model  /mouse"
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -3918,11 +3609,6 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("({})", effort_label(app.effort)),
                 model_style(focused),
             ),
-            Span::raw("  "),
-            Span::styled(
-                format!("mouse:{}", app.mouse_mode.as_str()),
-                muted_style(focused),
-            ),
         ]));
         for line in wrapped_hint.into_iter().skip(1) {
             lines.push(Line::from(Span::styled(line, muted_style(focused))));
@@ -3948,9 +3634,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run  /mouse"
+        "Enter plan  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan off  /run"
     } else {
-        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model  /mouse"
+        "Enter start  Up/Down history  Tab focus  Alt-1/2/3 pane  /plan  /model"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -4315,10 +4001,6 @@ fn is_scroll_mouse_event(kind: MouseEventKind) -> bool {
     )
 }
 
-fn is_vertical_scroll_mouse_event(kind: MouseEventKind) -> bool {
-    matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
-}
-
 fn mouse_scrollback_delta(mouse: MouseEvent, viewport_height: u16) -> isize {
     let rows = wheel_scroll_rows(viewport_height, mouse.modifiers) as isize;
     match mouse.kind {
@@ -4342,30 +4024,6 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
         .min(MAX_WHEEL_SCROLL_ROWS)
         .min(page)
         .max(1)
-}
-
-fn terminal_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
-    let page = viewport_height.saturating_sub(1).max(1) as usize;
-    if modifiers.intersects(
-        KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::META | KeyModifiers::SUPER,
-    ) {
-        return page.clamp(8, 24);
-    }
-    ((viewport_height / 8).max(3).min(8)) as usize
-}
-
-fn review_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
-    terminal_scroll_steps(viewport_height, modifiers)
-}
-
-fn scroll_key_bytes(mouse: MouseEvent) -> Option<Vec<u8>> {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => Some(b"\x1b[5~".to_vec()),
-        MouseEventKind::ScrollDown => Some(b"\x1b[6~".to_vec()),
-        MouseEventKind::ScrollLeft => Some(b"\x1b[1;5D".to_vec()),
-        MouseEventKind::ScrollRight => Some(b"\x1b[1;5C".to_vec()),
-        _ => None,
-    }
 }
 
 fn page_scroll_rows(area: Option<Rect>) -> isize {
@@ -5093,10 +4751,6 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
         );
     }
 
-    if input.starts_with("/mouse") {
-        return mouse_mode_suggestions(input.strip_prefix("/mouse").unwrap_or_default());
-    }
-
     let query = input.trim_start_matches('/').to_ascii_lowercase();
     command_suggestions()
         .into_iter()
@@ -5131,11 +4785,6 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/model ".to_string()),
         },
         Suggestion {
-            label: "/mouse".to_string(),
-            detail: "switch Ghostty native selection or Rudder mouse capture".to_string(),
-            action: SuggestionAction::Insert("/mouse ".to_string()),
-        },
-        Suggestion {
             label: "/login".to_string(),
             detail: "authenticate Rudder Cloud in the browser".to_string(),
             action: SuggestionAction::Insert("/login".to_string()),
@@ -5156,28 +4805,6 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::ShowHelp,
         },
     ]
-}
-
-fn mouse_mode_suggestions(rest: &str) -> Vec<Suggestion> {
-    let query = rest.trim_start().to_ascii_lowercase();
-    [
-        (
-            "native",
-            "Ghostty handles selection and scrollback; keyboard controls panes",
-        ),
-        (
-            "rudder",
-            "Rudder captures mouse for pane clicks, wheel, and custom selection",
-        ),
-    ]
-    .into_iter()
-    .filter(|(mode, _)| query.is_empty() || mode.starts_with(&query))
-    .map(|(mode, detail)| Suggestion {
-        label: format!("/mouse {mode}"),
-        detail: detail.to_string(),
-        action: SuggestionAction::SetMouseMode(MouseMode::parse(mode).unwrap()),
-    })
-    .collect()
 }
 
 fn model_provider_or_model_suggestions(rest: &str) -> Vec<Suggestion> {
