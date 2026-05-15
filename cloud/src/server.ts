@@ -58,6 +58,7 @@ type FlyMachine = {
 
 const port = Number(process.env.PORT || 3000);
 const baseURL = requiredEnv("BETTER_AUTH_URL", `http://localhost:${port}`);
+const authBaseURL = `${baseURL.replace(/\/$/, "")}/api/auth`;
 const dataDir = process.env.RUDDER_CLOUD_DATA_DIR || path.join(os.homedir(), ".rudder-cloud");
 const dbPath = process.env.RUDDER_CLOUD_DB || path.join(dataDir, "rudder-cloud.sqlite");
 const awsRegion = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
@@ -89,6 +90,51 @@ await restoreDatabaseFromS3();
 const database = new Database(dbPath);
 database.pragma("journal_mode = WAL");
 database.exec(`
+  create table if not exists user (
+    id text primary key not null,
+    name text not null,
+    email text not null unique,
+    emailVerified integer not null,
+    image text,
+    createdAt date not null,
+    updatedAt date not null
+  );
+  create table if not exists session (
+    id text primary key not null,
+    expiresAt date not null,
+    token text not null unique,
+    createdAt date not null,
+    updatedAt date not null,
+    ipAddress text,
+    userAgent text,
+    userId text not null references user(id) on delete cascade
+  );
+  create index if not exists session_userId_idx on session(userId);
+  create table if not exists account (
+    id text primary key not null,
+    accountId text not null,
+    providerId text not null,
+    userId text not null references user(id) on delete cascade,
+    accessToken text,
+    refreshToken text,
+    idToken text,
+    accessTokenExpiresAt date,
+    refreshTokenExpiresAt date,
+    scope text,
+    password text,
+    createdAt date not null,
+    updatedAt date not null
+  );
+  create index if not exists account_userId_idx on account(userId);
+  create table if not exists verification (
+    id text primary key not null,
+    identifier text not null,
+    value text not null,
+    expiresAt date not null,
+    createdAt date not null,
+    updatedAt date not null
+  );
+  create index if not exists verification_identifier_idx on verification(identifier);
   create table if not exists rudder_tokens (
     token_hash text primary key,
     account_id text not null,
@@ -218,6 +264,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/cli/login") {
       renderLoginPage(url, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/cli/oauth/google/start") {
+      await handleCliOAuthStart(url, res, "google");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/cli/oauth/github/start") {
+      await handleCliOAuthStart(url, res, "github");
       return;
     }
     if (req.method === "GET" && url.pathname === "/cli/github/start") {
@@ -432,14 +486,14 @@ function renderLoginPage(url: URL, res: ServerResponse): void {
   const buttons: string[] = [];
   if (providers.google) {
     buttons.push(providerButton(
-      `/api/auth/sign-in/social?provider=google&callbackURL=${encodeURIComponent(callbackURL)}`,
+      `/cli/oauth/google/start?device_code=${encodeURIComponent(deviceCode)}`,
       "Continue with Google",
       GOOGLE_ICON_SVG,
     ));
   }
   if (providers.github) {
     buttons.push(providerButton(
-      `/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}`,
+      `/cli/oauth/github/start?device_code=${encodeURIComponent(deviceCode)}`,
       "Continue with GitHub",
       GITHUB_ICON_SVG,
     ));
@@ -471,6 +525,62 @@ function renderLoginPage(url: URL, res: ServerResponse): void {
 
 function providerButton(href: string, label: string, icon: string): string {
   return `<a class="provider" href="${escapeHtml(href)}"><span class="icon" aria-hidden="true">${icon}</span><span>${escapeHtml(label)}</span></a>`;
+}
+
+async function handleCliOAuthStart(url: URL, res: ServerResponse, provider: "google" | "github"): Promise<void> {
+  const deviceCode = url.searchParams.get("device_code") || "";
+  const login = deviceLogins.get(deviceCode);
+  if (!login || login.expiresAt < Date.now()) {
+    renderExpiredPage(res);
+    return;
+  }
+
+  const providers = configuredProviders();
+  if (!providers[provider]) {
+    sendHtml(res, renderShell({
+      title: "Provider unavailable · Rudder Cloud",
+      body: `<section class="hero"><h1>Provider unavailable.</h1><p class="lede">${escapeHtml(provider)} login is not configured. Use the GitHub device code option instead.</p></section>`,
+    }), 404);
+    return;
+  }
+
+  const callbackURL = `${baseURL}/cli/approve?device_code=${encodeURIComponent(deviceCode)}`;
+  refreshAuthHandler();
+  const response = await auth.handler(new Request(`${authBaseURL}/sign-in/social`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: baseURL,
+    },
+    body: JSON.stringify({
+      provider,
+      callbackURL,
+      disableRedirect: true,
+    }),
+  }));
+  const text = await response.text();
+  let parsed: Json = text ? parseJson(text) : null;
+  if (!response.ok) {
+    const message = responseErrorMessage(parsed) ?? (text || `${response.status} ${response.statusText}`);
+    sendHtml(res, renderShell({
+      title: "Login failed · Rudder Cloud",
+      body: `<section class="hero"><h1>Login failed.</h1><p class="lede">${escapeHtml(message)}</p></section>`,
+    }), response.status);
+    return;
+  }
+  const redirectURL = parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.url === "string"
+    ? parsed.url
+    : undefined;
+  if (!redirectURL) {
+    throw new Error("OAuth provider did not return an authorization URL");
+  }
+  const responseHeaders = response.headers as Headers & { getSetCookie?: () => string[] };
+  for (const cookie of responseHeaders.getSetCookie?.() ?? splitSetCookieHeader(response.headers.get("set-cookie"))) {
+    res.setHeader("Set-Cookie", appendHeader(res.getHeader("Set-Cookie"), cookie));
+  }
+  res.statusCode = 302;
+  res.setHeader("Location", redirectURL);
+  res.end();
 }
 
 const GOOGLE_ICON_SVG = `<svg viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg"><path fill="#4285F4" d="M17.64 9.205c0-.639-.057-1.252-.164-1.841H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.258h2.908c1.702-1.567 2.684-3.875 2.684-6.614Z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.181l-2.908-2.258c-.806.54-1.836.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.331A8.997 8.997 0 0 0 9 18Z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.68 9c0-.593.102-1.17.284-1.71V4.959H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.041l3.007-2.331Z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.581C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.959L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58Z"/></svg>`;
@@ -555,7 +665,7 @@ function renderGithubAppSetup(url: URL, res: ServerResponse): void {
     },
     redirect_url: `${baseURL}/setup/github/callback`,
     callback_urls: [
-      `${baseURL}/api/auth/callback/github`,
+      `${authBaseURL}/callback/github`,
     ],
     setup_url: `${baseURL}/setup/github`,
     description: "Rudder Cloud login and coding-agent orchestration.",
@@ -572,7 +682,7 @@ function renderGithubAppSetup(url: URL, res: ServerResponse): void {
         <p class="lede">This creates a GitHub App from a manifest and stores its OAuth client ID and secret in Rudder Cloud's persisted state.</p>
         <div class="card">
           <p class="muted" style="margin-top:0">Callback URL</p>
-          <p><code class="kbd">${escapeHtml(`${baseURL}/api/auth/callback/github`)}</code></p>
+          <p><code class="kbd">${escapeHtml(`${authBaseURL}/callback/github`)}</code></p>
           <form action="${escapeHtml(action)}" method="post" style="margin-top:18px">
             <input type="hidden" name="manifest" value="${escapeHtml(JSON.stringify(manifest))}">
             <button class="btn-primary" type="submit">Create GitHub App</button>
@@ -1280,7 +1390,7 @@ function requireWorkerBearer(req: IncomingMessage, sailRow: Record<string, unkno
 
 function createBetterAuth() {
   return betterAuth({
-    baseURL,
+    baseURL: authBaseURL,
     secret: requiredEnv("BETTER_AUTH_SECRET"),
     database,
     socialProviders: socialProviders(),
@@ -1482,6 +1592,26 @@ function responseErrorMessage(value: Json | null): string | undefined {
     : typeof value.message === "string"
       ? value.message
       : undefined;
+}
+
+function appendHeader(existing: number | string | string[] | undefined, value: string): string[] {
+  if (Array.isArray(existing)) {
+    return [...existing, value];
+  }
+  if (typeof existing === "string") {
+    return [existing, value];
+  }
+  if (typeof existing === "number") {
+    return [String(existing), value];
+  }
+  return [value];
+}
+
+function splitSetCookieHeader(value: string | null): string[] {
+  if (!value) {
+    return [];
+  }
+  return value.split(/,(?=\s*[^;,]+=)/).map((cookie) => cookie.trim()).filter(Boolean);
 }
 
 function ensureCloudRuntimeConfigured(): void {
