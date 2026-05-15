@@ -19,6 +19,7 @@ import {
   slugify,
   writeJson,
 } from "./util.js";
+import { summarizeTask } from "./task-summary.js";
 
 export function globalConfigPath(): string {
   return path.join(rudderHome(), "config.json");
@@ -250,6 +251,7 @@ export async function createRunRecord(params: {
     status: "created",
     mode: params.mode ?? "execute",
     task: params.task,
+    taskSummary: summarizeTask(params.task),
     backend: params.backend,
     model: params.model,
     effort: params.effort,
@@ -274,12 +276,17 @@ export async function createRunRecord(params: {
 }
 
 export async function saveRunRecord(record: RunRecord): Promise<void> {
+  record.taskSummary = record.taskSummary || summarizeTask(record.task);
   record.updatedAt = nowIso();
   await writeJson(runRecordPath(record.repoRoot, record.id), record);
 }
 
 export async function loadRunRecord(repoRoot: string, runId: string): Promise<RunRecord | null> {
-  return await readJson<RunRecord>(runRecordPath(repoRoot, runId));
+  const record = await readJson<RunRecord>(runRecordPath(repoRoot, runId));
+  if (record && !record.taskSummary) {
+    record.taskSummary = summarizeTask(record.task);
+  }
+  return record;
 }
 
 export async function appendEvent(repoRoot: string, event: RudderEvent): Promise<void> {

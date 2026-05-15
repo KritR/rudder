@@ -1,6 +1,7 @@
 import type { RunRecord } from "./types.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
+import { taskDisplayLabel } from "./task-summary.js";
 import { shellQuote } from "./util.js";
 
 export function nativeAgentCommand(params: {
@@ -125,7 +126,7 @@ function codexPlanArgs(run: RunRecord, prompt: string): string[] {
 }
 
 function paneTitle(run: RunRecord): string {
-  const words = run.task.replace(/\s+/g, " ").trim().slice(0, 34);
+  const words = taskDisplayLabel(run, 34);
   return `${run.backend}:${words || run.id.slice(0, 12)}`;
 }
 
