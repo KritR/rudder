@@ -161,6 +161,50 @@
         line-height: 1.6;
       }
 
+      .details {
+        margin-top: 54px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 18px;
+        max-width: 1200px;
+      }
+
+      .panel {
+        border-top: 1px solid #111;
+        padding-top: 18px;
+      }
+
+      h2 {
+        margin: 0 0 14px;
+        font-size: 14px;
+        line-height: 1.2;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      .rows {
+        display: grid;
+        gap: 9px;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: minmax(92px, max-content) minmax(0, 1fr);
+        gap: 16px;
+        align-items: baseline;
+        color: #555;
+        font-size: 15px;
+        line-height: 1.45;
+      }
+
+      .row code {
+        color: #111;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
       footer {
         margin-top: 72px;
         padding-top: 24px;
@@ -188,6 +232,12 @@
 
         .summary {
           margin-top: 36px;
+        }
+
+        .details {
+          grid-template-columns: 1fr;
+          gap: 30px;
+          margin-top: 38px;
         }
       }
     </style>
@@ -229,6 +279,69 @@ rudder</code>
         <section class="summary" aria-label="Rudder summary">
           Multiple agents in parallel. Optional cloud continuation. Code diff.
           Backend native plan mode. One key merge. Easy start.
+        </section>
+
+        <section class="details" aria-label="Rudder shortcuts and commands">
+          <div class="panel">
+            <h2>Focus</h2>
+            <div class="rows">
+              <div class="row"><code>Tab</code><span>Cycle agents, worker, and task panes.</span></div>
+              <div class="row"><code>Alt-1/2/3</code><span>Jump straight to agents, worker, or task.</span></div>
+              <div class="row"><code>Ctrl-G</code><span>Use Rudder shortcuts while a worker is focused.</span></div>
+              <div class="row"><code>Ctrl-C</code><span>Leave Rudder from any pane.</span></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Agents</h2>
+            <div class="rows">
+              <div class="row"><code>j / k</code><span>Select an agent in the left pane.</span></div>
+              <div class="row"><code>v</code><span>Open or close the live diff review.</span></div>
+              <div class="row"><code>m / M</code><span>Merge selected worktree, or all completed worktrees.</span></div>
+              <div class="row"><code>dd</code><span>Delete an agent and remove its worktree after confirmation.</span></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Task</h2>
+            <div class="rows">
+              <div class="row"><code>/model</code><span>Choose Claude or Codex, then model and effort.</span></div>
+              <div class="row"><code>/plan</code><span>Use native read-only planning before implementation.</span></div>
+              <div class="row"><code>/login</code><span>Authenticate Rudder Cloud in the browser.</span></div>
+              <div class="row"><code>/cloud</code><span>List cloud workers, or start one with a task.</span></div>
+              <div class="row"><code>/sail</code><span>Short alias for starting a cloud worker.</span></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Worker</h2>
+            <div class="rows">
+              <div class="row"><code>Enter</code><span>Send input to Claude Code or Codex when the worker is focused.</span></div>
+              <div class="row"><code>Shift-Enter</code><span>Insert a new line in the worker prompt.</span></div>
+              <div class="row"><code>PageUp/Down</code><span>Scroll Rudder's captured worker output.</span></div>
+              <div class="row"><code>Cmd-C</code><span>Copy selected worker or task text.</span></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Review</h2>
+            <div class="rows">
+              <div class="row"><code>v</code><span>Switch from the worker to Hunk diff review.</span></div>
+              <div class="row"><code>Esc</code><span>Leave review and return to the worker.</span></div>
+              <div class="row"><code>wheel</code><span>Scroll the focused pane with trackpad or mouse.</span></div>
+              <div class="row"><code>m</code><span>Merge from review when the selected agent is ready.</span></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Cloud</h2>
+            <div class="rows">
+              <div class="row"><code>rudder login</code><span>Open browser auth and connect this machine.</span></div>
+              <div class="row"><code>rudder cloud list</code><span>Show cloud workers for your account.</span></div>
+              <div class="row"><code>rudder cloud onload</code><span>Move a local run into the cloud.</span></div>
+              <div class="row"><code>rudder sail</code><span>Start a Fly Machines worker from the current repo.</span></div>
+            </div>
+          </div>
         </section>
       </main>
     </div>

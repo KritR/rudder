@@ -172,7 +172,7 @@ pane has no Rudder scrollback to move and the inner TUI has explicitly requested
 mouse input, Rudder passes the wheel event through so Claude Code, Codex, Hunk,
 or another full-screen app can scroll its own view.
 
-## Keys
+## Dashboard Shortcuts
 
 | Key | Action |
 | --- | --- |
@@ -180,15 +180,15 @@ or another full-screen app can scroll its own view.
 | `Tab` / `Shift+Tab` | Cycle focus across agents, worker, and task panes |
 | `Alt-1` / `Alt-2` / `Alt-3` | Focus agents, worker, or task directly |
 | `Ctrl-G` | Toggle Rudder nav mode while focused inside a worker |
+| `Alt-v` | Toggle the selected agent's review view from any pane |
 | `Shift+Enter` | Insert a new line in the focused worker prompt |
 | `PageUp` / `PageDown` | Scroll the focused worker pane by roughly one page |
 | `j` / `k` or arrows | Move through agents when the agents pane is focused |
+| `Up` / `Down` | Browse task history when the task pane is focused |
+| `Alt-Left` / `Alt-Right` | Move by word in the task pane and in supported worker prompts |
+| `Alt-Backspace` / `Ctrl-W` | Delete the previous word in the task pane and in supported worker prompts |
+| `Cmd-C` / `Meta-C` | Copy the active Rudder text selection without forwarding `c` to the worker |
 | `Ctrl-C` | Leave Rudder from any pane |
-| `/plan` | Toggle Rudder's read-only plan mode for task pane submissions |
-| `/plan <task>` | Start one read-only planning session without toggling plan mode |
-| `/run <task>` | Start an implementation run even when plan mode is on |
-| `/model` | Open the provider-first model picker |
-| `/help` | Show the short command hint |
 | `v` | Toggle the selected agent's review view |
 | `Esc` | Leave the review view when it is focused |
 | `r` | Restart the selected stopped agent in its worktree |
@@ -196,6 +196,23 @@ or another full-screen app can scroll its own view.
 | `M` | Merge all completed worktrees |
 | `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
 | `q` | Quit when the worker is not consuming input |
+
+## Task Pane Commands
+
+Type `/` in the task pane to open command suggestions. Use `Up`/`Down` to move
+through suggestions and `Enter` to choose one.
+
+| Command | Action |
+| --- | --- |
+| `/model` | Open the provider-first model picker: choose Claude or Codex, then model, then effort when supported |
+| `/plan` | Toggle Rudder's read-only plan mode for task pane submissions |
+| `/plan <task>` | Start one read-only planning session without toggling plan mode |
+| `/run <task>` | Start an implementation run even when plan mode is on |
+| `/login` | Open browser login for Rudder Cloud |
+| `/cloud` | List cloud workers; requires `/login` first |
+| `/cloud <task>` | Start a cloud worker for a task |
+| `/sail <task>` | Short alias for starting a cloud worker |
+| `/help` | Show the short command hint |
 
 Use `Ctrl-G` before a Rudder shortcut if the worker pane is focused and you want
 the key handled by Rudder instead of by Claude Code or Codex.
