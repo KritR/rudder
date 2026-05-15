@@ -11,11 +11,10 @@
 [![Node >=20](https://img.shields.io/badge/node-%3E%3D20-43853d.svg)](https://nodejs.org/)
 [![Website](https://img.shields.io/badge/site-rudder.viraat.dev-111111.svg)](https://rudder.viraat.dev)
 
-Rudder is a terminal command center for running local coding agents. It opens a
-native three-pane dashboard, creates an isolated git worktree for each task, and
-runs real Claude Code or Codex processes in the worker pane.
-
-![Rudder dashboard running Codex in a worker pane](site/rudder-dashboard.svg)
+Rudder leans into how coding agents should be used: massively parallel,
+isolated, reviewable, and easy to merge. It opens a native three-pane dashboard,
+creates an isolated git worktree for each task, and runs real Claude Code or
+Codex processes in the worker pane.
 
 Rudder Cloud lives behind `/login`, `/cloud`, and `/sail`. It keeps the same
 local dashboard and worktree flow, with an optional Fly Machines worker path for

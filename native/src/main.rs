@@ -2,14 +2,14 @@ use std::{
     collections::HashSet,
     env, fs,
     hash::{Hash, Hasher},
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -173,9 +173,28 @@ struct App {
     merge_confirm: Option<MergeConfirmation>,
     conflict_prompt: Option<MergeConflictPrompt>,
     picker_index: usize,
+    worker_selection: Option<WorkerSelection>,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectionPoint {
+    row: usize,
+    col: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerSelection {
+    start: SelectionPoint,
+    end: SelectionPoint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalizedSelection {
+    start: SelectionPoint,
+    end: SelectionPoint,
 }
 
 struct MergeConfirmation {
@@ -297,6 +316,7 @@ impl App {
             merge_confirm: None,
             conflict_prompt: None,
             picker_index: 0,
+            worker_selection: None,
             agents_area: None,
             worker_area: None,
             task_area: None,
@@ -448,6 +468,7 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
+        self.worker_selection = None;
         if self.worker_view == WorkerView::Diff {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => {
@@ -533,6 +554,7 @@ impl App {
     }
 
     fn toggle_worker_view(&mut self) {
+        self.worker_selection = None;
         self.worker_view = match self.worker_view {
             WorkerView::Terminal => {
                 self.ensure_hunk_review();
@@ -779,6 +801,7 @@ impl App {
     fn handle_paste(&mut self, text: String) {
         match self.focus {
             FocusPane::Worker => {
+                self.worker_selection = None;
                 if self.worker_view == WorkerView::Diff {
                     if let Some(terminal) = self.selected_review_terminal_mut() {
                         if let Err(error) = terminal.write_input(text.as_bytes()) {
@@ -924,9 +947,69 @@ impl App {
             self.scroll_worker(mouse_scrollback_delta(mouse, inner.height));
             return;
         }
+        if self.handle_worker_selection_mouse(mouse, inner) {
+            return;
+        }
         if self.write_mouse_to_selected_worker(mouse, inner) {
             return;
         }
+    }
+
+    fn handle_worker_selection_mouse(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        if self.selected_terminal_mut().is_none() {
+            self.worker_selection = None;
+            return false;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.worker_selection = Some(WorkerSelection {
+                    start: selection_point_from_mouse(mouse, area),
+                    end: selection_point_from_mouse(mouse, area),
+                });
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = self.worker_selection.as_mut() {
+                    selection.end = selection_point_from_mouse(mouse, area);
+                    true
+                } else {
+                    false
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(mut selection) = self.worker_selection else {
+                    return false;
+                };
+                selection.end = selection_point_from_mouse(mouse, area);
+                self.worker_selection = Some(selection);
+                if selection_is_empty(normalize_selection(selection)) {
+                    self.worker_selection = None;
+                    return true;
+                }
+                let text = self.selected_worker_selection_text(selection);
+                if text.trim().is_empty() {
+                    self.notice = Some("selection empty".to_string());
+                    return true;
+                }
+                match copy_text_to_clipboard(&text) {
+                    Ok(()) => self.notice = Some("copied worker selection".to_string()),
+                    Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn selected_worker_selection_text(&self, selection: WorkerSelection) -> String {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            return String::new();
+        };
+        let Some(terminal) = run.terminal.as_ref() else {
+            return String::new();
+        };
+        selected_text_from_lines(&terminal.visible_lines_snapshot(), selection)
     }
 
     fn write_mouse_to_selected_worker(&mut self, mouse: MouseEvent, area: Rect) -> bool {
@@ -1055,6 +1138,7 @@ impl App {
         self.remember_task_history(&input);
         self.task_input.clear();
         self.task_cursor = 0;
+        self.worker_selection = None;
 
         if self.handle_command(&input) {
             return;
@@ -2164,6 +2248,32 @@ mod app_tests {
     }
 
     #[test]
+    fn extracts_selected_worker_text_across_visible_lines() {
+        let lines = vec![
+            "first line".to_string(),
+            "second line".to_string(),
+            "third".to_string(),
+        ];
+        let selection = WorkerSelection {
+            start: SelectionPoint { row: 0, col: 6 },
+            end: SelectionPoint { row: 1, col: 5 },
+        };
+
+        assert_eq!(selected_text_from_lines(&lines, selection), "line\nsecond");
+    }
+
+    #[test]
+    fn normalizes_reversed_worker_selection() {
+        let lines = vec!["abcdef".to_string()];
+        let selection = WorkerSelection {
+            start: SelectionPoint { row: 0, col: 4 },
+            end: SelectionPoint { row: 0, col: 1 },
+        };
+
+        assert_eq!(selected_text_from_lines(&lines, selection), "bcde");
+    }
+
+    #[test]
     fn wraps_worker_paste_as_single_bracketed_paste_payload() {
         assert_eq!(
             bracketed_paste_bytes("hello\nworld"),
@@ -2789,10 +2899,15 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
         ];
     };
 
+    let selection = app
+        .worker_selection
+        .map(normalize_selection)
+        .filter(|selection| !selection_is_empty(*selection));
     let mut lines = terminal
         .styled_lines()
         .into_iter()
-        .map(styled_terminal_line)
+        .enumerate()
+        .map(|(row, cells)| styled_terminal_line(cells, selection_for_row(selection, row)))
         .collect::<Vec<_>>();
     if lines.len() > height {
         lines = lines.split_off(lines.len() - height);
@@ -2834,7 +2949,7 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     let mut lines = review
         .styled_lines()
         .into_iter()
-        .map(styled_terminal_line)
+        .map(|cells| styled_terminal_line(cells, None))
         .collect::<Vec<_>>();
     if lines.len() > height {
         lines = lines.split_off(lines.len() - height);
@@ -3362,11 +3477,148 @@ fn status_color(status: AgentStatus) -> Color {
     }
 }
 
-fn styled_terminal_line(cells: Vec<StyledTerminalCell>) -> Line<'static> {
+fn selection_point_from_mouse(mouse: MouseEvent, area: Rect) -> SelectionPoint {
+    SelectionPoint {
+        row: mouse
+            .row
+            .saturating_sub(area.y)
+            .min(area.height.saturating_sub(1)) as usize,
+        col: mouse
+            .column
+            .saturating_sub(area.x)
+            .min(area.width.saturating_sub(1)) as usize,
+    }
+}
+
+fn normalize_selection(selection: WorkerSelection) -> NormalizedSelection {
+    let (start, end) =
+        if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+    NormalizedSelection { start, end }
+}
+
+fn selection_is_empty(selection: NormalizedSelection) -> bool {
+    selection.start == selection.end
+}
+
+fn selection_for_row(selection: Option<NormalizedSelection>, row: usize) -> Option<(usize, usize)> {
+    let selection = selection?;
+    if row < selection.start.row || row > selection.end.row {
+        return None;
+    }
+    let start_col = if row == selection.start.row {
+        selection.start.col
+    } else {
+        0
+    };
+    let end_col = if row == selection.end.row {
+        selection.end.col
+    } else {
+        usize::MAX
+    };
+    Some((start_col, end_col))
+}
+
+fn selected_text_from_lines(lines: &[String], selection: WorkerSelection) -> String {
+    let selection = normalize_selection(selection);
+    let mut selected = Vec::new();
+    for row in selection.start.row..=selection.end.row {
+        let Some(line) = lines.get(row) else {
+            continue;
+        };
+        let char_len = line.chars().count();
+        let start = if row == selection.start.row {
+            selection.start.col.min(char_len)
+        } else {
+            0
+        };
+        let end = if row == selection.end.row {
+            selection.end.col.saturating_add(1).min(char_len)
+        } else {
+            char_len
+        };
+        selected.push(slice_chars(line, start, end));
+    }
+    selected.join("\n")
+}
+
+fn slice_chars(value: &str, start: usize, end: usize) -> String {
+    value
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return run_clipboard_command("pbcopy", &[], text);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return run_clipboard_command("clip", &[], text);
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let commands: &[(&str, &[&str])] = &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        for (command, args) in commands {
+            if run_clipboard_command(command, args, text).is_ok() {
+                return Ok(());
+            }
+        }
+        bail!("no clipboard command found");
+    }
+}
+
+fn run_clipboard_command(command: &str, args: &[&str], text: &str) -> Result<()> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start {command}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .with_context(|| format!("failed to write to {command}"))?;
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {command}"))?;
+    if !status.success() {
+        bail!("{command} exited with {status}");
+    }
+    Ok(())
+}
+
+fn styled_terminal_line(
+    cells: Vec<StyledTerminalCell>,
+    selection: Option<(usize, usize)>,
+) -> Line<'static> {
     let spans = cells
         .into_iter()
+        .enumerate()
         .map(|cell| {
-            let style = terminal_cell_style(&cell);
+            let (col, cell) = cell;
+            let mut style = terminal_cell_style(&cell);
+            if selection.is_some_and(|(start, end)| col >= start && col <= end) {
+                style = style.fg(Color::Black).bg(FOCUS_COLOR);
+            }
             Span::styled(cell.contents, style)
         })
         .collect::<Vec<_>>();

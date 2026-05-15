@@ -6,13 +6,13 @@
     <title>Rudder</title>
     <meta
       name="description"
-      content="Rudder is the terminal OS for running Claude Code and Codex agents in isolated worktrees, with Rudder Cloud for remote worker runs."
+      content="Rudder is the terminal OS for massively parallel Claude Code and Codex agents with code diff, cloud continuation, and easy merges."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="The terminal OS for running Claude Code and Codex agents side by side, locally or through Rudder Cloud."
+      content="Run agents massively parallel. Review code diffs, continue in the cloud, and merge finished work cleanly."
     />
     <meta name="theme-color" content="#ffffff" />
     <style>
@@ -137,27 +137,14 @@
         outline-offset: 3px;
       }
 
-      .points {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 16px;
+      .summary {
         margin-top: 38px;
-      }
-
-      .point {
+        max-width: 900px;
         border-top: 1px solid #ddd;
-        padding-top: 16px;
-      }
-
-      .point strong {
-        display: block;
-        font-weight: 450;
-        margin-bottom: 5px;
-      }
-
-      .point span {
+        padding-top: 22px;
         color: #555;
-        line-height: 1.5;
+        font-size: 17px;
+        line-height: 1.6;
       }
 
       .terminal {
@@ -168,26 +155,6 @@
         grid-template-rows: 1fr 88px;
         background: #fff;
         box-shadow: 12px 12px 0 #111;
-      }
-
-      .screenshot-section {
-        margin-top: 52px;
-      }
-
-      .screenshot {
-        display: block;
-        width: 100%;
-        border: 1px solid #111;
-        box-shadow: 12px 12px 0 #111;
-        background: #eef1f7;
-      }
-
-      .caption {
-        margin-top: 18px;
-        max-width: 900px;
-        color: #555;
-        font-size: 15px;
-        line-height: 1.55;
       }
 
       .pane {
@@ -286,10 +253,6 @@
           display: block;
         }
 
-        .points {
-          grid-template-columns: 1fr;
-        }
-
         .terminal {
           min-height: 440px;
           grid-template-columns: 1fr;
@@ -306,15 +269,6 @@
           margin: 10px;
         }
 
-        .screenshot {
-          min-width: 860px;
-          box-shadow: 8px 8px 0 #111;
-        }
-
-        .screenshot-section {
-          overflow-x: auto;
-          padding-bottom: 14px;
-        }
       }
     </style>
   </head>
@@ -335,11 +289,10 @@
         <section class="hero">
           <h1>The terminal OS for coding agents.</h1>
           <p class="lede">
-            Rudder opens a local dashboard where each prompt becomes a real
-            Claude Code or Codex worker in its own git worktree. Watch the
-            agent live, review the diff, steer it when needed, then merge the
-            finished work back into your branch. Use Rudder Cloud when a run
-            should keep going away from your laptop on a Fly worker.
+            Rudder leans into how you should use agents: massively parallel,
+            isolated, reviewable, and easy to merge. Start local Claude Code or
+            Codex workers, continue agents in the cloud when it makes sense,
+            review code diffs, and merge finished work cleanly.
           </p>
           <div class="install">
             <code id="install-command">npm install -g @viraatdas/rudder@latest
@@ -348,41 +301,9 @@ rudder</code>
           </div>
         </section>
 
-        <section class="screenshot-section" aria-label="Rudder dashboard screenshot">
-          <img class="screenshot" src="/rudder-dashboard.svg" alt="Rudder dashboard with agents on the left, a Codex worker on the right, and task input at the bottom." />
-          <p class="caption">
-            The left pane tracks every agent, the right pane is the live Claude
-            Code or Codex process, and the bottom pane starts new tasks. Rudder
-            keeps each task isolated in a worktree so you can run, review, and
-            merge work intentionally.
-          </p>
-        </section>
-
-        <section class="points" aria-label="Rudder features">
-          <div class="point">
-            <strong>Real worker panes</strong>
-            <span>Claude Code and Codex run as native terminal processes, not rendered transcripts.</span>
-          </div>
-          <div class="point">
-            <strong>Worktree isolation</strong>
-            <span>Every prompt gets its own checkout so parallel agents do not fight over files.</span>
-          </div>
-          <div class="point">
-            <strong>Review and merge</strong>
-            <span>Open a Hunk review with `v`, then merge the selected completed agent with `m`.</span>
-          </div>
-          <div class="point">
-            <strong>Designed for long runs</strong>
-            <span>Rudder keeps run state, lets you restart stopped agents, and can hand work to cloud workers.</span>
-          </div>
-          <div class="point">
-            <strong>Rudder Cloud</strong>
-            <span>Run `rudder login`; Rudder reuses GitHub CLI auth when available, then `/cloud` or `/sail` can start work on a Fly Machine.</span>
-          </div>
-          <div class="point">
-            <strong>Hosted auth</strong>
-            <span>Attach existing GitHub and Google OAuth clients with `rudder cloud setup-github` and `rudder cloud setup-google`.</span>
-          </div>
+        <section class="summary" aria-label="Rudder summary">
+          Massively parallel agents. Optional cloud continuation. Code diff.
+          One-key merge. Easy start.
         </section>
       </main>
     </div>
