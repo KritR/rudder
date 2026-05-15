@@ -3115,6 +3115,11 @@ mod app_tests {
             .args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!execute_codex.args.iter().any(|arg| arg == "--sandbox"));
+        assert!(!execute_codex
+            .args
+            .iter()
+            .any(|arg| arg == "--ask-for-approval"));
         assert!(execute_codex
             .args
             .iter()
@@ -5650,20 +5655,16 @@ fn agent_command(
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
-            let mut args = vec![
-                "--no-alt-screen".to_string(),
-                "--ask-for-approval".to_string(),
-                "never".to_string(),
-            ];
+            let mut args = vec!["--no-alt-screen".to_string()];
             match mode {
                 AgentMode::Execute => {
-                    args.push("--sandbox".to_string());
-                    args.push("danger-full-access".to_string());
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
                 }
                 AgentMode::Plan => {
                     args.push("--sandbox".to_string());
                     args.push("read-only".to_string());
+                    args.push("--ask-for-approval".to_string());
+                    args.push("never".to_string());
                     args.push("--search".to_string());
                 }
             }
