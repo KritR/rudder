@@ -92,6 +92,7 @@ if [ -n "$task" ]; then
     if [ -n "$run_id" ]; then
       while true; do
         status="$(rudder runs --json | node -e 'const id=process.argv[1]; let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const runs=JSON.parse(s); const run=runs.find((r) => r.id === id); process.stdout.write(run?.status || "unknown"); });' "$run_id" 2>/dev/null || echo unknown)"
+        echo "Rudder run $run_id status: $status"
         case "$status" in
           completed)
             code=0
@@ -105,6 +106,10 @@ if [ -n "$task" ]; then
         sleep 10
       done
       rudder logs "$run_id" || true
+      if [ "$code" -ne 0 ] && [ -f ".rudder/runs/$run_id/events.ndjson" ]; then
+        echo "Raw Rudder events for failed run:"
+        tail -n 80 ".rudder/runs/$run_id/events.ndjson" || true
+      fi
     fi
   fi
   set -e
