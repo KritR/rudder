@@ -43,8 +43,7 @@ const MODEL_COLOR: Color = Color::Magenta;
 const RUNNING_COLOR: Color = Color::Yellow;
 const DONE_COLOR: Color = Color::Gray;
 const FAILED_COLOR: Color = Color::Red;
-const MIN_WHEEL_SCROLL_ROWS: u16 = 6;
-const MAX_WHEEL_SCROLL_ROWS: u16 = 18;
+const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 
@@ -716,6 +715,16 @@ impl App {
                     self.task_cursor = (self.task_cursor + 1).min(len);
                 }
             }
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                self.task_cursor = previous_word_position(&self.task_input, self.task_cursor);
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                self.task_cursor = next_word_position(&self.task_input, self.task_cursor);
+            }
             KeyCode::Home => {
                 self.task_cursor = 0;
             }
@@ -731,6 +740,27 @@ impl App {
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reset_task_history_navigation();
                 delete_previous_word_at(&mut self.task_input, &mut self.task_cursor);
+                self.clamp_picker_index();
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.task_cursor = 0;
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.task_cursor = self.task_input.chars().count();
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_task_history_navigation();
+                truncate_at_cursor(&mut self.task_input, self.task_cursor);
+                self.clamp_picker_index();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_task_history_navigation();
+                delete_char_at_cursor(&mut self.task_input, self.task_cursor);
+                self.clamp_picker_index();
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_task_history_navigation();
+                delete_char_before_cursor(&mut self.task_input, &mut self.task_cursor);
                 self.clamp_picker_index();
             }
             KeyCode::Char('/') if self.task_input.is_empty() => {
@@ -1047,6 +1077,22 @@ impl App {
     }
 
     fn handle_pane_scroll(&mut self, mouse: MouseEvent) {
+        if self.focus == FocusPane::Worker {
+            if let Some(area) = self.worker_area {
+                let inner = block_inner(area);
+                self.set_mouse_debug(format!(
+                    "mouse {:?} @{},{} focus=worker view={:?}",
+                    mouse.kind, mouse.column, mouse.row, self.worker_view
+                ));
+                if self.worker_view == WorkerView::Diff {
+                    let _ = self.scroll_selected_review_or_forward(mouse, inner);
+                } else {
+                    let _ = self.scroll_selected_worker_or_forward(mouse, inner);
+                }
+                return;
+            }
+        }
+
         if let Some(area) = self
             .worker_area
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
@@ -1731,12 +1777,13 @@ impl App {
             Some("/cloud") => {
                 let raw_args = parts.collect::<Vec<_>>();
                 let args = self.cloud_command_args(raw_args.clone());
-                if !cloud_args_are_login(&raw_args) && !rudder_cloud_authenticated() {
+                if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
                     self.notice =
                         Some("not logged in to Rudder Cloud; run /login first".to_string());
                     return true;
                 }
-                self.start_rudder_cli_command("cloud", args);
+                let label = cloud_agent_label(&args);
+                self.start_rudder_cli_command(&label, args);
                 true
             }
             Some("/sail") => {
@@ -1745,9 +1792,10 @@ impl App {
                         Some("not logged in to Rudder Cloud; run /login first".to_string());
                     return true;
                 }
-                let mut args = vec!["cloud".to_string(), "sail".to_string()];
-                args.extend(parts.map(ToString::to_string));
-                self.start_rudder_cli_command("sail", args);
+                let raw_args = parts.collect::<Vec<_>>();
+                let args = self.cloud_command_args(raw_args);
+                let label = cloud_agent_label(&args);
+                self.start_rudder_cli_command(&label, args);
                 true
             }
             _ => false,
@@ -1756,7 +1804,7 @@ impl App {
 
     fn cloud_command_args(&self, args: Vec<&str>) -> Vec<String> {
         if args.is_empty() {
-            return vec!["cloud".to_string(), "list".to_string()];
+            return vec!["cloud".to_string(), random_cloud_name()];
         }
         if args[0] == "onload" && args.len() == 1 {
             if let Some(run) = self.agents.get(self.selected_agent) {
@@ -1764,14 +1812,13 @@ impl App {
             }
         }
         let known = [
-            "login", "list", "ls", "onload", "sail", "launch", "pause", "resume", "status", "stop",
-            "logs",
+            "help", "login", "list", "ls", "onload", "sail", "launch", "pause", "resume",
+            "status", "stop", "logs",
         ];
         let mut command = vec!["cloud".to_string()];
         if known.contains(&args[0]) {
             command.extend(args.into_iter().map(ToString::to_string));
         } else {
-            command.push("sail".to_string());
             command.extend(args.into_iter().map(ToString::to_string));
         }
         command
@@ -2594,6 +2641,25 @@ mod app_tests {
         insert_str_at_cursor(&mut editable, &mut cursor, "login");
         assert_eq!(editable, "fix the login bug");
         assert_eq!(cursor, 13);
+
+        let mut app = App::new();
+        app.task_input = "fix the auth bug".to_string();
+        app.task_cursor = app.task_input.chars().count();
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.task_cursor, 13);
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.task_cursor, 8);
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(app.task_cursor, 12);
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.task_cursor, 0);
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.task_cursor, app.task_input.chars().count());
+        app.task_cursor = 8;
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.task_input, "fix the ");
+        app.handle_task_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.task_input, "fix the");
     }
 
     #[test]
@@ -2642,9 +2708,10 @@ mod app_tests {
 
     #[test]
     fn worker_wheel_scroll_rows_scale_with_viewport() {
-        assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 5);
-        assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 10);
-        assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 18);
+        assert_eq!(wheel_scroll_rows(2, KeyModifiers::empty()), 1);
+        assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 3);
+        assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 3);
+        assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 3);
         assert_eq!(wheel_scroll_rows(30, KeyModifiers::CONTROL), 29);
 
         let down = MouseEvent {
@@ -2653,7 +2720,7 @@ mod app_tests {
             row: 0,
             modifiers: KeyModifiers::empty(),
         };
-        assert_eq!(mouse_scrollback_delta(down, 30), -10);
+        assert_eq!(mouse_scrollback_delta(down, 30), -3);
     }
 
     #[cfg(not(windows))]
@@ -3209,12 +3276,12 @@ mod app_tests {
     }
 
     #[test]
-    fn cloud_command_defaults_to_authenticated_list() {
+    fn cloud_command_defaults_to_generated_cloud_worker() {
         let app = App::new();
-        assert_eq!(
-            app.cloud_command_args(Vec::new()),
-            vec!["cloud".to_string(), "list".to_string()]
-        );
+        let generated = app.cloud_command_args(Vec::new());
+        assert_eq!(generated.first().map(String::as_str), Some("cloud"));
+        assert_eq!(generated.len(), 2);
+        assert!(generated[1].contains('-'));
         assert_eq!(
             app.cloud_command_args(vec!["login"]),
             vec!["cloud".to_string(), "login".to_string()]
@@ -3222,6 +3289,14 @@ mod app_tests {
         assert_eq!(
             app.cloud_command_args(vec!["onload"]),
             vec!["cloud".to_string(), "onload".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["list"]),
+            vec!["cloud".to_string(), "list".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["visualization"]),
+            vec!["cloud".to_string(), "visualization".to_string()]
         );
     }
 
@@ -3888,7 +3963,9 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled(agent_status_label(agent), agent_status_style(agent)),
             Span::raw("  "),
-            if agent.mode == AgentMode::Plan {
+            if is_cloud_agent(agent) {
+                Span::styled("cloud", accent_style(focused).add_modifier(Modifier::BOLD))
+            } else if agent.mode == AgentMode::Plan {
                 Span::styled("plan", accent_style(focused))
             } else {
                 Span::styled("run", muted_style(focused))
@@ -4605,11 +4682,15 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
         return page;
     }
 
-    (viewport_height / 3)
-        .max(MIN_WHEEL_SCROLL_ROWS)
-        .min(MAX_WHEEL_SCROLL_ROWS)
-        .min(page)
-        .max(1)
+    wheel_scroll_rows_setting().min(page).max(1)
+}
+
+fn wheel_scroll_rows_setting() -> u16 {
+    env::var("RUDDER_WHEEL_SCROLL_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WHEEL_SCROLL_ROWS)
 }
 
 fn page_scroll_rows(area: Option<Rect>) -> isize {
@@ -4639,6 +4720,13 @@ fn agent_status_style(agent: &AgentRun) -> Style {
     } else {
         status_style(agent.status)
     }
+}
+
+fn is_cloud_agent(agent: &AgentRun) -> bool {
+    agent.task == "cloud"
+        || agent.task.starts_with("cloud ")
+        || agent.current_prompt == "cloud"
+        || agent.current_prompt.starts_with("cloud ")
 }
 
 fn status_color(status: AgentStatus) -> Color {
@@ -5245,8 +5333,50 @@ fn rudder_cloud_authenticated() -> bool {
         })
 }
 
-fn cloud_args_are_login(args: &[&str]) -> bool {
-    args.first().is_some_and(|arg| *arg == "login")
+fn cloud_args_need_auth(args: &[&str]) -> bool {
+    !args
+        .first()
+        .is_some_and(|arg| matches!(*arg, "help" | "login"))
+}
+
+fn cloud_agent_label(args: &[String]) -> String {
+    match args.get(1).map(String::as_str) {
+        Some("list" | "ls") => "cloud list".to_string(),
+        Some("help") => "cloud help".to_string(),
+        Some("login") => "cloud login".to_string(),
+        Some("onload") => args
+            .get(2)
+            .map(|id| format!("cloud onload {id}"))
+            .unwrap_or_else(|| "cloud onload".to_string()),
+        Some("launch") => "cloud launch".to_string(),
+        Some("pause" | "resume" | "stop" | "status" | "logs") => args
+            .get(2)
+            .map(|id| format!("cloud {} {id}", args[1]))
+            .unwrap_or_else(|| format!("cloud {}", args[1])),
+        Some(name) => format!("cloud {name}"),
+        None => "cloud".to_string(),
+    }
+}
+
+fn random_cloud_name() -> String {
+    const ADJECTIVES: &[&str] = &[
+        "amber", "bright", "calm", "clear", "cosmic", "gentle", "golden", "lucky", "rapid",
+        "silver", "steady", "swift",
+    ];
+    const NOUNS: &[&str] = &[
+        "atlas", "harbor", "signal", "summit", "orbit", "ranger", "river", "rocket", "sparrow",
+        "station", "voyager", "wave",
+    ];
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as usize)
+        .unwrap_or_default()
+        ^ std::process::id() as usize;
+    format!(
+        "{}-{}",
+        ADJECTIVES[seed % ADJECTIVES.len()],
+        NOUNS[(seed / ADJECTIVES.len()) % NOUNS.len()]
+    )
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -6027,6 +6157,11 @@ fn delete_char_at_cursor(input: &mut String, cursor: usize) {
     let start = byte_index_for_char(input, cursor);
     let end = byte_index_for_char(input, cursor + 1);
     input.replace_range(start..end, "");
+}
+
+fn truncate_at_cursor(input: &mut String, cursor: usize) {
+    let start = byte_index_for_char(input, cursor);
+    input.truncate(start);
 }
 
 fn delete_previous_word_at(input: &mut String, cursor: &mut usize) {

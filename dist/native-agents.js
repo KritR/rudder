@@ -1,0 +1,157 @@
+import { normalizeEffortForBackend } from "./effort.js";
+import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
+import { shellQuote } from "./util.js";
+export function nativeAgentCommand(params) {
+    const mode = params.mode ?? params.run.mode ?? "execute";
+    const args = mode === "plan"
+        ? planArgs(params.run, params.prompt)
+        : params.run.backend === "codex"
+            ? codexArgs(params.run, params.prompt, params.contract)
+            : claudeArgs(params.run, params.prompt, params.contract);
+    return args.map(shellQuote).join(" ");
+}
+function claudeArgs(run, prompt, contract) {
+    const model = run.model || "sonnet";
+    const effort = normalizeEffortForBackend("claude", run.effort);
+    const sessionId = run.session?.nativeSessionId;
+    return compact([
+        "env",
+        "CLAUDE_CODE_NO_FLICKER=0",
+        "claude",
+        "--model",
+        model,
+        effort ? "--effort" : undefined,
+        effort,
+        "--permission-mode",
+        "bypassPermissions",
+        "--dangerously-skip-permissions",
+        "--append-system-prompt",
+        contract,
+        "--name",
+        paneTitle(run),
+        sessionId ? "--session-id" : undefined,
+        sessionId,
+        prompt,
+    ]);
+}
+function codexArgs(run, prompt, contract) {
+    const model = run.model || "gpt-5.5";
+    const effort = normalizeEffortForBackend("codex", run.effort);
+    return [
+        "codex",
+        "--no-alt-screen",
+        "--model",
+        model,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--enable",
+        "goals",
+        effort ? "-c" : undefined,
+        effort ? `model_reasoning_effort="${effort}"` : undefined,
+        "-c",
+        'model_reasoning_summary="detailed"',
+        "-c",
+        "model_supports_reasoning_summaries=true",
+        "--cd",
+        run.worktree.path,
+        [contract, "", prompt].join("\n"),
+    ].filter((value) => Boolean(value));
+}
+function planArgs(run, prompt) {
+    return run.backend === "codex"
+        ? codexPlanArgs(run, prompt)
+        : claudePlanArgs(run, prompt);
+}
+function claudePlanArgs(run, prompt) {
+    const model = run.model || "sonnet";
+    const effort = normalizeEffortForBackend("claude", run.effort);
+    return compact([
+        "env",
+        "CLAUDE_CODE_NO_FLICKER=0",
+        "claude",
+        "--model",
+        model,
+        effort ? "--effort" : undefined,
+        effort,
+        "--permission-mode",
+        "default",
+        "--tools",
+        CLAUDE_PLAN_TOOLS.join(","),
+        "--allowedTools",
+        CLAUDE_PLAN_TOOLS.join(","),
+        "--disallowedTools",
+        CLAUDE_PLAN_DISALLOWED_TOOLS.join(","),
+        "--append-system-prompt",
+        PLAN_MODE_CONTRACT,
+        "--name",
+        `plan:${paneTitle(run)}`,
+        prompt,
+    ]);
+}
+function codexPlanArgs(run, prompt) {
+    const model = run.model || "gpt-5.5";
+    const effort = normalizeEffortForBackend("codex", run.effort);
+    return compact([
+        "codex",
+        "--no-alt-screen",
+        "--model",
+        model,
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "--search",
+        effort ? "-c" : undefined,
+        effort ? `model_reasoning_effort="${effort}"` : undefined,
+        "-c",
+        'model_reasoning_summary="detailed"',
+        "-c",
+        "model_supports_reasoning_summaries=true",
+        "--cd",
+        run.worktree.path,
+        `${PLAN_MODE_CONTRACT}\n\nUSER TASK:\n${prompt}`,
+    ]);
+}
+function paneTitle(run) {
+    const words = run.task.replace(/\s+/g, " ").trim().slice(0, 34);
+    return `${run.backend}:${words || run.id.slice(0, 12)}`;
+}
+function compact(values) {
+    return values.filter((value) => Boolean(value));
+}
+const CLAUDE_PLAN_TOOLS = [
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "WebSearch",
+    "WebFetch",
+];
+const CLAUDE_PLAN_DISALLOWED_TOOLS = [
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "Bash(rm *)",
+    "Bash(mv *)",
+    "Bash(cp *)",
+    "Bash(mkdir *)",
+    "Bash(touch *)",
+    "Bash(chmod *)",
+    "Bash(chown *)",
+    "Bash(git add*)",
+    "Bash(git commit*)",
+    "Bash(git checkout*)",
+    "Bash(git switch*)",
+    "Bash(git reset*)",
+    "Bash(git clean*)",
+    "Bash(git merge*)",
+    "Bash(git rebase*)",
+    "Bash(git push*)",
+    "Bash(fly deploy*)",
+    "Bash(fly secrets set*)",
+    "Bash(fly secrets unset*)",
+    "Bash(fly scale*)",
+    "Bash(fly apps destroy*)",
+];
+//# sourceMappingURL=native-agents.js.map

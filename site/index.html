@@ -308,8 +308,9 @@ rudder</code>
               <div class="row"><code>/model</code><span>Choose Claude or Codex, then model and effort.</span></div>
               <div class="row"><code>/plan</code><span>Use native read-only planning before implementation.</span></div>
               <div class="row"><code>/login</code><span>Authenticate Rudder Cloud in the browser.</span></div>
-              <div class="row"><code>/cloud</code><span>List cloud workers, or start one with a task.</span></div>
-              <div class="row"><code>/sail</code><span>Short alias for starting a cloud worker.</span></div>
+              <div class="row"><code>/cloud</code><span>Start a cloud worker with a generated name.</span></div>
+              <div class="row"><code>/cloud list</code><span>List cloud workers.</span></div>
+              <div class="row"><code>/sail</code><span>Short alias for starting a named cloud worker.</span></div>
             </div>
           </div>
 
@@ -337,6 +338,7 @@ rudder</code>
             <h2>Cloud</h2>
             <div class="rows">
               <div class="row"><code>rudder login</code><span>Open browser auth and connect this machine.</span></div>
+              <div class="row"><code>rudder cloud</code><span>Start a worker from the current repo snapshot.</span></div>
               <div class="row"><code>rudder cloud list</code><span>Show cloud workers for your account.</span></div>
               <div class="row"><code>rudder cloud onload</code><span>Move a local run into the cloud.</span></div>
               <div class="row"><code>rudder sail</code><span>Start a Fly Machines worker from the current repo.</span></div>

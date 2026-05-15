@@ -79,19 +79,21 @@ should run locally or be handed to a cloud worker.
 
 ```bash
 rudder login
+rudder cloud
 rudder cloud list
 rudder cloud onload <runId>
-rudder cloud "fix the long-running migration"
-rudder sail "try the alternate parser"
+rudder cloud migration-lab
+rudder sail staging-worker
 ```
 
 By default the CLI points at the hosted Rudder Cloud control plane:
 `https://mpd2pmnpep.us-east-1.awsapprunner.com`. Set `RUDDER_CLOUD_URL` to
 override it for local development or another deployment.
 
-Inside the dashboard, `/login` starts browser auth, `/cloud` lists cloud
-workers after you are logged in, and `/sail <task>` starts a cloud worker.
-`/cloud <task>` also starts a cloud worker for that task.
+Inside the dashboard, `/login` starts browser auth, `/cloud list` lists cloud
+workers after you are logged in, and `/cloud` starts a cloud worker with a
+generated memorable name. `/cloud <name>` and `/sail <name>` start named cloud
+workers. `/cloud help` shows the cloud command reference.
 
 `rudder login` connects this machine to Rudder Cloud by opening the browser for
 the control plane's Better Auth login. If that browser login endpoint is
@@ -209,9 +211,11 @@ through suggestions and `Enter` to choose one.
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/login` | Open browser login for Rudder Cloud |
-| `/cloud` | List cloud workers; requires `/login` first |
-| `/cloud <task>` | Start a cloud worker for a task |
-| `/sail <task>` | Short alias for starting a cloud worker |
+| `/cloud` | Start a cloud worker with a generated name; requires `/login` first |
+| `/cloud <name>` | Start a named cloud worker from the current repo snapshot |
+| `/cloud list` | List cloud workers |
+| `/cloud help` | Show cloud command help |
+| `/sail <name>` | Short alias for starting a named cloud worker |
 | `/help` | Show the short command hint |
 
 Use `Ctrl-G` before a Rudder shortcut if the worker pane is focused and you want
@@ -221,6 +225,9 @@ If trackpad scrolling does not behave as expected, run
 `rudder mouse-test parsed` to confirm your terminal is sending `ScrollUp` and
 `ScrollDown` events. For lower-level escape bytes, run `rudder mouse-test raw`.
 To inspect live dashboard routing, start Rudder with `RUDDER_MOUSE_DEBUG=1`.
+Rudder scrolls three terminal rows per wheel event by default, matching common
+terminal scrollback behavior. Override with `RUDDER_WHEEL_SCROLL_ROWS=<n>` if
+your terminal is configured differently.
 
 ## Models
 

@@ -635,10 +635,11 @@ Usage:
   rudder claude [options] "task"
   rudder codex [options] "task"
   rudder login
-  rudder cloud <name or task>
+  rudder cloud [name]
+  rudder cloud help
   rudder cloud list
   rudder cloud onload <runId>
-  rudder sail <name or task>
+  rudder sail [name]
 
 Run management:
   rudder watch [run]              Attach to live output
@@ -657,11 +658,13 @@ Setup:
 
 Cloud:
   rudder login                    Open browser login and store cloud token
+  rudder cloud [name]             Start a cloud worker from this repo snapshot
   rudder cloud list               List cloud workers/runs
+  rudder cloud help               Show cloud command help
   rudder cloud onload <runId>     Move a local Rudder run to cloud
   rudder cloud pause <id>         Pause an idle cloud worker
   rudder cloud resume <id>        Resume a cloud worker
-  rudder sail <name or task>      Alias for starting a cloud worker
+  rudder sail [name]              Alias for starting a cloud worker
 
 Options:
   -d, --detach                    Start in background

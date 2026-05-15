@@ -125,10 +125,10 @@ const BULKY_HOME_BASENAME_PATTERNS = [
 ];
 
 export async function runCloudCommand(command: string, args: string[], options: CloudCommandOptions = {}): Promise<void> {
-  const subcommand = args[0] ?? (command === "sail" ? "list" : "");
+  const subcommand = args[0] ?? "";
   const rest = args.slice(1);
 
-  if (command === "cloud" && (!subcommand || subcommand === "help")) {
+  if (command === "cloud" && subcommand === "help") {
     printCloudHelp();
     return;
   }
@@ -138,8 +138,10 @@ export async function runCloudCommand(command: string, args: string[], options: 
       await login(options);
       return;
     case "sail":
-    case "launch":
       await launch(rest, options);
+      return;
+    case "launch":
+      await launch(rest, options, "task");
       return;
     case "list":
     case "ls":
@@ -358,14 +360,19 @@ async function saveCloudLogin(
   }
 }
 
-async function launch(args: string[], options: CloudCommandOptions): Promise<void> {
-  const task = args.join(" ").trim();
+async function launch(args: string[], options: CloudCommandOptions, mode: "name" | "task" = "name"): Promise<void> {
+  const raw = args.join(" ").trim();
+  const name = mode === "task"
+    ? cloudNameFromTask(raw)
+    : raw || randomCloudName();
+  const task = mode === "task" ? raw : "";
   const repoRoot = findRepoRoot();
   const snapshot = await createSnapshot(repoRoot, options.homePaths ?? []);
   try {
     const client = await cloudClient({ requireToken: true });
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
+      name,
       snapshot: {
         name: path.basename(snapshot.archivePath),
         contentType: "application/gzip",
@@ -766,6 +773,16 @@ function printResult(result: JsonValue, options: CloudCommandOptions): void {
       printSailList(sails);
       return;
     }
+    if (typeof record.id === "string" && typeof record.status === "string") {
+      const parts = [
+        "cloud",
+        record.id,
+        record.status,
+        typeof record.task === "string" && record.task ? record.task : undefined,
+      ].filter(Boolean);
+      console.log(parts.join("  "));
+      return;
+    }
   }
   console.log(JSON.stringify(result, null, 2));
 }
@@ -784,6 +801,8 @@ function printSailList(items: JsonValue[]): void {
     console.log([
       sail.id,
       sail.status,
+      typeof sail.task === "string" && sail.task ? sail.task : undefined,
+      typeof sail.repoName === "string" && sail.repoName ? sail.repoName : undefined,
       sail.branch,
       sail.url,
       sail.updatedAt ?? sail.createdAt,
@@ -804,11 +823,12 @@ function printCloudHelp(): void {
 
 Usage:
   rudder cloud login
-  rudder cloud <name or task>
-  rudder cloud launch [--home-path <path>] ["task"]
+  rudder cloud help
+  rudder cloud [name]
   rudder cloud list
+  rudder cloud launch [--home-path <path>] ["task"]
   rudder cloud onload <runId>
-  rudder sail <name or task>
+  rudder sail [name]
   rudder sail list
   rudder sail pause <id>
   rudder sail resume <id>
@@ -823,4 +843,52 @@ Environment:
   RUDDER_GOOGLE_CLIENT_ID       Google OAuth client ID for setup-google
   RUDDER_GOOGLE_CLIENT_SECRET   Google OAuth client secret for setup-google
 `);
+}
+
+const CLOUD_ADJECTIVES = [
+  "amber",
+  "bright",
+  "calm",
+  "clear",
+  "cosmic",
+  "gentle",
+  "golden",
+  "lucky",
+  "rapid",
+  "silver",
+  "steady",
+  "swift",
+];
+
+const CLOUD_NOUNS = [
+  "atlas",
+  "harbor",
+  "signal",
+  "summit",
+  "orbit",
+  "ranger",
+  "river",
+  "rocket",
+  "sparrow",
+  "station",
+  "voyager",
+  "wave",
+];
+
+function randomCloudName(): string {
+  const seed = Date.now() + process.pid + Math.floor(Math.random() * 1_000_000);
+  return [
+    CLOUD_ADJECTIVES[Math.abs(seed) % CLOUD_ADJECTIVES.length],
+    CLOUD_NOUNS[Math.abs(Math.floor(seed / CLOUD_ADJECTIVES.length)) % CLOUD_NOUNS.length],
+  ].join("-");
+}
+
+function cloudNameFromTask(task: string): string {
+  const slug = task
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 36)
+    .replace(/-+$/g, "");
+  return slug || randomCloudName();
 }

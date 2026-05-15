@@ -1012,7 +1012,7 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
   ensureCloudRuntimeConfigured();
   const now = new Date().toISOString();
   const snapshot = await storeSnapshot(accountId, body);
-  const id = preferredId || `sail_${randomBytes(5).toString("hex")}`;
+  const id = preferredId || uniqueSailId(stringField(body, "name"));
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const task = stringField(body, "task");
   const repoName = stringField(body, "repoName");
@@ -1067,6 +1067,46 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function uniqueSailId(name?: string): string {
+  const base = slugForSailId(name) || `${cloudWord()}-${cloudWord()}`;
+  let id = base;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (!findSailById.get(id)) {
+      return id;
+    }
+    id = `${base}-${randomBytes(2).toString("hex")}`;
+  }
+  return `cloud-${randomBytes(5).toString("hex")}`;
+}
+
+function slugForSailId(value?: string): string {
+  const slug = (value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 42)
+    .replace(/-+$/g, "");
+  return slug ? `cloud-${slug}` : "";
+}
+
+function cloudWord(): string {
+  const words = [
+    "amber",
+    "atlas",
+    "bright",
+    "harbor",
+    "orbit",
+    "rapid",
+    "river",
+    "signal",
+    "silver",
+    "summit",
+    "swift",
+    "wave",
+  ];
+  return words[randomBytes(1)[0] % words.length] || "cloud";
 }
 
 async function storeSnapshot(accountId: string, body: Json): Promise<{ key: string }> {
