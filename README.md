@@ -167,7 +167,10 @@ chat. Use the worker's up and down arrow keys when you want to move through the
 agent's own prompt history or menus. Drag selection inside the worker pane
 copies selected text, including when you drag upward past the top of the pane.
 For full-screen alternate-screen workers, Rudder keeps its own pane history so
-trackpad scrolling moves the pane instead of depending on the child app.
+trackpad scrolling moves the pane instead of depending on the child app. If the
+pane has no Rudder scrollback to move and the inner TUI has explicitly requested
+mouse input, Rudder passes the wheel event through so Claude Code, Codex, Hunk,
+or another full-screen app can scroll its own view.
 
 ## Keys
 

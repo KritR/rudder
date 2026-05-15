@@ -1224,6 +1224,7 @@ impl App {
 
     fn scroll_selected_worker_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
+        let mouse_bytes = mouse_event_to_sgr(mouse, area);
         let Some(terminal) = self.selected_terminal_mut() else {
             return false;
         };
@@ -1231,6 +1232,14 @@ impl App {
         terminal.scrollback_by(rows);
         let moved = terminal.scrollback() != before;
         if moved {
+            return true;
+        }
+        if rows != 0 && terminal.wants_sgr_mouse_events() {
+            if let Some(bytes) = mouse_bytes {
+                if let Err(error) = terminal.write_input(&bytes) {
+                    self.set_selected_error(error.to_string());
+                }
+            }
             return true;
         }
         if rows != 0 {
@@ -1261,6 +1270,7 @@ impl App {
 
     fn scroll_selected_review_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
+        let mouse_bytes = mouse_event_to_sgr(mouse, area);
         let Some(review) = self.selected_review_terminal_mut() else {
             return false;
         };
@@ -1268,6 +1278,14 @@ impl App {
         review.scrollback_by(rows);
         let moved = review.scrollback() != before;
         if moved {
+            return true;
+        }
+        if rows != 0 && review.wants_sgr_mouse_events() {
+            if let Some(bytes) = mouse_bytes {
+                if let Err(error) = review.write_input(&bytes) {
+                    self.set_selected_review_error(error.to_string());
+                }
+            }
             return true;
         }
         if rows != 0 {
@@ -2608,6 +2626,62 @@ mod app_tests {
             scrolled_down.contains("second screen"),
             "scrolled_down was {scrolled_down:?}"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_wheel_forwards_to_inner_tui_when_scrollback_cannot_move() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "stty raw -echo; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; cat -v",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.uses_alternate_screen() && pane.wants_sgr_mouse_events() {
+                break;
+            }
+        }
+
+        assert!(pane.uses_alternate_screen());
+        assert!(pane.wants_sgr_mouse_events());
+
+        let mut app = App::new();
+        app.worker_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 7,
+        });
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("^[[<65;1;1M"), "output was {output:?}");
     }
 
     #[cfg(not(windows))]
