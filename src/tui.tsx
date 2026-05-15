@@ -1022,10 +1022,18 @@ function MergePromptBox(props: { prompt: MergePrompt; width: number }): React.Re
   const subject = props.prompt.kind === "selected"
     ? `merge ${shortId(props.prompt.runId)}  ${props.prompt.label}`
     : `merge ${props.prompt.runIds.length} completed run${props.prompt.runIds.length === 1 ? "" : "s"}`;
+  const prefix = "press ";
+  const action = "y to merge";
+  const suffix = ", n to cancel";
+  const hint = fitLine(`${prefix}${action}${suffix}`, contentWidth);
   return (
     <Box width={props.width} borderStyle="double" borderColor="yellow" paddingX={1} flexDirection="column">
       <Text color="yellow" bold>{fitLine(subject, contentWidth)}</Text>
-      <Text color="gray">{fitLine("press y to merge, n to cancel", contentWidth)}</Text>
+      <Text>
+        <Text color="gray">{hint.slice(0, prefix.length)}</Text>
+        <Text color="red" bold>{hint.slice(prefix.length, prefix.length + action.length)}</Text>
+        <Text color="gray">{hint.slice(prefix.length + action.length)}</Text>
+      </Text>
     </Box>
   );
 }

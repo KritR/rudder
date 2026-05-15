@@ -3491,6 +3491,21 @@ mod app_tests {
         assert!(task_pane_height(&app, 40) > base_height);
     }
 
+    #[test]
+    fn merge_confirm_hint_highlights_merge_action() {
+        let line = merge_confirm_hint_line();
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "Press y to merge, n to cancel.");
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].style.fg, Some(FAILED_COLOR));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
     fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
         AgentRun {
             id: "run-1".to_string(),
@@ -4377,7 +4392,7 @@ fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
 }
 
 fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (title, body, border_color) = if let Some(confirm) = &app.merge_confirm {
+    let (title, lines, border_color) = if let Some(confirm) = &app.merge_confirm {
         let summary = match &confirm.intent {
             MergeIntent::Selected { task, .. } => {
                 format!("Merge selected worktree: {}", short_task(task))
@@ -4391,9 +4406,12 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (
             " confirm merge ",
             vec![
-                summary,
-                "This will run git merge into the current branch.".to_string(),
-                "Press y to merge, n to cancel.".to_string(),
+                Line::from(Span::styled(summary, app_style())),
+                Line::from(Span::styled(
+                    "This will run git merge into the current branch.",
+                    app_style(),
+                )),
+                merge_confirm_hint_line(),
             ],
             RUNNING_COLOR,
         )
@@ -4402,21 +4420,30 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (
             " merge conflict ",
             vec![
-                format!(
-                    "Merge stopped with {} conflicted file{}.",
-                    prompt.conflicted_files.len(),
-                    if prompt.conflicted_files.len() == 1 {
-                        ""
+                Line::from(Span::styled(
+                    format!(
+                        "Merge stopped with {} conflicted file{}.",
+                        prompt.conflicted_files.len(),
+                        if prompt.conflicted_files.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                    app_style(),
+                )),
+                Line::from(Span::styled(
+                    if files.is_empty() {
+                        "Git did not report conflicted files.".to_string()
                     } else {
-                        "s"
-                    }
-                ),
-                if files.is_empty() {
-                    "Git did not report conflicted files.".to_string()
-                } else {
-                    format!("Files: {files}")
-                },
-                "Press y to start an AI resolver, n to handle manually.".to_string(),
+                        format!("Files: {files}")
+                    },
+                    app_style(),
+                )),
+                Line::from(Span::styled(
+                    "Press y to start an AI resolver, n to handle manually.",
+                    app_style(),
+                )),
             ],
             FAILED_COLOR,
         )
@@ -4424,13 +4451,7 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let modal = centered_modal(area, 74, (body.len() as u16).saturating_add(2));
-    let inner_width = modal.width.saturating_sub(4).max(1);
-    let lines = body
-        .into_iter()
-        .flat_map(|line| wrap_text(&line, inner_width))
-        .map(|line| Line::from(Span::styled(line, app_style())))
-        .collect::<Vec<_>>();
+    let modal = centered_modal(area, 74, (lines.len() as u16).saturating_add(2));
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -4446,6 +4467,19 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(Clear, modal);
     frame.render_widget(paragraph, modal);
+}
+
+fn merge_confirm_hint_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Press ", app_style()),
+        Span::styled(
+            "y to merge",
+            Style::default()
+                .fg(FAILED_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(", n to cancel.", app_style()),
+    ])
 }
 
 fn centered_modal(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
