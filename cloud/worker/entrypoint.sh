@@ -34,6 +34,15 @@ else
   cd unpacked
 fi
 
+if [ ! -d .git ]; then
+  echo "Initializing cloud git baseline..."
+  git init -q
+  git config user.email "rudder-cloud@local"
+  git config user.name "Rudder Cloud"
+  git add -A
+  git commit -qm "rudder cloud baseline" || true
+fi
+
 echo "Rudder worker ready in $(pwd)"
 rudder doctor || true
 
@@ -74,8 +83,30 @@ trap cleanup EXIT INT TERM
 if [ -n "$task" ]; then
   echo "Starting Rudder task: $task"
   set +e
-  rudder run --worktree "$task"
+  run_json="$(mktemp)"
+  rudder acpx --worktree --json "$task" >"$run_json"
   code="$?"
+  if [ "$code" -eq 0 ]; then
+    cat "$run_json"
+    run_id="$(node -e 'const fs=require("fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(v.id || "");' "$run_json" 2>/dev/null || true)"
+    if [ -n "$run_id" ]; then
+      while true; do
+        status="$(rudder runs --json | node -e 'const id=process.argv[1]; let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const runs=JSON.parse(s); const run=runs.find((r) => r.id === id); process.stdout.write(run?.status || "unknown"); });' "$run_id" 2>/dev/null || echo unknown)"
+        case "$status" in
+          completed)
+            code=0
+            break
+            ;;
+          failed|cancelled)
+            code=1
+            break
+            ;;
+        esac
+        sleep 10
+      done
+      rudder logs "$run_id" || true
+    fi
+  fi
   set -e
   if [ "$code" -eq 0 ]; then
     report_done completed "$code"

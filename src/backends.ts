@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore } from "./types.js";
+import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore, EffortLevel } from "./types.js";
 import { loadAuthStore, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
-import { commandExists, lineSplitBuffer, nowIso, parseJsonLine } from "./util.js";
+import { commandExists, lineSplitBuffer, nowIso, parseJsonLine, runCommand } from "./util.js";
 
 export function getBackend(id: BackendId): BackendAdapter {
   if (id === "claude") {
@@ -125,16 +125,22 @@ function acpxBackend(): BackendAdapter {
     },
     async run(request, emit) {
       const sessionName = request.run.session?.sessionName ?? request.run.id;
+      const env = process.env;
+      const model = acpxCodexModel(request.run.model, request.run.effort);
       request.run.session = {
         ...(request.run.session ?? {}),
         sessionName,
       };
       await saveRunRecord(request.run);
+      await runCommand("acpx", ["codex", "sessions", "ensure", "--name", sessionName], {
+        cwd: request.run.worktree.path,
+        env,
+      });
       const args = [
         "--approve-all",
         "--format",
         "json",
-        ...(request.run.model ? ["--model", request.run.model] : []),
+        ...(model ? ["--model", model] : []),
         "--cwd",
         request.run.worktree.path,
         "codex",
@@ -146,12 +152,21 @@ function acpxBackend(): BackendAdapter {
         command: "acpx",
         args,
         cwd: request.run.worktree.path,
-        env: process.env,
+        env,
         request,
         emit,
       });
     },
   };
+}
+
+function acpxCodexModel(model: string | undefined, effort: EffortLevel | undefined): string | undefined {
+  const selectedModel = model || "gpt-5.5";
+  if (selectedModel.includes("/")) {
+    return selectedModel;
+  }
+  const selectedEffort = normalizeEffortForBackend("codex", effort) || "xhigh";
+  return `${selectedModel}/${selectedEffort}`;
 }
 
 async function backendEnv(provider: "anthropic" | "openai"): Promise<NodeJS.ProcessEnv> {
@@ -291,6 +306,9 @@ async function emitBackendLine(
   if (!trimmed) {
     return;
   }
+  if (/^\[acpx\].*agent needs reconnect$/.test(trimmed)) {
+    return;
+  }
   const parsed = parseJsonLine(trimmed);
   const message = parsed ? textFromBackendData(parsed, streamState.sawStreamingText) : trimmed;
   if (isStreamingTextEvent(parsed)) {
@@ -326,6 +344,13 @@ function textFromBackendData(data: unknown, sawStreamingText: boolean): string {
     const event = record.event;
     if (event.type === "content_block_delta" && isRecord(event.delta) && typeof event.delta.text === "string") {
       return event.delta.text;
+    }
+    return "";
+  }
+  if (record.method === "session/update" && isRecord(record.params)) {
+    const update = record.params.update;
+    if (isRecord(update) && update.sessionUpdate === "agent_message_chunk" && isRecord(update.content)) {
+      return typeof update.content.text === "string" ? update.content.text : "";
     }
     return "";
   }

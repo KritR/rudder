@@ -969,6 +969,9 @@ async function refreshAccountSails(accountId: string): Promise<void> {
   }
   const sails = listAccountSails(accountId);
   for (const sail of sails) {
+    if (sail.status === "completed" || sail.status === "failed") {
+      continue;
+    }
     if (!sail.machineId) {
       continue;
     }

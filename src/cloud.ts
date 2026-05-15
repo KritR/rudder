@@ -64,8 +64,15 @@ const DEFAULT_CLOUD_URL = "https://mpd2pmnpep.us-east-1.awsapprunner.com";
 const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
 const DEFAULT_HOME_PATHS = [
-  "~/.claude",
-  "~/.codex",
+  "~/.claude/.credentials.json",
+  "~/.claude/settings.json",
+  "~/.claude/CLAUDE.md",
+  "~/.claude.json",
+  "~/.codex/auth.json",
+  "~/.codex/config.toml",
+  "~/.codex/AGENTS.md",
+  "~/.codex/hooks.json",
+  "~/.codex/rules",
   "~/.config/gh",
   "~/.gitconfig",
   "~/.npmrc",
@@ -81,6 +88,23 @@ const SECRET_PATH_PARTS = new Set([
   ".docker",
   "keychains",
 ]);
+const BULKY_HOME_PATH_PARTS = new Set([
+  "archived_sessions",
+  "backups",
+  "cache",
+  "file-history",
+  "log",
+  "paste-cache",
+  "plugins",
+  "projects",
+  "session",
+  "sessions",
+  "shell_snapshots",
+  "skills",
+  "telemetry",
+  "todos",
+  "worktrees",
+]);
 const SECRET_BASENAMES = new Set([
   ".env",
   ".env.local",
@@ -91,6 +115,14 @@ const SECRET_BASENAMES = new Set([
   "credentials",
   "known_hosts",
 ]);
+const BULKY_HOME_BASENAME_PATTERNS = [
+  /^history\./,
+  /^logs?_/,
+  /^state_\d+\.sqlite/,
+  /\.sqlite(?:-(?:wal|shm))?$/,
+  /\.log$/,
+  /\.jsonl$/,
+];
 
 export async function runCloudCommand(command: string, args: string[], options: CloudCommandOptions = {}): Promise<void> {
   const subcommand = args[0] ?? (command === "sail" ? "list" : "");
@@ -635,6 +667,14 @@ async function shouldIncludeSnapshotPath(candidate: string): Promise<boolean> {
   const basename = path.basename(normalized).toLowerCase();
   if (parts.some((part) => SECRET_PATH_PARTS.has(part)) || SECRET_BASENAMES.has(basename)) {
     return false;
+  }
+  if (isInside(os.homedir(), normalized)) {
+    if (parts.some((part) => BULKY_HOME_PATH_PARTS.has(part))) {
+      return false;
+    }
+    if (BULKY_HOME_BASENAME_PATTERNS.some((pattern) => pattern.test(basename))) {
+      return false;
+    }
   }
   const stat = await fsp.lstat(normalized).catch(() => null);
   if (!stat || !stat.isFile() || stat.size > MAX_HOME_SECRET_SCAN_BYTES) {
