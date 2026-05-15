@@ -56,6 +56,7 @@ impl Default for TerminalSize {
 pub struct TerminalCommand {
     pub program: String,
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 impl TerminalCommand {
@@ -63,6 +64,7 @@ impl TerminalCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            env: Vec::new(),
         }
     }
 
@@ -73,7 +75,13 @@ impl TerminalCommand {
         Self {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
         }
+    }
+
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
     }
 }
 
@@ -359,6 +367,9 @@ fn command_builder(command: Option<TerminalCommand>) -> Result<CommandBuilder> {
 
             let mut builder = CommandBuilder::new(command.program);
             builder.args(command.args);
+            for (key, value) in command.env {
+                builder.env(key, value);
+            }
             Ok(builder)
         }
         None => {

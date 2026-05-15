@@ -2717,6 +2717,22 @@ mod app_tests {
             .args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(execute_codex
+            .args
+            .iter()
+            .any(|arg| arg == "--no-alt-screen"));
+
+        let execute_claude = agent_command(
+            Backend::Claude,
+            "sonnet",
+            None,
+            "implement the work",
+            AgentMode::Execute,
+        );
+        assert!(execute_claude
+            .env
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_CODE_NO_FLICKER" && value == "0"));
 
         let codex = agent_command(
             Backend::Codex,
@@ -2726,6 +2742,7 @@ mod app_tests {
             AgentMode::Plan,
         );
         assert_eq!(codex.program, "codex");
+        assert!(codex.args.iter().any(|arg| arg == "--no-alt-screen"));
         assert!(codex
             .args
             .windows(2)
@@ -2744,6 +2761,10 @@ mod app_tests {
             AgentMode::Plan,
         );
         assert_eq!(claude.program, "claude");
+        assert!(claude
+            .env
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_CODE_NO_FLICKER" && value == "0"));
         assert!(claude
             .args
             .windows(2)
@@ -5102,10 +5123,14 @@ fn agent_command(
                 args.push(effort.as_str().to_string());
             }
             args.push(prompt);
-            TerminalCommand::with_args("claude", args)
+            TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
-            let mut args = vec!["--ask-for-approval".to_string(), "never".to_string()];
+            let mut args = vec![
+                "--no-alt-screen".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+            ];
             match mode {
                 AgentMode::Execute => {
                     args.push("--sandbox".to_string());

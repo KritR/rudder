@@ -23,6 +23,8 @@ function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] 
   const effort = normalizeEffortForBackend("claude", run.effort);
   const sessionId = run.session?.nativeSessionId;
   return compact([
+    "env",
+    "CLAUDE_CODE_NO_FLICKER=0",
     "claude",
     "--model",
     model,
@@ -46,6 +48,7 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
   const effort = normalizeEffortForBackend("codex", run.effort);
   return [
     "codex",
+    "--no-alt-screen",
     "--model",
     model,
     "--sandbox",
@@ -77,6 +80,8 @@ function claudePlanArgs(run: RunRecord, prompt: string): string[] {
   const model = run.model || "sonnet";
   const effort = normalizeEffortForBackend("claude", run.effort);
   return compact([
+    "env",
+    "CLAUDE_CODE_NO_FLICKER=0",
     "claude",
     "--model",
     model,
@@ -103,6 +108,7 @@ function codexPlanArgs(run: RunRecord, prompt: string): string[] {
   const effort = normalizeEffortForBackend("codex", run.effort);
   return compact([
     "codex",
+    "--no-alt-screen",
     "--model",
     model,
     "--sandbox",
