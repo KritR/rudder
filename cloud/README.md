@@ -27,7 +27,7 @@ RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
 ```
 
 `FLY_API_TOKEN` and `FLY_APP_NAME` are only required for the managed Fly
-Machines runtime. BYO VM runs still require `RUDDER_S3_BUCKET` and
+Machines runtime. BYOC runs still require `RUDDER_S3_BUCKET` and
 `RUDDER_WORKER_IMAGE` so the control plane can store a snapshot and print a
 worker command for the user's server.
 
@@ -184,23 +184,30 @@ of Fly Machines:
 
 ```bash
 rudder cloud login
-rudder cloud setup-vm
+rudder cloud setup-byoc rudder-workstation
 rudder cloud "fix the failing migration"
 ```
 
-`setup-vm` stores `byo-vm` as the local default runtime for that CLI login.
+`setup-byoc` expects an SSH host that is available from `~/.ssh/config`, uses
+key-based auth, and has Docker available to the SSH user. It stores `byoc` as
+the local default runtime for that CLI login, plus the SSH host for automatic
+worker startup.
 Future `/cloud <task>`, `/sail <task>`, and `rudder cloud <task>` launches
 upload the same snapshot but return a `docker run` command instead of calling
-the Fly Machines API. Run that command on the VM to start the worker. It passes
-`RUDDER_SNAPSHOT_URL`, `RUDDER_WORKER_TOKEN`, `RUDDER_CLOUD_URL`, and task
-metadata into `cloud/worker/entrypoint.sh`, which already reports heartbeats and
-completion back to the control plane.
+the Fly Machines API. If an SSH host is configured, the CLI starts that command
+on the host with `nohup`; otherwise it prints the command for manual execution.
+It passes `RUDDER_SNAPSHOT_URL`, `RUDDER_WORKER_TOKEN`, `RUDDER_CLOUD_URL`, and
+task metadata into `cloud/worker/entrypoint.sh`, which already reports
+heartbeats and completion back to the control plane.
 
 Useful commands:
 
 ```bash
-rudder cloud runtime            # show fly or byo-vm
+rudder cloud runtime            # show fly or byoc
 rudder cloud runtime fly        # switch back to Fly Machines
-rudder cloud vm "task"          # prepare one BYO VM run without changing default
-rudder cloud bootstrap <sailId> # regenerate an expired BYO VM command
+rudder cloud byoc "task"        # prepare one BYOC run without changing default
+rudder cloud bootstrap <sailId> # regenerate an expired BYOC command
 ```
+
+Set `RUDDER_BYOC_AUTOSTART=0` to force the CLI to print the Docker command
+instead of starting it over SSH.

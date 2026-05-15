@@ -1504,7 +1504,7 @@ function sailRuntimeValue(raw: string | undefined): SailRuntime {
   if (value === "fly" || value === "fly-machine" || value === "fly-machines") {
     return "fly";
   }
-  if (value === "byo" || value === "byo-vm" || value === "manual" || value === "self-hosted" || value === "vm") {
+  if (value === "byo" || value === "byoc" || value === "byo-vm" || value === "manual" || value === "self-hosted" || value === "vm") {
     return "byo-vm";
   }
   throw badRequest(`unsupported cloud runtime: ${raw}`);

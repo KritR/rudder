@@ -1865,10 +1865,12 @@ impl App {
             "stop",
             "logs",
             "vm",
+            "byoc",
             "byo-vm",
             "bootstrap",
             "runtime",
             "setup",
+            "setup-byoc",
             "setup-vm",
             "setup-fly",
         ];
@@ -3408,6 +3410,10 @@ mod app_tests {
             vec!["cloud".to_string(), "setup".to_string(), "vm".to_string()]
         );
         assert_eq!(
+            app.cloud_command_args(vec!["setup-byoc"]),
+            vec!["cloud".to_string(), "setup-byoc".to_string()]
+        );
+        assert_eq!(
             app.cloud_command_args(vec!["setup-vm"]),
             vec!["cloud".to_string(), "setup-vm".to_string()]
         );
@@ -3416,6 +3422,15 @@ mod app_tests {
             vec![
                 "cloud".to_string(),
                 "vm".to_string(),
+                "fix".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["byoc", "fix", "tests"]),
+            vec![
+                "cloud".to_string(),
+                "byoc".to_string(),
                 "fix".to_string(),
                 "tests".to_string()
             ]
@@ -5865,9 +5880,9 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/cloud".to_string()),
         },
         Suggestion {
-            label: "/cloud setup-vm".to_string(),
-            detail: "use your own VM for cloud workers".to_string(),
-            action: SuggestionAction::RunCommand("/cloud setup-vm".to_string()),
+            label: "/cloud setup-byoc".to_string(),
+            detail: "bring your own computer for cloud workers".to_string(),
+            action: SuggestionAction::RunCommand("/cloud setup-byoc".to_string()),
         },
         Suggestion {
             label: "/sail".to_string(),

@@ -52,6 +52,7 @@ type Parsed = {
     headless?: boolean;
     tmuxSession?: string;
     homePaths?: string[];
+    sshHost?: string;
   };
 };
 
@@ -192,6 +193,7 @@ export async function main(): Promise<void> {
       await runCloudCommand("cloud", ["login", ...parsed.args], {
         json: parsed.flags.json,
         homePaths: parsed.flags.homePaths,
+        sshHost: parsed.flags.sshHost,
       });
       return;
     case "cloud":
@@ -199,6 +201,7 @@ export async function main(): Promise<void> {
       await runCloudCommand(parsed.command, parsed.args, {
         json: parsed.flags.json,
         homePaths: parsed.flags.homePaths,
+        sshHost: parsed.flags.sshHost,
       });
       return;
     case "run": {
@@ -408,6 +411,10 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.homePaths = [...(parsed.flags.homePaths ?? []), readValue(argv, ++i, arg)];
       continue;
     }
+    if (takesValue(arg, "--ssh", "--ssh-host")) {
+      parsed.flags.sshHost = readValue(argv, ++i, arg);
+      continue;
+    }
     if (arg.startsWith("--model=")) {
       parsed.flags.model = arg.slice("--model=".length);
       continue;
@@ -434,6 +441,14 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--home-path=")) {
       parsed.flags.homePaths = [...(parsed.flags.homePaths ?? []), arg.slice("--home-path=".length)];
+      continue;
+    }
+    if (arg.startsWith("--ssh=")) {
+      parsed.flags.sshHost = arg.slice("--ssh=".length);
+      continue;
+    }
+    if (arg.startsWith("--ssh-host=")) {
+      parsed.flags.sshHost = arg.slice("--ssh-host=".length);
       continue;
     }
     if (!parsed.command && !arg.startsWith("-")) {
@@ -637,9 +652,9 @@ Usage:
   rudder login
   rudder cloud [name or task]
   rudder cloud help
-  rudder cloud setup-vm
-  rudder cloud runtime [fly|byo-vm]
-  rudder cloud vm <task>
+  rudder cloud setup-byoc <ssh-host>
+  rudder cloud runtime [fly|byoc]
+  rudder cloud byoc <task>
   rudder cloud list
   rudder cloud onload <runId>
   rudder cloud bootstrap <id>
@@ -665,11 +680,11 @@ Cloud:
   rudder cloud [name or task]     Start a cloud worker from this repo snapshot
   rudder cloud list               List cloud workers/runs
   rudder cloud help               Show cloud command help
-  rudder cloud setup-vm           Use your own VM for future cloud launches
-  rudder cloud runtime [runtime]  Show or set fly/byo-vm cloud runtime
-  rudder cloud vm <task>          Prepare a BYO VM worker command for a task
+  rudder cloud setup-byoc <ssh>   Use your own SSH host for future cloud launches
+  rudder cloud runtime [runtime]  Show or set fly/byoc cloud runtime
+  rudder cloud byoc <task>        Prepare a BYOC worker command for a task
   rudder cloud onload <runId>     Move a local Rudder run to cloud
-  rudder cloud bootstrap <id>     Regenerate a BYO VM worker command
+  rudder cloud bootstrap <id>     Regenerate a BYOC worker command
   rudder cloud pause <id>         Pause an idle cloud worker
   rudder cloud resume <id>        Resume a cloud worker
   rudder sail [name or task]      Alias for starting a cloud worker
@@ -685,6 +700,7 @@ Options:
       --no-native                 Use the tmux dashboard instead of native
       --headless                  Alias for --no-tmux on bare rudder
       --home-path <path>          Include extra HOME path in cloud snapshot
+      --ssh <host>                BYOC SSH host from ~/.ssh/config
       --json                      Machine-readable output
   -v, --version                   Print version
       --allow-dirty               Allow merge into dirty target branch
