@@ -84,7 +84,7 @@ if [ -n "$task" ]; then
   echo "Starting Rudder task: $task"
   set +e
   run_json="$(mktemp)"
-  rudder acpx --worktree --json "$task" >"$run_json"
+  rudder codex --worktree --json "$task" >"$run_json"
   code="$?"
   if [ "$code" -eq 0 ]; then
     cat "$run_json"
