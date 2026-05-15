@@ -116,6 +116,7 @@ pub struct TerminalPane {
     alternate_history_offset: usize,
     last_alternate_snapshot: Vec<String>,
     alternate_history_limit: usize,
+    styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +210,7 @@ impl TerminalPane {
             alternate_history_offset: 0,
             last_alternate_snapshot: Vec::new(),
             alternate_history_limit: options.scrollback_lines.max(DEFAULT_ROWS as usize),
+            styled_lines_cache: None,
         })
     }
 
@@ -226,6 +228,7 @@ impl TerminalPane {
         self.parser.screen_mut().set_size(size.rows, size.cols);
         self.size = size;
         self.last_alternate_snapshot.clear();
+        self.invalidate_render_cache();
         Ok(())
     }
 
@@ -240,6 +243,7 @@ impl TerminalPane {
             drained.extend_from_slice(&chunk);
         }
         if !drained.is_empty() {
+            self.invalidate_render_cache();
             self.capture_alternate_snapshot();
         }
         drained
@@ -274,10 +278,13 @@ impl TerminalPane {
 
     pub fn styled_lines(&mut self) -> Vec<Vec<StyledTerminalCell>> {
         self.drain_output();
-        self.styled_lines_snapshot()
+        if self.styled_lines_cache.is_none() {
+            self.styled_lines_cache = Some(self.compute_styled_lines_snapshot());
+        }
+        self.styled_lines_cache.clone().unwrap_or_default()
     }
 
-    pub fn styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
+    fn compute_styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
         if let Some(snapshot) = self.alternate_history_snapshot() {
             return snapshot
                 .iter()
@@ -357,6 +364,7 @@ impl TerminalPane {
         if self.parser.screen().alternate_screen() {
             self.capture_alternate_snapshot();
             let max_offset = self.alternate_history.len().saturating_sub(1);
+            let before = self.alternate_history_offset;
             self.alternate_history_offset = if rows.is_negative() {
                 self.alternate_history_offset
                     .saturating_sub(rows.unsigned_abs())
@@ -364,6 +372,9 @@ impl TerminalPane {
                 self.alternate_history_offset.saturating_add(rows as usize)
             }
             .min(max_offset);
+            if self.alternate_history_offset != before {
+                self.invalidate_render_cache();
+            }
             return;
         }
 
@@ -373,12 +384,18 @@ impl TerminalPane {
         } else {
             current.saturating_add(rows as usize)
         };
-        self.parser.screen_mut().set_scrollback(next);
+        if next != current {
+            self.parser.screen_mut().set_scrollback(next);
+            self.invalidate_render_cache();
+        }
     }
 
     pub fn reset_scrollback(&mut self) {
-        self.alternate_history_offset = 0;
-        self.parser.screen_mut().set_scrollback(0);
+        if self.alternate_history_offset != 0 || self.parser.screen().scrollback() != 0 {
+            self.alternate_history_offset = 0;
+            self.parser.screen_mut().set_scrollback(0);
+            self.invalidate_render_cache();
+        }
     }
 
     pub fn cursor(&self) -> TerminalCursor {
@@ -429,10 +446,12 @@ impl TerminalPane {
 
         self.last_alternate_snapshot = snapshot.clone();
         self.alternate_history.push(snapshot);
+        self.invalidate_render_cache();
         if self.alternate_history.len() > self.alternate_history_limit {
             let overflow = self.alternate_history.len() - self.alternate_history_limit;
             self.alternate_history.drain(0..overflow);
             self.alternate_history_offset = self.alternate_history_offset.saturating_sub(overflow);
+            self.invalidate_render_cache();
         }
     }
 
@@ -445,6 +464,10 @@ impl TerminalPane {
             .len()
             .checked_sub(1 + self.alternate_history_offset)?;
         self.alternate_history.get(index)
+    }
+
+    fn invalidate_render_cache(&mut self) {
+        self.styled_lines_cache = None;
     }
 }
 

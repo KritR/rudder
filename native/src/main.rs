@@ -33,8 +33,8 @@ use rudder_native::pty_terminal::{
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-const TICK_RATE: Duration = Duration::from_millis(16);
-const MAX_EVENTS_PER_FRAME: usize = 16;
+const TICK_RATE: Duration = Duration::from_millis(8);
+const MAX_EVENTS_PER_FRAME: usize = 64;
 const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
 const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
