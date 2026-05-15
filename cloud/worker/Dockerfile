@@ -5,7 +5,8 @@ RUN apt-get update \
     ca-certificates curl git openssh-client tar gzip zsh \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g acpx@latest hunkdiff@latest @openai/codex@latest
+RUN npm install -g acpx@latest hunkdiff@latest @openai/codex@latest \
+  && npm cache clean --force
 
 WORKDIR /opt/rudder
 COPY package.json package-lock.json ./
