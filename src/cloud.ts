@@ -459,7 +459,7 @@ async function cloudClient(options: { requireToken: boolean }): Promise<CloudCli
   const envToken = process.env.RUDDER_CLOUD_TOKEN?.trim();
   const token = envToken || (state?.cloudUrl === baseUrl ? state.token : undefined);
   if (options.requireToken && !token) {
-    throw new Error("Not logged in to Rudder Cloud. Run `rudder cloud login` first.");
+    throw new Error("Not logged in to Rudder Cloud. Run `rudder login` first.");
   }
   return {
     baseUrl,

@@ -288,6 +288,7 @@ struct Suggestion {
 #[derive(Clone)]
 enum SuggestionAction {
     Insert(String),
+    RunCommand(String),
     ChooseModelProvider(Backend),
     ChooseModel {
         backend: Backend,
@@ -831,6 +832,12 @@ impl App {
         match suggestion.action {
             SuggestionAction::Insert(value) => {
                 self.replace_task_input(value);
+            }
+            SuggestionAction::RunCommand(value) => {
+                self.task_input.clear();
+                self.task_cursor = 0;
+                self.picker_index = 0;
+                self.start_task_from_input(&value);
             }
             SuggestionAction::ChooseModelProvider(backend) => {
                 self.replace_task_input(format!("/model {} ", backend.as_str()));
@@ -1412,7 +1419,10 @@ impl App {
         self.task_input.clear();
         self.task_cursor = 0;
         self.worker_selection = None;
+        self.start_task_from_input(&input);
+    }
 
+    fn start_task_from_input(&mut self, input: &str) {
         if self.handle_command(&input) {
             return;
         }
@@ -1719,11 +1729,22 @@ impl App {
                 true
             }
             Some("/cloud") => {
-                let args = self.cloud_command_args(parts.collect::<Vec<_>>());
+                let raw_args = parts.collect::<Vec<_>>();
+                let args = self.cloud_command_args(raw_args.clone());
+                if !cloud_args_are_login(&raw_args) && !rudder_cloud_authenticated() {
+                    self.notice =
+                        Some("not logged in to Rudder Cloud; run /login first".to_string());
+                    return true;
+                }
                 self.start_rudder_cli_command("cloud", args);
                 true
             }
             Some("/sail") => {
+                if !rudder_cloud_authenticated() {
+                    self.notice =
+                        Some("not logged in to Rudder Cloud; run /login first".to_string());
+                    return true;
+                }
                 let mut args = vec!["cloud".to_string(), "sail".to_string()];
                 args.extend(parts.map(ToString::to_string));
                 self.start_rudder_cli_command("sail", args);
@@ -1735,7 +1756,7 @@ impl App {
 
     fn cloud_command_args(&self, args: Vec<&str>) -> Vec<String> {
         if args.is_empty() {
-            return vec!["cloud".to_string()];
+            return vec!["cloud".to_string(), "list".to_string()];
         }
         if args[0] == "onload" && args.len() == 1 {
             if let Some(run) = self.agents.get(self.selected_agent) {
@@ -1743,7 +1764,8 @@ impl App {
             }
         }
         let known = [
-            "list", "onload", "sail", "pause", "resume", "status", "stop", "logs",
+            "login", "list", "ls", "onload", "sail", "launch", "pause", "resume", "status", "stop",
+            "logs",
         ];
         let mut command = vec!["cloud".to_string()];
         if known.contains(&args[0]) {
@@ -3171,18 +3193,36 @@ mod app_tests {
         assert!(claude
             .args
             .windows(2)
-            .any(|window| window[0] == "--permission-mode" && window[1] == "default"));
-        assert!(claude
-            .args
-            .windows(2)
-            .any(|window| window[0] == "--tools" && window[1].contains("WebSearch")));
-        assert!(claude.args.iter().any(|arg| arg.contains("WebSearch")));
+            .any(|window| window[0] == "--permission-mode" && window[1] == "plan"));
         assert!(!claude
             .args
             .windows(2)
-            .any(|window| window[0] == "--allowedTools" && window[1].contains("Bash")));
-        assert!(claude.args.iter().any(|arg| arg.contains("Write")));
-        assert!(claude.args.iter().any(|arg| arg.contains("Bash")));
+            .any(|window| window[0] == "--tools" || window[0] == "--allowedTools"));
+        assert!(!claude
+            .args
+            .iter()
+            .any(|arg| arg.contains("[RUDDER PLAN MODE]")));
+        assert!(claude
+            .args
+            .iter()
+            .any(|arg| arg.contains("Plan this task before implementation")));
+    }
+
+    #[test]
+    fn cloud_command_defaults_to_authenticated_list() {
+        let app = App::new();
+        assert_eq!(
+            app.cloud_command_args(Vec::new()),
+            vec!["cloud".to_string(), "list".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["login"]),
+            vec!["cloud".to_string(), "login".to_string()]
+        );
+        assert_eq!(
+            app.cloud_command_args(vec!["onload"]),
+            vec!["cloud".to_string(), "onload".to_string()]
+        );
     }
 
     #[test]
@@ -5168,6 +5208,47 @@ fn rudder_config_path() -> Option<PathBuf> {
     Some(home.join("config.json"))
 }
 
+fn rudder_cloud_auth_path() -> Option<PathBuf> {
+    let home = if let Some(value) = std::env::var_os("RUDDER_HOME") {
+        let value = PathBuf::from(value);
+        if !value.as_os_str().is_empty() {
+            value
+        } else {
+            user_home_dir()?.join(".rudder")
+        }
+    } else {
+        user_home_dir()?.join(".rudder")
+    };
+    Some(home.join("cloud.json"))
+}
+
+fn rudder_cloud_authenticated() -> bool {
+    if env::var("RUDDER_CLOUD_TOKEN")
+        .ok()
+        .is_some_and(|token| !token.trim().is_empty())
+    {
+        return true;
+    }
+
+    let Some(path) = rudder_cloud_auth_path() else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .is_some_and(|data| {
+            data.get("token")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty())
+        })
+}
+
+fn cloud_args_are_login(args: &[&str]) -> bool {
+    args.first().is_some_and(|arg| *arg == "login")
+}
+
 fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -5333,12 +5414,12 @@ fn command_suggestions() -> Vec<Suggestion> {
         Suggestion {
             label: "/login".to_string(),
             detail: "authenticate Rudder Cloud in the browser".to_string(),
-            action: SuggestionAction::Insert("/login".to_string()),
+            action: SuggestionAction::RunCommand("/login".to_string()),
         },
         Suggestion {
             label: "/cloud".to_string(),
-            detail: "list, start, pause, resume, or onload cloud workers".to_string(),
-            action: SuggestionAction::Insert("/cloud ".to_string()),
+            detail: "list cloud workers, requires /login first".to_string(),
+            action: SuggestionAction::RunCommand("/cloud".to_string()),
         },
         Suggestion {
             label: "/sail".to_string(),
@@ -5630,15 +5711,7 @@ fn agent_command(
                 ],
                 AgentMode::Plan => vec![
                     "--permission-mode".to_string(),
-                    "default".to_string(),
-                    "--tools".to_string(),
-                    claude_plan_tools().join(","),
-                    "--allowedTools".to_string(),
-                    claude_plan_tools().join(","),
-                    "--disallowedTools".to_string(),
-                    claude_plan_disallowed_tools().join(","),
-                    "--append-system-prompt".to_string(),
-                    plan_mode_contract(),
+                    "plan".to_string(),
                     "--name".to_string(),
                     format!("plan:{}", short_task(task)),
                 ],
@@ -5694,62 +5767,8 @@ fn execution_prompt(task: &str) -> String {
 
 fn plan_prompt(task: &str) -> String {
     format!(
-        "{}\n\nUSER TASK:\nPlan this task before implementation:\n{}\n\nFirst inspect the repository and relevant external/read-only context. Ask follow-up questions if the plan cannot be made decision-complete from inspection alone.",
-        plan_mode_contract(),
-        task
+        "Plan this task before implementation. Inspect the repository and relevant read-only context first. Ask follow-up questions if the plan cannot be made decision-complete from inspection alone.\n\nUSER TASK:\n{task}"
     )
-}
-
-fn plan_mode_contract() -> String {
-    [
-        "[RUDDER PLAN MODE]",
-        "You are running inside Rudder's own plan mode, not the backend's native implementation mode.",
-        "Your job is to investigate and produce a decision-complete implementation plan.",
-        "",
-        "Rules:",
-        "- Do not write, edit, create, delete, move, rename, install, commit, merge, deploy, migrate, or otherwise mutate local or remote state.",
-        "- Use only read-only inspection. It is OK to read files, search the repo, inspect git state or read-only CLI state when the active tool profile permits it, and use web search/fetch when it improves the plan.",
-        "- If secrets or environment state matter, inspect only what is needed and do not print secret values. Mention presence, absence, names, or configuration shape instead.",
-        "- Ask concise follow-up questions when important product or implementation choices cannot be discovered from the environment.",
-        "- When the plan is ready, put the final answer in a single <proposed_plan>...</proposed_plan> block.",
-        "[END RUDDER PLAN MODE]",
-    ]
-    .join("\n")
-}
-
-fn claude_plan_tools() -> Vec<&'static str> {
-    vec!["Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch"]
-}
-
-fn claude_plan_disallowed_tools() -> Vec<&'static str> {
-    vec![
-        "Edit",
-        "Write",
-        "MultiEdit",
-        "NotebookEdit",
-        "Bash",
-        "Bash(rm *)",
-        "Bash(mv *)",
-        "Bash(cp *)",
-        "Bash(mkdir *)",
-        "Bash(touch *)",
-        "Bash(chmod *)",
-        "Bash(chown *)",
-        "Bash(git add*)",
-        "Bash(git commit*)",
-        "Bash(git checkout*)",
-        "Bash(git switch*)",
-        "Bash(git reset*)",
-        "Bash(git clean*)",
-        "Bash(git merge*)",
-        "Bash(git rebase*)",
-        "Bash(git push*)",
-        "Bash(fly deploy*)",
-        "Bash(fly secrets set*)",
-        "Bash(fly secrets unset*)",
-        "Bash(fly scale*)",
-        "Bash(fly apps destroy*)",
-    ]
 }
 
 fn short_task(task: &str) -> String {

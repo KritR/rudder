@@ -89,9 +89,9 @@ By default the CLI points at the hosted Rudder Cloud control plane:
 `https://mpd2pmnpep.us-east-1.awsapprunner.com`. Set `RUDDER_CLOUD_URL` to
 override it for local development or another deployment.
 
-Inside the dashboard, `/cloud` opens the cloud controls. `/sail` is a short
-alias for starting a cloud worker. `/cloud <name>` also starts a cloud worker
-for that task name.
+Inside the dashboard, `/login` starts browser auth, `/cloud` lists cloud
+workers after you are logged in, and `/sail <task>` starts a cloud worker.
+`/cloud <task>` also starts a cloud worker for that task.
 
 `rudder login` connects this machine to Rudder Cloud. If GitHub CLI is already
 authenticated, Rudder reuses it to issue a Rudder Cloud token. Otherwise it
@@ -243,8 +243,7 @@ Codex:
 
 ```bash
 codex --no-alt-screen \
-  --ask-for-approval never \
-  --sandbox danger-full-access \
+  --dangerously-bypass-approvals-and-sandbox \
   -c model_reasoning_summary="detailed" \
   -c model_supports_reasoning_summaries=true \
   -c model_reasoning_effort="<effort>" \
@@ -255,24 +254,21 @@ The exact model and effort flags are omitted when set to `auto`.
 
 ## Plan Mode
 
-Rudder has its own plan mode in the task pane. Type `/plan` to toggle it on or
-off. While it is on, pressing `Enter` starts a planner instead of an
+Type `/plan` to toggle planning on or off. While it is on, pressing `Enter`
+starts a planner instead of an
 implementation run. You can also use `/plan <task>` for a one-off plan, or
 `/run <task>` to bypass plan mode and start a normal worktree agent.
 
-Planning sessions use the currently selected Claude or Codex model, but Rudder
-owns the behavior:
+Planning sessions use the currently selected Claude or Codex model and lean on
+the backend's native planning/read-only controls:
 
 - The planner runs in the current checkout instead of creating a worktree.
-- The prompt tells the model to inspect first, ask follow-up questions when the
-  plan cannot be made decision-complete from read-only context, and return the
-  final answer in a `<proposed_plan>` block.
 - Codex planners launch with `--sandbox read-only`, `--ask-for-approval never`,
   and `--search`, so filesystem writes are blocked and the native Responses
   `web_search` tool is available.
-- Claude planners launch with default permission mode, only file/search/web
-  tools enabled, and Bash plus write/edit tools denied so shell writes and
-  destructive commands are not available.
+- Claude planners launch with Claude Code's native `--permission-mode plan`.
+- Rudder only prefixes the task with a short planning request; it no longer
+  injects a custom planner contract.
 - Normal implementation runs are unchanged: they still create worktrees and use
   the full-permission worker launch described above.
 
