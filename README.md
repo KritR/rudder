@@ -93,12 +93,12 @@ Inside the dashboard, `/login` starts browser auth, `/cloud` lists cloud
 workers after you are logged in, and `/sail <task>` starts a cloud worker.
 `/cloud <task>` also starts a cloud worker for that task.
 
-`rudder login` connects this machine to Rudder Cloud. If GitHub CLI is already
-authenticated, Rudder reuses it to issue a Rudder Cloud token. Otherwise it
-falls back to GitHub's browser device flow. The control plane also supports
-Better Auth with Google and GitHub providers once those OAuth clients are
-configured. It is separate from Claude Code and Codex login: provider auth still
-belongs to the official CLIs unless you explicitly configure otherwise.
+`rudder login` connects this machine to Rudder Cloud by opening the browser for
+the control plane's Better Auth login. If that browser login endpoint is
+unavailable, Rudder falls back to local GitHub CLI auth and then GitHub's
+browser device flow. It is separate from Claude Code and Codex login: provider
+auth still belongs to the official CLIs unless you explicitly configure
+otherwise.
 
 Cloud admins can attach existing OAuth clients without redeploying the control
 plane:

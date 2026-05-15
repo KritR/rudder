@@ -168,6 +168,21 @@ export async function runCloudCommand(command: string, args: string[], options: 
 
 async function login(options: CloudCommandOptions): Promise<void> {
   const client = await cloudClient({ requireToken: false });
+  const browserLogin = await tryBrowserLogin(client, options).catch((error) => {
+    if (!options.json) {
+      console.warn(`Browser login unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn("Trying local GitHub auth fallback...");
+    }
+    return null;
+  });
+  if (browserLogin?.token || browserLogin?.accessToken) {
+    const token = browserLogin.token ?? browserLogin.accessToken;
+    if (token) {
+      await saveCloudLogin(client, browserLogin, token, options, "browser");
+      return;
+    }
+  }
+
   const githubLogin = await tryGithubCliLogin(client).catch(() => null);
   if (githubLogin?.token || githubLogin?.accessToken) {
     const token = githubLogin.token ?? githubLogin.accessToken;
@@ -185,7 +200,9 @@ async function login(options: CloudCommandOptions): Promise<void> {
       return;
     }
   }
+}
 
+async function tryBrowserLogin(client: CloudClient, options: CloudCommandOptions): Promise<LoginPollResponse | null> {
   const response = await client.request<LoginStartResponse>("/api/cli/login", {
     method: "POST",
     body: {
@@ -200,7 +217,9 @@ async function login(options: CloudCommandOptions): Promise<void> {
   const timeoutMs = Math.max(intervalMs, (response.expiresIn ?? DEFAULT_LOGIN_TIMEOUT_MS / 1000) * 1000);
 
   console.log(`Opening ${loginUrl}`);
-  openBrowser(loginUrl);
+  if (!options.json) {
+    openBrowser(loginUrl);
+  }
   console.log("Waiting for browser login to complete...");
 
   const startedAt = Date.now();
@@ -209,8 +228,7 @@ async function login(options: CloudCommandOptions): Promise<void> {
     const poll = await pollLogin(client, pollPath, deviceCode);
     const token = poll.token ?? poll.accessToken;
     if (token) {
-      await saveCloudLogin(client, poll, token, options, "browser");
-      return;
+      return poll;
     }
     if (poll.pending === false) {
       throw new Error("Cloud login was not approved.");
