@@ -1,4 +1,11 @@
 {
   "cleanUrls": true,
-  "trailingSlash": false
+  "trailingSlash": false,
+  "redirects": [
+    {
+      "source": "/login",
+      "destination": "https://mpd2pmnpep.us-east-1.awsapprunner.com/cli/login",
+      "permanent": false
+    }
+  ]
 }

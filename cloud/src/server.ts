@@ -74,6 +74,7 @@ const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 15 * 60 * 1000);
 const stateKey = process.env.RUDDER_CLOUD_STATE_KEY || "control-plane/rudder-cloud.sqlite";
 const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
 const githubDeviceClientId = process.env.RUDDER_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
+const publicLoginUrl = (process.env.RUDDER_PUBLIC_LOGIN_URL || "").trim();
 const adminEmails = new Set((process.env.RUDDER_ADMIN_EMAILS || "viraat.laldas@gmail.com,viraat@exla.ai")
   .split(",")
   .map((email) => email.trim().toLowerCase())
@@ -354,9 +355,11 @@ async function handleCliLoginStart(res: ServerResponse): Promise<void> {
   const deviceCode = randomUUID();
   const expiresAt = Date.now() + 5 * 60 * 1000;
   deviceLogins.set(deviceCode, { deviceCode, expiresAt });
+  const loginBase = publicLoginUrl || `${baseURL}/cli/login`;
+  const separator = loginBase.includes("?") ? "&" : "?";
   sendJson(res, 200, {
     deviceCode,
-    loginUrl: `${baseURL}/cli/login?device_code=${encodeURIComponent(deviceCode)}`,
+    loginUrl: `${loginBase}${separator}device_code=${encodeURIComponent(deviceCode)}`,
     pollUrl: "/api/cli/login/poll",
     interval: 2,
     expiresIn: 300,
@@ -426,24 +429,115 @@ function renderLoginPage(url: URL, res: ServerResponse): void {
   const deviceCode = url.searchParams.get("device_code") || "";
   const callbackURL = `/cli/approve?device_code=${encodeURIComponent(deviceCode)}`;
   const providers = configuredProviders();
-  const links = [
-    providers.google
-      ? `<a href="/api/auth/sign-in/social?provider=google&callbackURL=${encodeURIComponent(callbackURL)}">Continue with Google</a>`
-      : "",
-    providers.github
-      ? `<a href="/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}">Continue with GitHub</a>`
-      : "",
-    deviceCode
-      ? `<a href="/cli/github/start?device_code=${encodeURIComponent(deviceCode)}">Continue with GitHub device login</a>`
-      : "",
-  ].filter(Boolean).join("\n");
-  const body = links || "<p>No OAuth providers are configured yet. Run <code>rudder login</code> from the CLI to use GitHub device login.</p>";
-  sendHtml(res, `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rudder Cloud Login</title>
-<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}a{display:block;margin:12px 0;color:#111}code{background:#f2f2f2;padding:2px 5px}</style></head>
-<body><h1>Rudder Cloud</h1><p>Choose a provider to finish CLI login.</p>
-${body}
-</body></html>`);
+  const buttons: string[] = [];
+  if (providers.google) {
+    buttons.push(providerButton(
+      `/api/auth/sign-in/social?provider=google&callbackURL=${encodeURIComponent(callbackURL)}`,
+      "Continue with Google",
+      GOOGLE_ICON_SVG,
+    ));
+  }
+  if (providers.github) {
+    buttons.push(providerButton(
+      `/api/auth/sign-in/social?provider=github&callbackURL=${encodeURIComponent(callbackURL)}`,
+      "Continue with GitHub",
+      GITHUB_ICON_SVG,
+    ));
+  }
+  const cliBlock = deviceCode
+    ? `<div class="device">
+        Don't want to use a provider above? You can also
+        <a href="/cli/github/start?device_code=${escapeHtml(deviceCode)}">sign in with a GitHub device code</a>.
+      </div>`
+    : `<div class="device">
+        Run <code>rudder login</code> from the CLI to start a login session.
+      </div>`;
+  const noProviders = buttons.length === 0
+    ? `<p class="empty">No OAuth providers are configured yet.${deviceCode ? " Use the GitHub device code option below." : ""}</p>`
+    : "";
+  const body = `
+    <section class="hero">
+      <h1>Sign in.</h1>
+      <p class="lede">Connect this browser to Rudder Cloud so the CLI can launch and watch over cloud workers.</p>
+      <div class="card">
+        ${noProviders}
+        ${buttons.join("\n")}
+        ${cliBlock}
+      </div>
+    </section>
+  `;
+  sendHtml(res, renderShell({ title: "Sign in · Rudder Cloud", body }));
+}
+
+function providerButton(href: string, label: string, icon: string): string {
+  return `<a class="provider" href="${escapeHtml(href)}"><span class="icon" aria-hidden="true">${icon}</span><span>${escapeHtml(label)}</span></a>`;
+}
+
+const GOOGLE_ICON_SVG = `<svg viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg"><path fill="#4285F4" d="M17.64 9.205c0-.639-.057-1.252-.164-1.841H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.258h2.908c1.702-1.567 2.684-3.875 2.684-6.614Z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.181l-2.908-2.258c-.806.54-1.836.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.331A8.997 8.997 0 0 0 9 18Z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.68 9c0-.593.102-1.17.284-1.71V4.959H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.041l3.007-2.331Z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.581C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.959L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58Z"/></svg>`;
+const GITHUB_ICON_SVG = `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>`;
+
+const BRAND_SVG = `<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="6" y="6" width="52" height="52" rx="12" fill="#fff"/><rect x="6" y="6" width="52" height="52" rx="12" fill="none" stroke="#111" stroke-width="3"/><path d="M18 20h12c8 0 13 4 13 11s-5 11-13 11h-6v9h-6V20Zm6 6v10h6c4 0 7-2 7-5s-3-5-7-5h-6Z" fill="#111"/><path d="M39 42l8 9" stroke="#111" stroke-width="6" stroke-linecap="round"/></svg>`;
+
+function renderShell(options: { title: string; body: string; footer?: string }): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#ffffff">
+    <title>${escapeHtml(options.title)}</title>
+    <link rel="icon" href="https://rudder.viraat.dev/favicon.svg" type="image/svg+xml">
+    <style>
+      :root { color:#111; background:#fff; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight:300; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:#fff; color:#111; min-height:100vh; }
+      a { color:inherit; text-decoration-thickness:1px; text-underline-offset:4px; }
+      .page { max-width: 1100px; margin: 0 auto; padding: 32px 24px 72px; }
+      header { display:flex; align-items:center; justify-content:space-between; gap:24px; padding-bottom: 64px; }
+      .brand { display:inline-flex; align-items:center; gap:12px; font-size:15px; text-decoration:none; color:#111; }
+      .brand svg { width:28px; height:28px; }
+      nav { display:flex; gap:18px; color:#555; font-size:14px; }
+      nav a { color:#555; }
+      h1 { margin:0; font-size: clamp(44px, 7vw, 88px); line-height:0.94; font-weight:300; letter-spacing:0; }
+      .lede { margin: 28px 0 0; max-width: 620px; font-size: clamp(17px, 1.6vw, 21px); line-height:1.45; color:#333; font-weight:300; }
+      .card { margin-top: 38px; max-width: 460px; border:1px solid #111; background:#fff; padding: 22px; box-shadow: 12px 12px 0 #111; }
+      .provider { display:flex; align-items:center; gap:14px; width:100%; border:1px solid #111; background:#fff; color:#111; padding: 12px 14px; font:inherit; font-size:15px; cursor:pointer; text-decoration:none; transition: background .12s ease, color .12s ease; }
+      .provider + .provider { margin-top: 10px; }
+      .provider:hover, .provider:focus-visible { background:#111; color:#fff; outline:none; }
+      .provider .icon { width:20px; height:20px; flex-shrink:0; display:inline-flex; align-items:center; justify-content:center; }
+      .provider .icon svg { width:100%; height:100%; }
+      .device { margin-top: 22px; padding-top: 18px; border-top: 1px dashed #111; color:#555; font-size: 14px; line-height:1.55; }
+      .device code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f2f2f2; padding: 1px 6px; }
+      .device a { color:#111; }
+      .empty { color:#555; font-size:15px; line-height:1.5; margin: 0 0 14px; }
+      .code-display { font: 600 32px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 6px; margin: 20px 0 6px; }
+      .muted { color:#666; font-size:14px; line-height:1.55; }
+      .pill { display:inline-block; padding: 6px 10px; border:1px solid #111; font:600 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-transform:uppercase; letter-spacing:1px; }
+      .btn-primary { display:inline-block; margin-top: 18px; border: 1px solid #111; background:#111; color:#fff; padding: 10px 14px; font:inherit; font-size:14px; text-decoration:none; }
+      .btn-primary:hover { background:#fff; color:#111; }
+      code.kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f2f2f2; padding: 2px 6px; }
+      footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid #ddd; color:#666; font-size: 13px; line-height:1.55; max-width: 620px; }
+      @media (max-width: 640px) {
+        header { padding-bottom: 36px; }
+        .card { box-shadow: 8px 8px 0 #111; padding: 18px; }
+        .code-display { font-size: 26px; letter-spacing: 4px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <a class="brand" href="https://rudder.viraat.dev">${BRAND_SVG}<span>Rudder Cloud</span></a>
+        <nav>
+          <a href="https://rudder.viraat.dev">rudder.viraat.dev</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+        </nav>
+      </header>
+      <main>${options.body}</main>
+      <footer>${options.footer ?? "You can close this tab once the CLI says you're signed in. Rudder Cloud uses Better Auth for OAuth — your provider tokens stay on this server."}</footer>
+    </div>
+  </body>
+</html>`;
 }
 
 function renderGithubAppSetup(url: URL, res: ServerResponse): void {
@@ -470,24 +564,33 @@ function renderGithubAppSetup(url: URL, res: ServerResponse): void {
     default_permissions: {},
     default_events: [],
   };
-  sendHtml(res, `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up Rudder GitHub OAuth</title>
-<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}button{font:inherit;padding:8px 12px;border:1px solid #111;background:#fff}code{background:#f2f2f2;padding:2px 5px}</style></head>
-<body><h1>Set up Rudder GitHub OAuth</h1>
-<p>This creates a GitHub App from a manifest and stores its OAuth client ID and secret in Rudder Cloud's persisted state.</p>
-<p>Callback URL: <code>${escapeHtml(`${baseURL}/api/auth/callback/github`)}</code></p>
-<form action="${escapeHtml(action)}" method="post">
-  <input type="hidden" name="manifest" value="${escapeHtml(JSON.stringify(manifest))}">
-  <button type="submit">Create GitHub App</button>
-</form>
-</body></html>`);
+  sendHtml(res, renderShell({
+    title: "Set up GitHub OAuth · Rudder Cloud",
+    body: `
+      <section class="hero">
+        <h1>GitHub OAuth.</h1>
+        <p class="lede">This creates a GitHub App from a manifest and stores its OAuth client ID and secret in Rudder Cloud's persisted state.</p>
+        <div class="card">
+          <p class="muted" style="margin-top:0">Callback URL</p>
+          <p><code class="kbd">${escapeHtml(`${baseURL}/api/auth/callback/github`)}</code></p>
+          <form action="${escapeHtml(action)}" method="post" style="margin-top:18px">
+            <input type="hidden" name="manifest" value="${escapeHtml(JSON.stringify(manifest))}">
+            <button class="btn-primary" type="submit">Create GitHub App</button>
+          </form>
+        </div>
+      </section>
+    `,
+  }));
 }
 
 async function handleGithubAppSetupCallback(url: URL, res: ServerResponse): Promise<void> {
   const code = url.searchParams.get("code") || "";
   const state = url.searchParams.get("state") || "";
   if (!code || !verifySetupState(state)) {
-    sendHtml(res, "<p>GitHub setup expired. Open <code>/setup/github</code> and try again.</p>", 400);
+    sendHtml(res, renderShell({
+      title: "Setup expired · Rudder Cloud",
+      body: `<section class="hero"><h1>Setup expired.</h1><p class="lede">Open <code class="kbd">/setup/github</code> and try again.</p></section>`,
+    }), 400);
     return;
   }
   const app = await githubManifestConversion(code);
@@ -500,13 +603,20 @@ async function handleGithubAppSetupCallback(url: URL, res: ServerResponse): Prom
   setSetting("github_client_secret", clientSecret);
   refreshAuthHandler(true);
   await persistDatabaseToS3();
-  sendHtml(res, `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rudder GitHub OAuth Ready</title>
-<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}code{background:#f2f2f2;padding:2px 5px}</style></head>
-<body><h1>GitHub OAuth is ready</h1>
-<p>Rudder Cloud saved the GitHub App OAuth credentials. <code>/cli/login</code> can now show the normal GitHub browser login button.</p>
-<p><a href="/health">Check health</a></p>
-</body></html>`);
+  sendHtml(res, renderShell({
+    title: "GitHub OAuth ready · Rudder Cloud",
+    body: `
+      <section class="hero">
+        <h1>All set.</h1>
+        <p class="lede">Rudder Cloud saved the GitHub App OAuth credentials. The sign-in page can now show the GitHub button.</p>
+        <div class="card">
+          <p class="muted" style="margin-top:0">Next</p>
+          <p><a class="btn-primary" href="/cli/login">Go to sign in</a></p>
+          <div class="device"><a href="/health">Check health</a></div>
+        </div>
+      </section>
+    `,
+  }));
 }
 
 async function handleOAuthCredentialSetup(
@@ -537,7 +647,7 @@ async function handleCliGithubStart(url: URL, res: ServerResponse): Promise<void
   const deviceCode = url.searchParams.get("device_code") || "";
   const login = deviceLogins.get(deviceCode);
   if (!login || login.expiresAt < Date.now()) {
-    sendHtml(res, "<p>Login expired. Run <code>rudder login</code> again.</p>", 400);
+    renderExpiredPage(res);
     return;
   }
   const existing = githubBrowserLogins.get(deviceCode);
@@ -553,7 +663,7 @@ async function handleCliGithubWait(url: URL, res: ServerResponse): Promise<void>
   const githubLogin = githubBrowserLogins.get(deviceCode);
   if (!login || login.expiresAt < Date.now() || !githubLogin || githubLogin.expiresAt < Date.now()) {
     githubBrowserLogins.delete(deviceCode);
-    sendHtml(res, "<p>Login expired. Run <code>rudder login</code> again.</p>", 400);
+    renderExpiredPage(res);
     return;
   }
   if (Date.now() < githubLogin.nextPollAt) {
@@ -578,7 +688,7 @@ async function handleCliGithubWait(url: URL, res: ServerResponse): Promise<void>
     login.accountId = issued.accountId;
     login.email = issued.email;
     githubBrowserLogins.delete(deviceCode);
-    sendHtml(res, "<p>Rudder Cloud login complete. You can close this tab.</p>");
+    renderSuccessPage(res, login.email);
     return;
   }
   if (poll.error === "slow_down") {
@@ -586,7 +696,19 @@ async function handleCliGithubWait(url: URL, res: ServerResponse): Promise<void>
     githubLogin.nextPollAt = Date.now() + githubLogin.intervalMs;
   } else if (poll.error && poll.error !== "authorization_pending") {
     githubBrowserLogins.delete(deviceCode);
-    sendHtml(res, `<p>GitHub login failed: ${escapeHtml(poll.error_description || poll.error)}</p>`, 400);
+    sendHtml(res, renderShell({
+      title: "GitHub login failed · Rudder Cloud",
+      body: `
+        <section class="hero">
+          <h1>GitHub login failed.</h1>
+          <p class="lede">${escapeHtml(poll.error_description || poll.error)}</p>
+          <div class="card">
+            <p class="muted" style="margin-top:0">Run the CLI again to try once more.</p>
+            <p><code class="kbd">rudder login</code></p>
+          </div>
+        </section>
+      `,
+    }), 400);
     return;
   }
   renderGithubDevicePage(res, deviceCode, githubLogin);
@@ -692,24 +814,34 @@ function setupStateSignature(payload: string): string {
 
 function renderGithubDevicePage(res: ServerResponse, deviceCode: string, githubLogin: GithubBrowserLogin): void {
   const href = githubLogin.verificationUriComplete || githubLogin.verificationUri;
-  sendHtml(res, `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="${Math.ceil(githubLogin.intervalMs / 1000)};url=/cli/github/wait?device_code=${encodeURIComponent(deviceCode)}">
-<title>Rudder Cloud GitHub Login</title>
-<style>body{font-family:ui-sans-serif,system-ui;margin:48px;color:#111;background:#fff;line-height:1.45}.code{font:600 32px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;margin:20px 0}a{color:#111}p{max-width:620px}</style></head>
-<body><h1>Rudder Cloud</h1>
-<p>Authorize Rudder with GitHub, then return here. This page will finish automatically.</p>
-<div class="code">${escapeHtml(githubLogin.userCode)}</div>
-<p><a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">Open GitHub authorization</a></p>
-<p>Waiting for GitHub approval...</p>
-</body></html>`);
+  const refreshSec = Math.ceil(githubLogin.intervalMs / 1000);
+  const html = renderShell({
+    title: "Authorize GitHub · Rudder Cloud",
+    body: `
+      <section class="hero">
+        <h1>Authorize on GitHub.</h1>
+        <p class="lede">Open GitHub, paste this code, then come back. This tab will finish on its own.</p>
+        <div class="card">
+          <span class="pill">Device code</span>
+          <div class="code-display">${escapeHtml(githubLogin.userCode)}</div>
+          <p class="muted">Waiting for GitHub approval&hellip;</p>
+          <a class="btn-primary" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">Open GitHub</a>
+          <div class="device">Stuck? Run <code>rudder login</code> again from the CLI.</div>
+        </div>
+      </section>
+    `,
+  }).replace(
+    "</head>",
+    `<meta http-equiv="refresh" content="${refreshSec};url=/cli/github/wait?device_code=${encodeURIComponent(deviceCode)}"></head>`,
+  );
+  sendHtml(res, html);
 }
 
 async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const deviceCode = url.searchParams.get("device_code") || "";
   const login = deviceLogins.get(deviceCode);
   if (!login || login.expiresAt < Date.now()) {
-    sendHtml(res, "<p>Login expired. Run <code>rudder login</code> again.</p>", 400);
+    renderExpiredPage(res);
     return;
   }
   const session = await getBetterAuthSession(req);
@@ -724,7 +856,7 @@ async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: 
   login.token = issued.token;
   login.accountId = issued.accountId;
   login.email = typeof session.user.email === "string" ? session.user.email : undefined;
-  sendHtml(res, "<p>Rudder Cloud login complete. You can close this tab.</p>");
+  renderSuccessPage(res, login.email);
 }
 
 async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
@@ -1220,7 +1352,52 @@ function ensureColumn(table: string, column: string, definition: string): void {
 }
 
 function renderHome(res: ServerResponse): void {
-  sendHtml(res, "<h1>Rudder Cloud</h1><p>Use <code>rudder login</code> from the CLI.</p>");
+  sendHtml(res, renderShell({
+    title: "Rudder Cloud",
+    body: `
+      <section class="hero">
+        <h1>Rudder Cloud.</h1>
+        <p class="lede">The control plane that lets Rudder hand off coding-agent runs to managed cloud workers. Sign in to connect a laptop.</p>
+        <div class="card">
+          <a class="provider" href="/cli/login"><span class="icon" aria-hidden="true">${BRAND_SVG}</span><span>Sign in to Rudder Cloud</span></a>
+          <div class="device">Or run <code>rudder login</code> from the CLI to open this page with a device code attached.</div>
+        </div>
+      </section>
+    `,
+  }));
+}
+
+function renderSuccessPage(res: ServerResponse, email?: string): void {
+  sendHtml(res, renderShell({
+    title: "Signed in · Rudder Cloud",
+    body: `
+      <section class="hero">
+        <h1>You're in.</h1>
+        <p class="lede">${email ? `Signed in as <strong>${escapeHtml(email)}</strong>. ` : ""}You can close this tab. The Rudder CLI will pick up the session in a moment.</p>
+        <div class="card">
+          <span class="pill">Logged in</span>
+          <p class="muted" style="margin-top:14px">Try it next:</p>
+          <p><code class="kbd">rudder cloud list</code> &middot; <code class="kbd">rudder sail "fix the failing tests"</code></p>
+        </div>
+      </section>
+    `,
+  }));
+}
+
+function renderExpiredPage(res: ServerResponse, status = 400): void {
+  sendHtml(res, renderShell({
+    title: "Login expired · Rudder Cloud",
+    body: `
+      <section class="hero">
+        <h1>Session expired.</h1>
+        <p class="lede">This login link has timed out.</p>
+        <div class="card">
+          <p class="muted" style="margin-top:0">Run the command again to start a fresh session:</p>
+          <p><code class="kbd">rudder login</code></p>
+        </div>
+      </section>
+    `,
+  }), status);
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Json> {

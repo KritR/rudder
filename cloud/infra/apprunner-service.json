@@ -17,11 +17,16 @@
           "FLY_APP_NAME": "rudder-workers-exla",
           "FLY_REGION": "iad",
           "RUDDER_WORKER_IMAGE": "public.ecr.aws/exla/rudder-worker:latest",
-          "RUDDER_IDLE_PAUSE_MS": "900000"
+          "RUDDER_IDLE_PAUSE_MS": "900000",
+          "RUDDER_PUBLIC_LOGIN_URL": "https://rudder.viraat.dev/login",
+          "GOOGLE_CLIENT_ID": "126214446123-b245olbglilh1edvnk0qu7sb2asbin2q.apps.googleusercontent.com",
+          "GITHUB_CLIENT_ID": "Iv23liKY5Nx0Mc4EqByY"
         },
         "RuntimeEnvironmentSecrets": {
           "BETTER_AUTH_SECRET": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/better-auth-secret-LGW1vG",
-          "FLY_API_TOKEN": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/fly-api-token-fss6y8"
+          "FLY_API_TOKEN": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/fly-api-token-fss6y8",
+          "GOOGLE_CLIENT_SECRET": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/google-client-secret-s0zyUc",
+          "GITHUB_CLIENT_SECRET": "arn:aws:secretsmanager:us-east-1:597088032164:secret:rudder/github-client-secret-M2XihV"
         }
       }
     },

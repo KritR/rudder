@@ -6,14 +6,15 @@
     <title>Rudder</title>
     <meta
       name="description"
-      content="Rudder is the terminal OS for massively parallel Claude Code and Codex agents with code diff, cloud continuation, and easy merges."
+      content="Rudder is the terminal OS for running Claude Code and Codex agents in parallel, with code diffs, cloud continuation, and easy merges."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="Run agents massively parallel. Review code diffs, continue in the cloud, and merge finished work cleanly."
+      content="Run multiple coding agents the way they should be run: in parallel, isolated, reviewable, easy to merge."
     />
+    <meta property="og:image" content="/screenshot.png" />
     <meta name="theme-color" content="#ffffff" />
     <style>
       :root {
@@ -137,103 +138,27 @@
         outline-offset: 3px;
       }
 
+      .shot {
+        margin-top: 56px;
+        max-width: 1200px;
+      }
+
+      .shot img {
+        display: block;
+        width: 100%;
+        height: auto;
+        border: 1px solid #111;
+        box-shadow: 12px 12px 0 #111;
+      }
+
       .summary {
-        margin-top: 38px;
+        margin-top: 56px;
         max-width: 900px;
         border-top: 1px solid #ddd;
         padding-top: 22px;
         color: #555;
         font-size: 17px;
         line-height: 1.6;
-      }
-
-      .terminal {
-        border: 1px solid #111;
-        min-height: 520px;
-        display: grid;
-        grid-template-columns: 32% 68%;
-        grid-template-rows: 1fr 88px;
-        background: #fff;
-        box-shadow: 12px 12px 0 #111;
-      }
-
-      .pane {
-        padding: 18px;
-        border-color: #111;
-        overflow: hidden;
-      }
-
-      .agents {
-        border-right: 1px solid #111;
-      }
-
-      .worker {
-        border: 3px double #111;
-        margin: 12px;
-        padding: 14px;
-      }
-
-      .task {
-        grid-column: 1 / -1;
-        border-top: 1px solid #111;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-      }
-
-      .label {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
-        color: #666;
-        margin-bottom: 16px;
-        text-transform: uppercase;
-      }
-
-      .run {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
-        line-height: 1.55;
-        margin-bottom: 18px;
-      }
-
-      .run.active {
-        color: #000;
-      }
-
-      .run.muted {
-        color: #777;
-      }
-
-      .worker pre,
-      .task pre {
-        margin: 0;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
-        line-height: 1.55;
-        white-space: pre-wrap;
-      }
-
-      .focus {
-        display: inline-block;
-        padding: 2px 7px;
-        margin-bottom: 14px;
-        background: #39ff14;
-        color: #111;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
-      }
-
-      .note {
-        color: #555;
-      }
-
-      .merge-button {
-        display: inline-block;
-        margin-top: 18px;
-        border: 1px solid #111;
-        padding: 8px 10px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
       }
 
       footer {
@@ -253,22 +178,17 @@
           display: block;
         }
 
-        .terminal {
-          min-height: 440px;
-          grid-template-columns: 1fr;
-          grid-template-rows: 150px 1fr 82px;
-          box-shadow: 8px 8px 0 #111;
+        .shot {
+          margin-top: 36px;
         }
 
-        .agents {
-          border-right: 0;
-          border-bottom: 1px solid #111;
+        .shot img {
+          box-shadow: 6px 6px 0 #111;
         }
 
-        .worker {
-          margin: 10px;
+        .summary {
+          margin-top: 36px;
         }
-
       }
     </style>
   </head>
@@ -282,6 +202,7 @@
         <nav>
           <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
           <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="/login">Sign in</a>
         </nav>
       </header>
 
@@ -289,11 +210,10 @@
         <section class="hero">
           <h1>The terminal OS for coding agents.</h1>
           <p class="lede">
-            Rudder leans into how you should use agents: massively parallel,
-            isolated, reviewable, and easy to merge. Start local Claude Code or
-            Codex workers, continue agents in the cloud when it makes sense,
-            review code diffs, login with /login, list cloud workers with
-            /cloud, and merge finished work cleanly.
+            Run multiple agents the way they should be run: in parallel,
+            isolated, reviewable, easy to merge. Start local Claude Code or
+            Codex workers, continue them in the cloud when it makes sense,
+            review the diff, and merge cleanly.
           </p>
           <div class="install">
             <code id="install-command">npm install -g @viraatdas/rudder@latest
@@ -302,9 +222,13 @@ rudder</code>
           </div>
         </section>
 
+        <section class="shot" aria-label="Rudder screenshot">
+          <img src="/screenshot.png" alt="Rudder three pane terminal with an agents list, a worker running gpt-5.5, and a task input." />
+        </section>
+
         <section class="summary" aria-label="Rudder summary">
-          Massively parallel agents. Optional cloud continuation. Code diff.
-          Backend-native plan mode. One-key merge. Easy start.
+          Multiple agents in parallel. Optional cloud continuation. Code diff.
+          Backend native plan mode. One key merge. Easy start.
         </section>
       </main>
     </div>
