@@ -11,6 +11,7 @@ import { appendEvent, } from "./state.js";
 import { activeRunsForCheckout, createRunWorktree, currentBranch, currentCommit, findRepoRoot, hasChanges, mergeRunIntoCurrentBranch, processAlive, removeWorktree, } from "./git.js";
 import { ensureDir, isTty, newRunId, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
+import { taskDisplayLabel } from "./task-summary.js";
 const AUTO_STEER_DELAY_MS = 10_000;
 export async function startRun(params) {
     const repoRoot = findRepoRoot();
@@ -174,7 +175,7 @@ export async function startNativeRun(params) {
             contract,
         });
         await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
-        const title = `${backend}:${shortTask(params.task)}`;
+        const title = `${backend}:${shortRunTask(run)}`;
         const paneId = params.workerPaneId;
         if (paneId) {
             await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
@@ -286,7 +287,7 @@ export async function startNativePlan(params) {
             mode: "plan",
         });
         await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
-        const title = `${backend}:plan:${shortTask(params.task)}`;
+        const title = `${backend}:plan:${shortRunTask(run)}`;
         const paneId = params.workerPaneId;
         if (paneId) {
             await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
@@ -669,8 +670,8 @@ function effortForBackend(backend, config) {
     }
     return config.backends.acpx?.reasoningEffort ?? config.backends.acpx?.effort;
 }
-function shortTask(task) {
-    return task.replace(/\s+/g, " ").trim().slice(0, 34) || "agent";
+function shortRunTask(run) {
+    return taskDisplayLabel(run, 34) || "agent";
 }
 export async function statusRuns(options) {
     const repoRoot = findRepoRoot();
@@ -954,7 +955,7 @@ export async function reconcileNativeTerminals(repoRoot) {
             await respawnPane({
                 paneId: run.terminal.paneId,
                 cwd: run.worktree.path,
-                title: `${run.backend}:${shortTask(run.task)}`,
+                title: `${run.backend}:${shortRunTask(run)}`,
                 command,
                 logPath: outputPath(repoRoot, run.id),
             });

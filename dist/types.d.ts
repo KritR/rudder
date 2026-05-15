@@ -84,6 +84,7 @@ export type RunRecord = {
     status: RunStatus;
     mode?: RunMode;
     task: string;
+    taskSummary?: string;
     backend: BackendId;
     model?: string;
     effort?: EffortLevel;
@@ -186,6 +187,7 @@ export type CloudAuthState = {
     version: 1;
     token: string;
     cloudUrl: string;
+    defaultRuntime?: "fly" | "byo-vm";
     accountId?: string;
     email?: string;
     expiresAt?: string;

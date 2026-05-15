@@ -247,6 +247,7 @@ struct AgentRun {
     created_at: String,
     mode: AgentMode,
     task: String,
+    task_summary: String,
     current_prompt: String,
     turns: Vec<AgentTurn>,
     last_user_input_at: String,
@@ -1549,6 +1550,7 @@ impl App {
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
             task: input.to_string(),
+            task_summary: summarize_task(input),
             current_prompt: input.to_string(),
             turns: vec![AgentTurn {
                 ts: created_at.clone(),
@@ -1618,6 +1620,7 @@ impl App {
             created_at: created_at.clone(),
             mode: AgentMode::Plan,
             task: input.to_string(),
+            task_summary: summarize_task(input),
             current_prompt: input.to_string(),
             turns: vec![AgentTurn {
                 ts: created_at.clone(),
@@ -1849,8 +1852,24 @@ impl App {
             }
         }
         let known = [
-            "help", "login", "list", "ls", "onload", "sail", "launch", "pause", "resume", "status",
-            "stop", "logs", "vm", "byo-vm", "bootstrap", "runtime", "setup", "setup-vm",
+            "help",
+            "login",
+            "list",
+            "ls",
+            "onload",
+            "sail",
+            "launch",
+            "pause",
+            "resume",
+            "status",
+            "stop",
+            "logs",
+            "vm",
+            "byo-vm",
+            "bootstrap",
+            "runtime",
+            "setup",
+            "setup-vm",
             "setup-fly",
         ];
         let mut command = vec!["cloud".to_string()];
@@ -1877,6 +1896,7 @@ impl App {
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
             task: task.clone(),
+            task_summary: summarize_task(&task),
             current_prompt: task.clone(),
             turns: vec![AgentTurn {
                 ts: created_at.clone(),
@@ -2208,6 +2228,7 @@ impl App {
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
             task: task.clone(),
+            task_summary: summarize_task(&task),
             current_prompt: prompt.clone(),
             turns: vec![AgentTurn {
                 ts: created_at.clone(),
@@ -3455,6 +3476,23 @@ mod app_tests {
     }
 
     #[test]
+    fn task_summary_turns_request_into_agent_label() {
+        assert_eq!(
+            summarize_task(
+                "also can you summarize the task that user puts and then that's what gets lsited on the agent pane. rihgt now you are just putting the task name"
+            ),
+            "summarize the user task for the agent pane"
+        );
+        assert_eq!(
+            summarize_task_to(
+                "ok another thing for you to work on is when merge happens label the thing on the side merged and when you delete then only it deletes the worktree",
+                40,
+            ),
+            "merge happens label thing side merged..."
+        );
+    }
+
+    #[test]
     fn worker_prompt_draft_tracks_line_editing_until_enter() {
         let mut draft = String::new();
         let mut cursor = 0;
@@ -3669,6 +3707,7 @@ mod app_tests {
             created_at: "1".to_string(),
             mode: AgentMode::Execute,
             task: task.to_string(),
+            task_summary: summarize_task(task),
             current_prompt: task.to_string(),
             turns: vec![AgentTurn {
                 ts: "1".to_string(),
@@ -3761,6 +3800,7 @@ mod app_tests {
             created_at: "1".to_string(),
             mode: AgentMode::Execute,
             task: "test task".to_string(),
+            task_summary: summarize_task("test task"),
             current_prompt: "test task".to_string(),
             turns: vec![AgentTurn {
                 ts: "1".to_string(),
@@ -4179,10 +4219,16 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             pane_text_style(focused)
         };
+        let task_label = if agent.task_summary.trim().is_empty() {
+            summarize_task(&agent.task)
+        } else {
+            agent.task_summary.clone()
+        };
+        let task_width = area.width.saturating_sub(4).max(12) as usize;
 
         lines.push(ListItem::new(Line::from(vec![
             Span::styled(marker, accent_style(focused)),
-            Span::styled(short_task(&agent.task), task_style),
+            Span::styled(truncate_chars(&task_label, task_width), task_style),
         ])));
         lines.push(ListItem::new(Line::from(vec![
             Span::raw("  "),
@@ -6200,10 +6246,208 @@ fn strip_rudder_prompt_wrappers(task: &str) -> String {
 
 fn short_task(task: &str) -> String {
     const MAX: usize = 26;
-    let mut chars = task.chars();
-    let short = chars.by_ref().take(MAX).collect::<String>();
+    truncate_chars(task, MAX)
+}
+
+fn summarize_task(task: &str) -> String {
+    summarize_task_to(task, 56)
+}
+
+fn summarize_task_to(task: &str, max_chars: usize) -> String {
+    let original = normalize_task_text(task);
+    if original.is_empty() {
+        return "agent".to_string();
+    }
+
+    let mut summary = strip_leading_scaffolding(&original);
+    summary = normalize_task_text(&summary)
+        .replace("lsited", "listed")
+        .replace("rihgt", "right")
+        .replace("the task that the user puts", "the user task")
+        .replace("the task that user puts", "the user task")
+        .replace("task that the user puts", "user task")
+        .replace("task that user puts", "user task")
+        .replace("and then that's what gets listed on", "for")
+        .replace("and then that is what gets listed on", "for");
+    summary = strip_trailing_context(&summary);
+    summary = first_sentence(&summary);
+    summary = strip_terminal_punctuation(&summary);
+    if summary.is_empty() {
+        summary = original;
+    }
+
+    if summary.chars().count() <= max_chars {
+        return summary;
+    }
+
+    compact_title(&summary, max_chars).unwrap_or_else(|| truncate_chars(&summary, max_chars))
+}
+
+fn normalize_task_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_leading_scaffolding(value: &str) -> String {
+    let mut current = value.trim().to_string();
+    loop {
+        let lower = current.to_ascii_lowercase();
+        let mut next = None;
+        for prefix in [
+            "ok, ",
+            "okay, ",
+            "hey, ",
+            "ok ",
+            "okay ",
+            "hey ",
+            "also ",
+            "please ",
+            "can you ",
+            "could you ",
+            "would you ",
+            "can u ",
+            "could u ",
+            "would u ",
+            "can we ",
+            "could we ",
+            "would we ",
+            "i need you to ",
+            "i need to ",
+            "i want you to ",
+            "i want to ",
+            "need you to ",
+            "need to ",
+            "want you to ",
+            "want to ",
+            "we need to ",
+            "we should ",
+            "we have to ",
+            "another thing for you to work on is ",
+            "another thing is ",
+            "the task is ",
+        ] {
+            if lower.starts_with(prefix) {
+                next = Some(current[prefix.len()..].trim().to_string());
+                break;
+            }
+        }
+        match next {
+            Some(value) if value != current => current = value,
+            _ => break,
+        }
+    }
+    current
+}
+
+fn strip_trailing_context(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    for marker in [" right now", " currently", " at the moment", " for now"] {
+        if let Some(index) = lower.find(marker) {
+            return value[..index].trim().to_string();
+        }
+    }
+    value.trim().to_string()
+}
+
+fn first_sentence(value: &str) -> String {
+    let mut char_count = 0;
+    for (index, ch) in value.char_indices() {
+        char_count += 1;
+        if char_count >= 12 && matches!(ch, '.' | '!' | '?') {
+            return value[..index].trim().to_string();
+        }
+    }
+    value.trim().to_string()
+}
+
+fn compact_title(value: &str, max_chars: usize) -> Option<String> {
+    let mut selected = Vec::new();
+    for word in
+        value.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | '-')))
+    {
+        if word.is_empty() {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if is_task_summary_stop_word(&lower) {
+            continue;
+        }
+        selected.push(word.to_string());
+        if selected.join(" ").chars().count() >= max_chars.saturating_sub(1) || selected.len() >= 8
+        {
+            break;
+        }
+    }
+    let compact = strip_terminal_punctuation(&selected.join(" "));
+    if !compact.is_empty() && compact.chars().count() < value.chars().count() {
+        Some(truncate_chars(&compact, max_chars))
+    } else {
+        None
+    }
+}
+
+fn is_task_summary_stop_word(value: &str) -> bool {
+    matches!(
+        value,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "but"
+            | "by"
+            | "for"
+            | "from"
+            | "gets"
+            | "have"
+            | "in"
+            | "is"
+            | "it"
+            | "its"
+            | "just"
+            | "of"
+            | "on"
+            | "or"
+            | "put"
+            | "puts"
+            | "putting"
+            | "right"
+            | "so"
+            | "than"
+            | "that"
+            | "the"
+            | "then"
+            | "this"
+            | "to"
+            | "user"
+            | "what"
+            | "when"
+            | "where"
+            | "with"
+            | "you"
+            | "your"
+    )
+}
+
+fn strip_terminal_punctuation(value: &str) -> String {
+    value
+        .trim_end_matches(|ch| matches!(ch, '.' | '!' | '?'))
+        .trim()
+        .to_string()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let short = chars.by_ref().take(max_chars).collect::<String>();
     if chars.next().is_some() {
-        format!("{short}...")
+        if max_chars <= 3 {
+            ".".repeat(max_chars)
+        } else {
+            format!(
+                "{}...",
+                short.chars().take(max_chars - 3).collect::<String>()
+            )
+        }
     } else {
         short
     }
@@ -6702,6 +6946,12 @@ fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
 fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<AgentRun> {
     let id = record.get("id")?.as_str()?.to_string();
     let task = record.get("task")?.as_str()?.to_string();
+    let task_summary = record
+        .get("taskSummary")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| summarize_task(&task));
     let backend = record
         .get("backend")
         .and_then(|value| value.as_str())
@@ -6767,6 +7017,7 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         created_at,
         mode,
         task,
+        task_summary,
         current_prompt,
         turns,
         last_user_input_at,
@@ -6885,6 +7136,7 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
         "status": run_record_status(run.status),
         "mode": run.mode.as_str(),
         "task": run.task,
+        "taskSummary": run.task_summary,
         "backend": run.backend.as_str(),
         "model": run.model,
         "effort": run.effort.map(|effort| effort.as_str()),

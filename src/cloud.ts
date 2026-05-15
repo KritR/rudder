@@ -1015,3 +1015,51 @@ Environment:
   RUDDER_GOOGLE_CLIENT_SECRET   Google OAuth client secret for setup-google
 `);
 }
+
+const CLOUD_ADJECTIVES = [
+  "amber",
+  "bright",
+  "calm",
+  "clear",
+  "cosmic",
+  "gentle",
+  "golden",
+  "lucky",
+  "rapid",
+  "silver",
+  "steady",
+  "swift",
+];
+
+const CLOUD_NOUNS = [
+  "atlas",
+  "harbor",
+  "signal",
+  "summit",
+  "orbit",
+  "ranger",
+  "river",
+  "rocket",
+  "sparrow",
+  "station",
+  "voyager",
+  "wave",
+];
+
+function randomCloudName(): string {
+  const seed = Date.now() + process.pid + Math.floor(Math.random() * 1_000_000);
+  return [
+    CLOUD_ADJECTIVES[Math.abs(seed) % CLOUD_ADJECTIVES.length],
+    CLOUD_NOUNS[Math.abs(Math.floor(seed / CLOUD_ADJECTIVES.length)) % CLOUD_NOUNS.length],
+  ].join("-");
+}
+
+function cloudNameFromTask(task: string): string {
+  const slug = task
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 36)
+    .replace(/-+$/g, "");
+  return slug || randomCloudName();
+}

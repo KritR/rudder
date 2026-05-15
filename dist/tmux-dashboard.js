@@ -12,6 +12,7 @@ import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTe
 import { listRuns, loadConfig, outputPath, rememberBackendSelection } from "./state.js";
 import { loadTmuxDashboardState, updateTmuxDashboardState, } from "./tmux-state.js";
 import { detachClient, resizePane, selectPane } from "./tmux.js";
+import { taskDisplayLabel } from "./task-summary.js";
 import { shortenHome } from "./util.js";
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
 const ATTENTION_TAIL_BYTES = 64 * 1024;
@@ -153,7 +154,7 @@ function AgentPane({ defaults }) {
     const width = Math.max(24, size.columns);
     const maxRuns = Math.max(1, Math.floor((size.rows - 5) / 3));
     const visibleRuns = runs.slice(0, maxRuns);
-    return (_jsxs(Box, { flexDirection: "column", children: [_jsx(Text, { bold: true, children: "rudder" }), _jsx(Text, { color: "gray", children: summarize(`${shortenHome(repoRoot)} ${branch}`, width) }), _jsxs(Text, { children: ["agents ", _jsxs(Text, { color: "gray", children: [runs.length, " runs"] })] }), visibleRuns.length === 0 ? _jsx(Text, { color: "gray", children: "No agents yet." }) : visibleRuns.map((run) => (_jsxs(Box, { flexDirection: "column", children: [_jsxs(Text, { color: run.id === selectedRun?.id ? "cyan" : taskColor(run), children: [run.id === selectedRun?.id ? "> " : "  ", summarize(run.task, width - 3)] }), _jsxs(Text, { children: [_jsxs(Text, { color: runStatusColor(run), children: ["  ", statusMark(run)] }), _jsxs(Text, { color: "gray", children: ["  ", run.backend, " "] }), _jsx(Text, { color: "magenta", children: modelLabel(run, config) })] })] }, run.id))), notice ? _jsx(Text, { color: deleteIntent ? "red" : "yellow", children: summarize(notice, width) }) : null, _jsx(Text, { color: "gray", children: "j/k select  Enter focus  m merge  dd delete" })] }));
+    return (_jsxs(Box, { flexDirection: "column", children: [_jsx(Text, { bold: true, children: "rudder" }), _jsx(Text, { color: "gray", children: summarize(`${shortenHome(repoRoot)} ${branch}`, width) }), _jsxs(Text, { children: ["agents ", _jsxs(Text, { color: "gray", children: [runs.length, " runs"] })] }), visibleRuns.length === 0 ? _jsx(Text, { color: "gray", children: "No agents yet." }) : visibleRuns.map((run) => (_jsxs(Box, { flexDirection: "column", children: [_jsxs(Text, { color: run.id === selectedRun?.id ? "cyan" : taskColor(run), children: [run.id === selectedRun?.id ? "> " : "  ", summarize(taskDisplayLabel(run, 80), width - 3)] }), _jsxs(Text, { children: [_jsxs(Text, { color: runStatusColor(run), children: ["  ", statusMark(run)] }), _jsxs(Text, { color: "gray", children: ["  ", run.backend, " "] }), _jsx(Text, { color: "magenta", children: modelLabel(run, config) })] })] }, run.id))), notice ? _jsx(Text, { color: deleteIntent ? "red" : "yellow", children: summarize(notice, width) }) : null, _jsx(Text, { color: "gray", children: "j/k select  Enter focus  m merge  dd delete" })] }));
 }
 function TaskPane({ defaults }) {
     const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());

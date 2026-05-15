@@ -579,11 +579,15 @@ Usage:
   rudder claude [options] "task"
   rudder codex [options] "task"
   rudder login
-  rudder cloud [name]
+  rudder cloud [name or task]
   rudder cloud help
+  rudder cloud setup-vm
+  rudder cloud runtime [fly|byo-vm]
+  rudder cloud vm <task>
   rudder cloud list
   rudder cloud onload <runId>
-  rudder sail [name]
+  rudder cloud bootstrap <id>
+  rudder sail [name or task]
 
 Run management:
   rudder watch [run]              Attach to live output
@@ -602,13 +606,17 @@ Setup:
 
 Cloud:
   rudder login                    Open browser login and store cloud token
-  rudder cloud [name]             Start a cloud worker from this repo snapshot
+  rudder cloud [name or task]     Start a cloud worker from this repo snapshot
   rudder cloud list               List cloud workers/runs
   rudder cloud help               Show cloud command help
+  rudder cloud setup-vm           Use your own VM for future cloud launches
+  rudder cloud runtime [runtime]  Show or set fly/byo-vm cloud runtime
+  rudder cloud vm <task>          Prepare a BYO VM worker command for a task
   rudder cloud onload <runId>     Move a local Rudder run to cloud
+  rudder cloud bootstrap <id>     Regenerate a BYO VM worker command
   rudder cloud pause <id>         Pause an idle cloud worker
   rudder cloud resume <id>        Resume a cloud worker
-  rudder sail [name]              Alias for starting a cloud worker
+  rudder sail [name or task]      Alias for starting a cloud worker
 
 Options:
   -d, --detach                    Start in background

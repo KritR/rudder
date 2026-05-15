@@ -16,6 +16,7 @@ import {
 } from "./tmux-state.js";
 import { detachClient, resizePane, selectPane } from "./tmux.js";
 import type { BackendId, EffortLevel, RunRecord, RudderConfig } from "./types.js";
+import { taskDisplayLabel } from "./task-summary.js";
 import { shortenHome } from "./util.js";
 
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
@@ -201,7 +202,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
       {visibleRuns.length === 0 ? <Text color="gray">No agents yet.</Text> : visibleRuns.map((run) => (
         <Box key={run.id} flexDirection="column">
           <Text color={run.id === selectedRun?.id ? "cyan" : taskColor(run)}>
-            {run.id === selectedRun?.id ? "> " : "  "}{summarize(run.task, width - 3)}
+            {run.id === selectedRun?.id ? "> " : "  "}{summarize(taskDisplayLabel(run, 80), width - 3)}
           </Text>
           <Text>
             <Text color={runStatusColor(run)}>  {statusMark(run)}</Text>

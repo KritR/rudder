@@ -9,6 +9,7 @@ import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions } from "./models.js";
 import { eventsPath, listRuns, loadConfig, outputPath, rememberBackendSelection, } from "./state.js";
 import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
+import { taskDisplayLabel } from "./task-summary.js";
 import { pathExists, shortenHome } from "./util.js";
 const INTERACTIVE_BACKENDS = ["claude", "codex"];
 const COMPLETION_SOUND = fileURLToPath(new URL("../assets/sounds/ping.mp3", import.meta.url));
@@ -213,7 +214,7 @@ function RudderTui({ defaults }) {
         setMergePrompt({
             kind: "selected",
             runId: run.id,
-            label: truncate(run.task, 48),
+            label: truncate(taskDisplayLabel(run, 48), 48),
             allowDirty,
         });
         setNotice(`Merge ${shortId(run.id)}? press y to confirm or n to cancel`);
@@ -715,7 +716,7 @@ function RunRail(props) {
 function RunCard(props) {
     const tone = runStatusColor(props.run);
     const label = props.selected ? (props.targeted ? ">>" : "> ") : "  ";
-    const task = truncate(props.run.task, Math.max(12, props.width - 14));
+    const task = truncate(taskDisplayLabel(props.run, 80), Math.max(12, props.width - 14));
     const progress = completionPercent(props.run);
     const summary = truncate(agentRailSummary(props.run), Math.max(12, props.width - 7));
     const meta = `${progressBar(progress)} ${progress}%`;

@@ -14,6 +14,7 @@ import {
   rememberBackendSelection,
 } from "./state.js";
 import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
+import { taskDisplayLabel } from "./task-summary.js";
 import type { BackendId, RunRecord, RudderConfig, RudderEvent, RunStatus } from "./types.js";
 import { pathExists, shortenHome } from "./util.js";
 
@@ -275,7 +276,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     setMergePrompt({
       kind: "selected",
       runId: run.id,
-      label: truncate(run.task, 48),
+      label: truncate(taskDisplayLabel(run, 48), 48),
       allowDirty,
     });
     setNotice(`Merge ${shortId(run.id)}? press y to confirm or n to cancel`);
@@ -845,7 +846,7 @@ function RunRail(props: {
 function RunCard(props: { run: UiRun; selected: boolean; targeted: boolean; expanded: boolean; width: number }): React.ReactElement {
   const tone = runStatusColor(props.run);
   const label = props.selected ? (props.targeted ? ">>" : "> ") : "  ";
-  const task = truncate(props.run.task, Math.max(12, props.width - 14));
+  const task = truncate(taskDisplayLabel(props.run, 80), Math.max(12, props.width - 14));
   const progress = completionPercent(props.run);
   const summary = truncate(agentRailSummary(props.run), Math.max(12, props.width - 7));
   const meta = `${progressBar(progress)} ${progress}%`;

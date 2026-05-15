@@ -1,6 +1,7 @@
 import path from "node:path";
 import fsp from "node:fs/promises";
 import { ensureDir, newRunId, nowIso, readJson, rudderHome, shortHash, slugify, writeJson, } from "./util.js";
+import { summarizeTask } from "./task-summary.js";
 export function globalConfigPath() {
     return path.join(rudderHome(), "config.json");
 }
@@ -181,6 +182,7 @@ export async function createRunRecord(params) {
         status: "created",
         mode: params.mode ?? "execute",
         task: params.task,
+        taskSummary: summarizeTask(params.task),
         backend: params.backend,
         model: params.model,
         effort: params.effort,
@@ -204,11 +206,16 @@ export async function createRunRecord(params) {
     return record;
 }
 export async function saveRunRecord(record) {
+    record.taskSummary = record.taskSummary || summarizeTask(record.task);
     record.updatedAt = nowIso();
     await writeJson(runRecordPath(record.repoRoot, record.id), record);
 }
 export async function loadRunRecord(repoRoot, runId) {
-    return await readJson(runRecordPath(repoRoot, runId));
+    const record = await readJson(runRecordPath(repoRoot, runId));
+    if (record && !record.taskSummary) {
+        record.taskSummary = summarizeTask(record.task);
+    }
+    return record;
 }
 export async function appendEvent(repoRoot, event) {
     await ensureDir(runDir(repoRoot, event.runId));

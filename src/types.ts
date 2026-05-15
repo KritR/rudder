@@ -112,6 +112,7 @@ export type RunRecord = {
   status: RunStatus;
   mode?: RunMode;
   task: string;
+  taskSummary?: string;
   backend: BackendId;
   model?: string;
   effort?: EffortLevel;

@@ -1,5 +1,6 @@
 import { normalizeEffortForBackend } from "./effort.js";
 import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
+import { taskDisplayLabel } from "./task-summary.js";
 import { shellQuote } from "./util.js";
 export function nativeAgentCommand(params) {
     const mode = params.mode ?? params.run.mode ?? "execute";
@@ -113,7 +114,7 @@ function codexPlanArgs(run, prompt) {
     ]);
 }
 function paneTitle(run) {
-    const words = run.task.replace(/\s+/g, " ").trim().slice(0, 34);
+    const words = taskDisplayLabel(run, 34);
     return `${run.backend}:${words || run.id.slice(0, 12)}`;
 }
 function compact(values) {
