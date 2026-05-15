@@ -138,6 +138,7 @@ impl EffortLevel {
 enum AgentStatus {
     Running,
     Done,
+    Merged,
     Failed,
     Stopped,
 }
@@ -147,6 +148,7 @@ impl AgentStatus {
         match self {
             Self::Running => "running",
             Self::Done => "done",
+            Self::Merged => "merged",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
         }
@@ -962,7 +964,10 @@ impl App {
         if run.needs_permission {
             return false;
         }
-        if matches!(run.status, AgentStatus::Done | AgentStatus::Stopped) {
+        if matches!(
+            run.status,
+            AgentStatus::Done | AgentStatus::Merged | AgentStatus::Stopped
+        ) {
             return true;
         }
         run.terminal.as_ref().is_some_and(|terminal| {
@@ -1985,15 +1990,11 @@ impl App {
         let selected = &self.agents[self.selected_agent];
         if self.delete_pending.as_deref() != Some(&selected.id) {
             self.delete_pending = Some(selected.id.clone());
-            self.notice = Some(
-                if selected.worktree_path.is_some() && has_git_changes(&selected.cwd) {
-                    "worktree has changes: press m to merge, or d again to delete".to_string()
-                } else if selected.worktree_path.is_some() {
-                    "press d again to delete agent and remove its worktree".to_string()
-                } else {
-                    "press d again to delete agent".to_string()
-                },
-            );
+            self.notice = Some(if selected.worktree_path.is_some() {
+                "press d again to delete agent and remove its worktree".to_string()
+            } else {
+                "press d again to delete agent".to_string()
+            });
             return;
         }
 
@@ -2039,6 +2040,7 @@ impl App {
             self.notice = Some("selected agent has no worktree to merge".to_string());
             return;
         }
+        self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::Selected {
                 id: run.id.clone(),
@@ -2065,6 +2067,7 @@ impl App {
             return;
         }
 
+        self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::All { ids: ready.clone() },
         });
@@ -2288,6 +2291,7 @@ impl App {
                 .output();
         }
         if let Some(run) = self.agents.get_mut(index) {
+            run.status = AgentStatus::Merged;
             run.worktree_path = None;
             run.worktree_branch = None;
             let _ = save_native_run_record(&self.cwd, run);
@@ -3612,6 +3616,49 @@ mod app_tests {
     }
 
     #[test]
+    fn merged_status_is_distinct_and_labeled() {
+        assert_eq!(agent_status_from_record(Some("merged")), AgentStatus::Merged);
+        assert_eq!(run_record_status(AgentStatus::Merged), "merged");
+
+        let mut run = test_agent_run("run-1", "test task");
+        run.status = AgentStatus::Merged;
+
+        assert_eq!(agent_status_label(&run), "merged");
+    }
+
+    #[test]
+    fn merge_request_clears_pending_delete() {
+        let mut app = App::new();
+        let mut run = test_agent_run("run-1", "test task");
+        run.status = AgentStatus::Done;
+        run.worktree_branch = Some("rudder/test".to_string());
+        run.worktree_path = Some(app.cwd.join("worktree"));
+        app.agents.push(run);
+        app.delete_pending = Some("run-1".to_string());
+
+        app.request_merge_selected_agent();
+
+        assert!(app.delete_pending.is_none());
+        assert!(app.merge_confirm.is_some());
+    }
+
+    #[test]
+    fn delete_prompt_for_worktree_requires_second_d_without_merge_offer() {
+        let mut app = App::new();
+        let mut run = test_agent_run("run-1", "test task");
+        run.worktree_path = Some(app.cwd.join("worktree"));
+        app.agents.push(run);
+
+        app.delete_selected_agent();
+
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.delete_pending.as_deref(), Some("run-1"));
+        let notice = app.notice.as_deref().unwrap_or_default();
+        assert!(notice.contains("press d again"));
+        assert!(!notice.contains("merge"));
+    }
+
+    #[test]
     fn delete_agent_requires_second_d() {
         let mut app = App::new();
         app.agents.push(AgentRun {
@@ -4815,7 +4862,7 @@ fn is_cloud_agent(agent: &AgentRun) -> bool {
 fn status_color(status: AgentStatus) -> Color {
     match status {
         AgentStatus::Running => RUNNING_COLOR,
-        AgentStatus::Done => DONE_COLOR,
+        AgentStatus::Done | AgentStatus::Merged => DONE_COLOR,
         AgentStatus::Failed => FAILED_COLOR,
         AgentStatus::Stopped => INACTIVE_COLOR,
     }
@@ -6648,7 +6695,8 @@ fn turn_from_json(value: &serde_json::Value) -> Option<AgentTurn> {
 
 fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
     match status {
-        Some("completed") | Some("merged") => AgentStatus::Done,
+        Some("completed") => AgentStatus::Done,
+        Some("merged") => AgentStatus::Merged,
         Some("failed") => AgentStatus::Failed,
         Some("running") | Some("steering") | Some("verifying") | Some("created") => {
             AgentStatus::Stopped
@@ -6662,6 +6710,7 @@ fn run_record_status(status: AgentStatus) -> &'static str {
     match status {
         AgentStatus::Running => "running",
         AgentStatus::Done => "completed",
+        AgentStatus::Merged => "merged",
         AgentStatus::Failed => "failed",
         AgentStatus::Stopped => "cancelled",
     }
