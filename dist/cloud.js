@@ -96,6 +96,9 @@ export async function runCloudCommand(command, args, options = {}) {
         case "ls":
             await listSails(options);
             return;
+        case "status":
+            await status(options);
+            return;
         case "onload":
             await onload(rest, options);
             return;
@@ -384,6 +387,45 @@ async function listSails(options) {
     const client = await cloudClient({ requireToken: true });
     const result = await client.request("/api/rudder/sail", { method: "GET" });
     await printResult(result, options);
+}
+async function status(options) {
+    const client = await cloudClient({ requireToken: true });
+    const state = await loadCloudAuth();
+    const runtime = await selectedCloudRuntime();
+    const sails = await client.request("/api/rudder/sail", { method: "GET" });
+    const sailRows = Array.isArray(sails)
+        ? sails
+        : sails && typeof sails === "object" && !Array.isArray(sails) && Array.isArray(sails.sails)
+            ? sails.sails
+            : [];
+    const sailCount = sailRows.length;
+    const result = {
+        ok: true,
+        cloudUrl: client.baseUrl,
+        runtime,
+        sails: sailCount,
+    };
+    if (state?.cloudUrl === client.baseUrl) {
+        if (state.email) {
+            result.email = state.email;
+        }
+        if (state.accountId) {
+            result.accountId = state.accountId;
+        }
+        if (state.byocSshHost) {
+            result.byocSshHost = state.byocSshHost;
+        }
+    }
+    if (options.json) {
+        printJson(result);
+        return;
+    }
+    console.log(`Logged in to ${client.baseUrl}${state?.email ? ` as ${state.email}` : ""}.`);
+    console.log(`Runtime: ${runtime}`);
+    if (state?.byocSshHost) {
+        console.log(`BYOC SSH host: ${state.byocSshHost}`);
+    }
+    console.log(`Cloud workers: ${sailCount}`);
 }
 async function bootstrap(args, options) {
     const sailId = args[0];
