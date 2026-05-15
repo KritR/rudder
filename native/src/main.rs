@@ -1166,6 +1166,14 @@ impl App {
             return false;
         };
 
+        let alternate_screen = terminal.uses_alternate_screen();
+        if alternate_screen {
+            if terminal.wants_sgr_mouse_events() {
+                return self.write_scroll_to_selected_worker(mouse, area);
+            }
+            return self.write_scroll_key_to_selected_worker(mouse);
+        }
+
         let before = terminal.scrollback();
         terminal.scrollback_by(rows);
         let after = terminal.scrollback();
@@ -1173,7 +1181,24 @@ impl App {
             return true;
         }
 
-        self.write_scroll_to_selected_worker(mouse, area)
+        if terminal.wants_sgr_mouse_events() {
+            return self.write_scroll_to_selected_worker(mouse, area);
+        }
+        self.write_scroll_key_to_selected_worker(mouse)
+    }
+
+    fn write_scroll_key_to_selected_worker(&mut self, mouse: MouseEvent) -> bool {
+        let Some(bytes) = scroll_key_bytes(mouse) else {
+            return false;
+        };
+        let result = match self.selected_terminal_mut() {
+            Some(terminal) => terminal.write_input(&bytes),
+            None => return false,
+        };
+        if let Err(error) = result {
+            self.set_selected_error(error.to_string());
+        }
+        true
     }
 
     fn write_mouse_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
@@ -2480,6 +2505,7 @@ mod app_tests {
             modifiers: KeyModifiers::empty(),
         };
         assert_eq!(mouse_scrollback_delta(down, 30), -10);
+        assert_eq!(scroll_key_bytes(down), Some(b"\x1b[6~".to_vec()));
     }
 
     #[test]
@@ -3797,6 +3823,16 @@ fn terminal_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize
 
 fn review_scroll_steps(viewport_height: u16, modifiers: KeyModifiers) -> usize {
     terminal_scroll_steps(viewport_height, modifiers)
+}
+
+fn scroll_key_bytes(mouse: MouseEvent) -> Option<Vec<u8>> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(b"\x1b[5~".to_vec()),
+        MouseEventKind::ScrollDown => Some(b"\x1b[6~".to_vec()),
+        MouseEventKind::ScrollLeft => Some(b"\x1b[1;5D".to_vec()),
+        MouseEventKind::ScrollRight => Some(b"\x1b[1;5C".to_vec()),
+        _ => None,
+    }
 }
 
 fn page_scroll_rows(area: Option<Rect>) -> isize {
