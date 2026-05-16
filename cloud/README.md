@@ -34,7 +34,7 @@ worker command for the user's server.
 Current hosted control plane:
 
 ```text
-https://mpd2pmnpep.us-east-1.awsapprunner.com
+https://rudder-cloud-control.fly.dev
 ```
 
 Current Exla defaults:
@@ -59,8 +59,8 @@ Generated AWS secrets:
 - `rudder/fly-api-token`
 
 Google/GitHub OAuth client IDs and client secrets still need to be created in
-the provider consoles and added as App Runner secrets before the hosted login
-flow can go live.
+the provider consoles and added as Fly secrets before the hosted login flow
+can go live.
 
 Until provider OAuth clients are installed, login still works through an
 already-authenticated GitHub CLI or GitHub's device flow. `rudder login` sends
@@ -73,8 +73,8 @@ GitHub browser OAuth can be configured from the hosted setup page without
 copying secrets by hand:
 
 ```text
-https://mpd2pmnpep.us-east-1.awsapprunner.com/setup/github
-https://mpd2pmnpep.us-east-1.awsapprunner.com/setup/github?org=exla
+https://rudder-cloud-control.fly.dev/setup/github
+https://rudder-cloud-control.fly.dev/setup/github?org=exla
 ```
 
 That page uses GitHub's App Manifest flow to create a GitHub App, receives the
@@ -98,7 +98,7 @@ Google browser OAuth can be installed the same way after creating an OAuth web
 client with this redirect URI:
 
 ```text
-https://mpd2pmnpep.us-east-1.awsapprunner.com/api/auth/callback/google
+https://rudder-cloud-control.fly.dev/api/auth/callback/google
 ```
 
 ```bash
@@ -145,20 +145,29 @@ not receive AWS credentials.
 
 The control plane also persists its SQLite state to S3 at
 `RUDDER_CLOUD_STATE_KEY` by default. That keeps CLI tokens, sail records, worker
-heartbeats, and Better Auth tables available across App Runner restarts without
-requiring a database server for the early deployment. Set
-`RUDDER_CLOUD_PERSIST_STATE=0` to disable that behavior for local development.
+heartbeats, and Better Auth tables available across control-plane restarts
+without requiring a database server. Set `RUDDER_CLOUD_PERSIST_STATE=0` to
+disable that behavior for local development.
 
-The intended AWS shape is:
+## Hosting
 
-- container image in ECR
-- App Runner service for the control plane
-- S3 bucket for encrypted snapshot objects and persisted control-plane state
-- secrets stored in AWS Secrets Manager or App Runner environment secrets
+The control plane runs on a single Fly Machine in the `rudder-cloud-control`
+app. WebSocket Upgrade is required for `cloud attach`, so the host must not
+strip Upgrade headers. The Fly Machines API is used for both this app and the
+worker app, but they are separate apps — the control plane reads
+`RUDDER_FLY_APP_NAME` (workers app, e.g. `rudder-workers-exla`) rather than
+`FLY_APP_NAME`, which Fly auto-injects with the running app's own name.
 
-Build and push the image, then create or update the App Runner service with the
-environment above. The sample App Runner shape lives in
-`infra/apprunner-service.json`.
+Deploy with:
+
+```bash
+cd cloud
+flyctl deploy --remote-only
+```
+
+`fly.toml` carries the env block; secrets (`BETTER_AUTH_SECRET`,
+`FLY_API_TOKEN`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_SECRET`,
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) live in `flyctl secrets`.
 
 ## Fly Machines
 

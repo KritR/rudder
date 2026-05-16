@@ -90,7 +90,7 @@ rudder sail staging-worker
 ```
 
 By default the CLI points at the hosted Rudder Cloud control plane:
-`https://mpd2pmnpep.us-east-1.awsapprunner.com`. Set `RUDDER_CLOUD_URL` to
+`https://rudder-cloud-control.fly.dev`. Set `RUDDER_CLOUD_URL` to
 override it for local development or another deployment.
 
 Inside the dashboard, `/login` starts browser auth and `/cloud list` lists
