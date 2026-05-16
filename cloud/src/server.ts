@@ -1978,25 +1978,30 @@ async function reuseOrRestartWorkspace(
       { method: "GET" },
     ).catch(() => null);
   }
-  if (machine && machine.state && machine.state !== "destroyed" && machine.state !== "destroying") {
-    if (machine.state !== "started" && machine.state !== "starting") {
-      machine = await flyRequest<FlyMachine>(
-        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId!)}/start`,
-        { method: "POST", body: {} },
-      ).catch(() => machine);
-    }
-    const status = flyStateToWorkspaceStatus(machine?.state);
+  // Only reuse a machine that is currently running. Stopped/suspended
+  // machines hold a stale (presigned, 1-hour-expiring) snapshot URL in their
+  // env, so trying to start them again hits a 403 from S3 and the supervisor
+  // crashes. Tear down anything that isn't already running and create a fresh
+  // machine with a freshly-signed snapshot URL.
+  if (machine && (machine.state === "started" || machine.state === "starting")) {
+    const status = flyStateToWorkspaceStatus(machine.state);
     const now = new Date().toISOString();
     updateWorkspaceMachine.run({
       id: workspace.id,
       status,
-      machineId: machine?.id ?? workspace.machineId ?? null,
-      machineState: machine?.state ?? null,
+      machineId: machine.id ?? workspace.machineId ?? null,
+      machineState: machine.state ?? null,
       updatedAt: now,
     });
     updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
     const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
     return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
+  }
+  if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
+    await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
+      { method: "DELETE" },
+    ).catch(() => null);
   }
   const snapshotInput = objectField(body, "snapshot");
   const snapshotKey = snapshotInput
