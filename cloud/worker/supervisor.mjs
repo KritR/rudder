@@ -14,24 +14,41 @@ import pty from "node-pty";
 
 const cloudUrl = (process.env.RUDDER_CLOUD_URL || "").trim();
 const sailId = (process.env.RUDDER_SAIL_ID || "").trim();
+const workspaceId = (process.env.RUDDER_WORKSPACE_ID || "").trim();
 const workerToken = (process.env.RUDDER_WORKER_TOKEN || "").trim();
 const snapshotUrl = (process.env.RUDDER_SNAPSHOT_URL || "").trim();
 const repoName = (process.env.RUDDER_REPO_NAME || "repo").trim() || "repo";
 const task = process.env.RUDDER_TASK || "";
 
-if (!snapshotUrl) {
-  console.error("RUDDER_SNAPSHOT_URL is required");
+const isWorkspaceMode = Boolean(workspaceId);
+const sessionId = isWorkspaceMode ? workspaceId : sailId;
+const sessionKind = isWorkspaceMode ? "workspace" : "sail";
+
+if (!sessionId) {
+  console.error("RUDDER_WORKSPACE_ID or RUDDER_SAIL_ID is required");
   process.exit(2);
 }
 
-stageSnapshot();
+if (alreadyStaged()) {
+  console.log(`Rudder worker re-using staged workspace`);
+  chdirToStagedWorkdir();
+} else {
+  if (!snapshotUrl) {
+    console.error("RUDDER_SNAPSHOT_URL is required for first start");
+    process.exit(2);
+  }
+  stageSnapshot();
+  markStaged();
+}
 
 const cwd = process.cwd();
 console.log(`Rudder worker ready in ${cwd}`);
 sh("rudder doctor || true");
 
 const command = "rudder";
-const args = task ? ["codex", "--worktree", task] : [];
+const args = isWorkspaceMode
+  ? []
+  : task ? ["codex", "--worktree", task] : [];
 
 const term = pty.spawn(command, args, {
   name: "xterm-256color",
@@ -86,11 +103,11 @@ process.on("SIGINT", () => {
 });
 
 function connect() {
-  if (!cloudUrl || !sailId || !workerToken) {
+  if (!cloudUrl || !sessionId || !workerToken) {
     return Promise.resolve(null);
   }
   const wsUrl = cloudUrl.replace(/^http/, "ws").replace(/\/$/, "")
-    + `/api/rudder/sail/${encodeURIComponent(sailId)}/worker`;
+    + `/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/worker`;
   return new Promise((resolve) => {
     let connected = false;
     const socket = new WebSocket(wsUrl, {
@@ -104,7 +121,8 @@ function connect() {
         type: "hello",
         cols: term.cols,
         rows: term.rows,
-        sailId,
+        sessionKind,
+        sessionId,
       }));
       resolve(socket);
     });
@@ -165,6 +183,35 @@ function handleControl(text) {
   }
 }
 
+function stagedMarkerPath() {
+  return path.join("/workspace", ".rudder-staged.json");
+}
+
+function alreadyStaged() {
+  try {
+    const raw = fs.readFileSync(stagedMarkerPath(), "utf8");
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.workdir === "string" && fs.existsSync(parsed.workdir);
+  } catch {
+    return false;
+  }
+}
+
+function chdirToStagedWorkdir() {
+  const raw = fs.readFileSync(stagedMarkerPath(), "utf8");
+  const parsed = JSON.parse(raw);
+  process.chdir(parsed.workdir);
+}
+
+function markStaged() {
+  try {
+    const payload = { workdir: process.cwd(), stagedAt: new Date().toISOString() };
+    fs.writeFileSync(stagedMarkerPath(), JSON.stringify(payload));
+  } catch {
+    // ignore
+  }
+}
+
 function stageSnapshot() {
   fs.mkdirSync("/workspace", { recursive: true });
   process.chdir("/workspace");
@@ -197,12 +244,15 @@ function stageSnapshot() {
   }
 }
 
+function heartbeatUrl() {
+  return `${cloudUrl.replace(/\/$/, "")}/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/heartbeat`;
+}
+
 function reportHeartbeat() {
-  if (!cloudUrl || !sailId || !workerToken) {
+  if (!cloudUrl || !sessionId || !workerToken) {
     return;
   }
-  const url = `${cloudUrl.replace(/\/$/, "")}/api/rudder/sail/${encodeURIComponent(sailId)}/heartbeat`;
-  fetch(url, {
+  fetch(heartbeatUrl(), {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -214,12 +264,11 @@ function reportHeartbeat() {
 
 function reportDone(state, code) {
   lastReportedState = state;
-  if (!cloudUrl || !sailId || !workerToken) {
+  if (!cloudUrl || !sessionId || !workerToken) {
     return;
   }
-  const url = `${cloudUrl.replace(/\/$/, "")}/api/rudder/sail/${encodeURIComponent(sailId)}/heartbeat`;
   // best-effort fire-and-forget; we exit shortly after
-  fetch(url, {
+  fetch(heartbeatUrl(), {
     method: "POST",
     headers: {
       "content-type": "application/json",

@@ -1,3 +1,11 @@
+FROM rust:1-bookworm AS native-builder
+WORKDIR /src
+COPY native ./native
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release --manifest-path native/Cargo.toml \
+  && cp target/release/rudder-native /rudder-native \
+  || cp native/target/release/rudder-native /rudder-native
+
 FROM node:22-slim
 
 RUN apt-get update \
@@ -14,7 +22,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY dist ./dist
 COPY assets ./assets
-RUN npm link
+COPY --from=native-builder /rudder-native ./dist/native/rudder-native
+RUN chmod +x ./dist/native/rudder-native && npm link
 
 WORKDIR /opt/rudder-worker
 COPY cloud/worker/package.json ./package.json

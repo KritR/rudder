@@ -53,6 +53,23 @@ type Sail = {
   bootstrapCommand?: string;
 };
 
+type WorkspaceStatus = "queued" | "running" | "paused" | "stopped" | "failed";
+
+type Workspace = {
+  id: string;
+  accountId: string;
+  workspaceKey: string;
+  repoName?: string;
+  status: WorkspaceStatus;
+  machineId?: string;
+  machineState?: string;
+  snapshotKey?: string;
+  lastActivityAt?: string;
+  lastHeartbeatAt?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type FlyMachine = {
   id?: string;
   name?: string;
@@ -169,6 +186,22 @@ database.exec(`
     value text not null,
     updated_at text not null
   );
+  create table if not exists rudder_workspaces (
+    id text primary key,
+    account_id text not null,
+    workspace_key text not null,
+    repo_name text,
+    status text not null,
+    machine_id text,
+    machine_state text,
+    snapshot_key text,
+    worker_token_hash text,
+    last_activity_at text,
+    last_heartbeat_at text,
+    created_at text not null,
+    updated_at text not null,
+    unique(account_id, workspace_key)
+  );
 `);
 ensureColumn("rudder_sails", "worker_token_hash", "text");
 ensureColumn("rudder_sails", "last_heartbeat_at", "text");
@@ -215,6 +248,63 @@ const updateWorkerToken = database.prepare(`
   set worker_token_hash = @workerTokenHash,
       updated_at = @updatedAt
   where id = @id and account_id = @accountId
+`);
+const insertWorkspace = database.prepare(`
+  insert into rudder_workspaces (
+    id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
+    snapshot_key, worker_token_hash, last_activity_at, last_heartbeat_at, created_at, updated_at
+  ) values (
+    @id, @accountId, @workspaceKey, @repoName, @status, @machineId, @machineState,
+    @snapshotKey, @workerTokenHash, @lastActivityAt, @lastHeartbeatAt, @createdAt, @updatedAt
+  )
+`);
+const findWorkspaceByKey = database.prepare(
+  "select * from rudder_workspaces where account_id = ? and workspace_key = ?",
+);
+const findWorkspaceById = database.prepare("select * from rudder_workspaces where id = ?");
+const findWorkspaceForAccount = database.prepare(
+  "select * from rudder_workspaces where id = ? and account_id = ?",
+);
+const listWorkspacesForAccount = database.prepare(
+  "select * from rudder_workspaces where account_id = ? order by updated_at desc limit 100",
+);
+const listAllRunningWorkspaces = database.prepare(
+  "select * from rudder_workspaces where status in ('running','paused','queued')",
+);
+const updateWorkspaceMachine = database.prepare(`
+  update rudder_workspaces
+  set status = @status,
+      machine_id = @machineId,
+      machine_state = @machineState,
+      updated_at = @updatedAt
+  where id = @id
+`);
+const updateWorkspaceSnapshot = database.prepare(`
+  update rudder_workspaces
+  set snapshot_key = @snapshotKey,
+      updated_at = @updatedAt
+  where id = @id
+`);
+const updateWorkspaceWorkerToken = database.prepare(`
+  update rudder_workspaces
+  set worker_token_hash = @workerTokenHash,
+      updated_at = @updatedAt
+  where id = @id
+`);
+const updateWorkspaceActivity = database.prepare(`
+  update rudder_workspaces
+  set last_activity_at = @lastActivityAt,
+      updated_at = @updatedAt
+  where id = @id
+`);
+const updateWorkspaceHeartbeat = database.prepare(`
+  update rudder_workspaces
+  set status = @status,
+      machine_state = @machineState,
+      last_heartbeat_at = @lastHeartbeatAt,
+      last_activity_at = @lastActivityAt,
+      updated_at = @updatedAt
+  where id = @id
 `);
 const getSetting = database.prepare("select value from rudder_settings where key = ?");
 const upsertSetting = database.prepare(`
@@ -305,6 +395,10 @@ const server = http.createServer(async (req, res) => {
       await handleSailApi(req, res, url);
       return;
     }
+    if (url.pathname.startsWith("/api/rudder/workspace")) {
+      await handleWorkspaceApi(req, res, url);
+      return;
+    }
     renderHome(res);
   } catch (error) {
     const status = error && typeof error === "object" && "status" in error && typeof error.status === "number"
@@ -315,61 +409,114 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-const ATTACH_PATH_RE = /^\/api\/rudder\/sail\/([^/]+)\/(worker|attach)$/;
-const SAIL_REPLAY_BYTES = 256 * 1024;
+const SAIL_ATTACH_PATH_RE = /^\/api\/rudder\/sail\/([^/]+)\/(worker|attach)$/;
+const WORKSPACE_ATTACH_PATH_RE = /^\/api\/rudder\/workspace\/([^/]+)\/(worker|attach)$/;
+const REPLAY_BUFFER_BYTES = 256 * 1024;
 
-type SailChannel = {
+type Channel = {
   worker?: WebSocket;
   clients: Set<WebSocket>;
   buffer: Buffer[];
   bufferBytes: number;
 };
 
-const sailChannels = new Map<string, SailChannel>();
+type ChannelKind = "sail" | "workspace";
+
+const sailChannels = new Map<string, Channel>();
+const workspaceChannels = new Map<string, Channel>();
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
   try {
     const url = new URL(req.url || "/", baseURL);
-    const match = ATTACH_PATH_RE.exec(url.pathname);
-    if (!match) {
-      destroyUpgrade(socket, 404);
+    const sailMatch = SAIL_ATTACH_PATH_RE.exec(url.pathname);
+    if (sailMatch) {
+      handleSailUpgrade(req, socket, head, sailMatch[1], sailMatch[2] as "worker" | "attach");
       return;
     }
-    const sailId = match[1];
-    const role = match[2] as "worker" | "attach";
-    const sailRow = findSailById.get(sailId) as Record<string, unknown> | undefined;
-    if (!sailRow) {
-      destroyUpgrade(socket, 404);
+    const workspaceMatch = WORKSPACE_ATTACH_PATH_RE.exec(url.pathname);
+    if (workspaceMatch) {
+      handleWorkspaceUpgrade(req, socket, head, workspaceMatch[1], workspaceMatch[2] as "worker" | "attach");
       return;
     }
-    if (role === "worker") {
-      try {
-        requireWorkerBearer(req, sailRow);
-      } catch {
-        destroyUpgrade(socket, 401);
-        return;
-      }
-      wss.handleUpgrade(req, socket, head, (ws) => attachWorker(sailId, ws));
-      return;
-    }
-    let auth;
-    try {
-      auth = requireBearer(req);
-    } catch {
-      destroyUpgrade(socket, 401);
-      return;
-    }
-    if (String(sailRow.account_id) !== auth.accountId) {
-      destroyUpgrade(socket, 403);
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => attachClient(sailId, ws));
+    destroyUpgrade(socket, 404);
   } catch {
     destroyUpgrade(socket, 500);
   }
 });
+
+function handleSailUpgrade(
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  sailId: string,
+  role: "worker" | "attach",
+): void {
+  const sailRow = findSailById.get(sailId) as Record<string, unknown> | undefined;
+  if (!sailRow) {
+    destroyUpgrade(socket, 404);
+    return;
+  }
+  if (role === "worker") {
+    try {
+      requireWorkerBearer(req, sailRow);
+    } catch {
+      destroyUpgrade(socket, 401);
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => attachWorker("sail", sailId, ws));
+    return;
+  }
+  let auth;
+  try {
+    auth = requireBearer(req);
+  } catch {
+    destroyUpgrade(socket, 401);
+    return;
+  }
+  if (String(sailRow.account_id) !== auth.accountId) {
+    destroyUpgrade(socket, 403);
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => attachClient("sail", sailId, ws));
+}
+
+function handleWorkspaceUpgrade(
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  workspaceId: string,
+  role: "worker" | "attach",
+): void {
+  const workspaceRow = findWorkspaceById.get(workspaceId) as Record<string, unknown> | undefined;
+  if (!workspaceRow) {
+    destroyUpgrade(socket, 404);
+    return;
+  }
+  if (role === "worker") {
+    try {
+      requireWorkerBearer(req, workspaceRow);
+    } catch {
+      destroyUpgrade(socket, 401);
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => attachWorker("workspace", workspaceId, ws));
+    return;
+  }
+  let auth;
+  try {
+    auth = requireBearer(req);
+  } catch {
+    destroyUpgrade(socket, 401);
+    return;
+  }
+  if (String(workspaceRow.account_id) !== auth.accountId) {
+    destroyUpgrade(socket, 403);
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => attachClient("workspace", workspaceId, ws));
+}
 
 function destroyUpgrade(socket: Duplex, status: number): void {
   const reason = status === 401 ? "Unauthorized"
@@ -384,27 +531,33 @@ function destroyUpgrade(socket: Duplex, status: number): void {
   socket.destroy();
 }
 
-function getChannel(sailId: string): SailChannel {
-  let channel = sailChannels.get(sailId);
+function channelMap(kind: ChannelKind): Map<string, Channel> {
+  return kind === "workspace" ? workspaceChannels : sailChannels;
+}
+
+function getChannel(kind: ChannelKind, id: string): Channel {
+  const map = channelMap(kind);
+  let channel = map.get(id);
   if (!channel) {
     channel = { clients: new Set(), buffer: [], bufferBytes: 0 };
-    sailChannels.set(sailId, channel);
+    map.set(id, channel);
   }
   return channel;
 }
 
-function disposeChannelIfEmpty(sailId: string): void {
-  const channel = sailChannels.get(sailId);
+function disposeChannelIfEmpty(kind: ChannelKind, id: string): void {
+  const map = channelMap(kind);
+  const channel = map.get(id);
   if (!channel) {
     return;
   }
   if (!channel.worker && channel.clients.size === 0) {
-    sailChannels.delete(sailId);
+    map.delete(id);
   }
 }
 
-function attachWorker(sailId: string, ws: WebSocket): void {
-  const channel = getChannel(sailId);
+function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
+  const channel = getChannel(kind, id);
   if (channel.worker && channel.worker.readyState === WebSocket.OPEN) {
     try {
       channel.worker.close(4000, "replaced");
@@ -438,14 +591,17 @@ function attachWorker(sailId: string, ws: WebSocket): void {
       channel.worker = undefined;
     }
     broadcastStatus(channel, "worker-disconnected");
-    disposeChannelIfEmpty(sailId);
+    disposeChannelIfEmpty(kind, id);
   });
   ws.on("error", () => undefined);
 }
 
-function attachClient(sailId: string, ws: WebSocket): void {
-  const channel = getChannel(sailId);
+function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
+  const channel = getChannel(kind, id);
   channel.clients.add(ws);
+  if (kind === "workspace") {
+    touchWorkspaceActivity(id);
+  }
 
   ws.send(JSON.stringify({
     type: "status",
@@ -464,6 +620,9 @@ function attachClient(sailId: string, ws: WebSocket): void {
     }
     if (isBinary && data instanceof Buffer) {
       worker.send(data, { binary: true });
+      if (kind === "workspace") {
+        touchWorkspaceActivity(id);
+      }
       return;
     }
     if (data instanceof Buffer) {
@@ -473,15 +632,15 @@ function attachClient(sailId: string, ws: WebSocket): void {
 
   ws.on("close", () => {
     channel.clients.delete(ws);
-    disposeChannelIfEmpty(sailId);
+    disposeChannelIfEmpty(kind, id);
   });
   ws.on("error", () => undefined);
 }
 
-function pushBuffer(channel: SailChannel, chunk: Buffer): void {
+function pushBuffer(channel: Channel, chunk: Buffer): void {
   channel.buffer.push(chunk);
   channel.bufferBytes += chunk.length;
-  while (channel.bufferBytes > SAIL_REPLAY_BYTES && channel.buffer.length > 1) {
+  while (channel.bufferBytes > REPLAY_BUFFER_BYTES && channel.buffer.length > 1) {
     const dropped = channel.buffer.shift();
     if (dropped) {
       channel.bufferBytes -= dropped.length;
@@ -489,7 +648,7 @@ function pushBuffer(channel: SailChannel, chunk: Buffer): void {
   }
 }
 
-function forwardTextToClients(channel: SailChannel, text: string): void {
+function forwardTextToClients(channel: Channel, text: string): void {
   for (const client of channel.clients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(text);
@@ -497,12 +656,21 @@ function forwardTextToClients(channel: SailChannel, text: string): void {
   }
 }
 
-function broadcastStatus(channel: SailChannel, state: string): void {
+function broadcastStatus(channel: Channel, state: string): void {
   const payload = JSON.stringify({ type: "status", state });
   for (const client of channel.clients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
     }
+  }
+}
+
+function touchWorkspaceActivity(workspaceId: string): void {
+  try {
+    const now = new Date().toISOString();
+    updateWorkspaceActivity.run({ id: workspaceId, lastActivityAt: now, updatedAt: now });
+  } catch {
+    // ignore
   }
 }
 
@@ -516,6 +684,52 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       process.exit(signal === "SIGINT" ? 130 : 143);
     });
   });
+}
+
+const workspaceIdleMs = Number(process.env.RUDDER_WORKSPACE_IDLE_MS || 30 * 60 * 1000);
+const workspaceSweepIntervalMs = Number(process.env.RUDDER_WORKSPACE_SWEEP_MS || 60 * 1000);
+if (workspaceIdleMs >= 60 * 1000 && workspaceSweepIntervalMs >= 10 * 1000) {
+  const timer = setInterval(() => {
+    void sweepIdleWorkspaces().catch(() => undefined);
+  }, workspaceSweepIntervalMs);
+  timer.unref?.();
+}
+
+async function sweepIdleWorkspaces(): Promise<void> {
+  if (!flyApiToken || !flyAppName) {
+    return;
+  }
+  const rows = listAllRunningWorkspaces.all() as Record<string, unknown>[];
+  const now = Date.now();
+  for (const row of rows) {
+    const workspace = rowToWorkspace(row);
+    if (!workspace.machineId) {
+      continue;
+    }
+    if (workspaceChannels.get(workspace.id)?.clients.size) {
+      continue;
+    }
+    const last = workspace.lastActivityAt ?? workspace.lastHeartbeatAt ?? workspace.updatedAt;
+    const lastMs = Date.parse(last);
+    if (!Number.isFinite(lastMs) || now - lastMs < workspaceIdleMs) {
+      continue;
+    }
+    try {
+      await flyRequest<FlyMachine>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/stop`,
+        { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
+      );
+      updateWorkspaceMachine.run({
+        id: workspace.id,
+        status: "stopped",
+        machineId: workspace.machineId,
+        machineState: "stopping",
+        updatedAt: new Date().toISOString(),
+      });
+    } catch {
+      // ignore; will retry next sweep
+    }
+  }
 }
 
 let persistTimer: NodeJS.Timeout | undefined;
@@ -1226,6 +1440,38 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
   sendJson(res, 404, { error: "not found" });
 }
 
+async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const heartbeatMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/heartbeat$/);
+  if (req.method === "POST" && heartbeatMatch) {
+    await handleWorkspaceHeartbeat(req, res, heartbeatMatch[1]);
+    return;
+  }
+
+  const authContext = requireBearer(req);
+  if (req.method === "GET" && url.pathname === "/api/rudder/workspace") {
+    sendJson(res, 200, { workspaces: listAccountWorkspaces(authContext.accountId) });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/rudder/workspace/attach") {
+    const body = await readJsonBody(req);
+    const result = await ensureWorkspaceForAttach(authContext.accountId, body);
+    sendJson(res, 200, result);
+    return;
+  }
+  const stopMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/(stop|pause|resume)$/);
+  if (req.method === "POST" && stopMatch) {
+    const workspace = getAccountWorkspace(stopMatch[1], authContext.accountId);
+    if (!workspace) {
+      sendJson(res, 404, { error: "workspace not found" });
+      return;
+    }
+    const next = await mutateWorkspace(workspace, stopMatch[2]);
+    sendJson(res, 200, next);
+    return;
+  }
+  sendJson(res, 404, { error: "not found" });
+}
+
 async function createSail(accountId: string, body: Json, preferredId?: string): Promise<Sail> {
   const runtime = sailRuntimeFromBody(body);
   ensureCloudRuntimeConfigured(runtime);
@@ -1627,6 +1873,308 @@ function shouldPauseStaleSail(sail: Sail): boolean {
   const heartbeatOrCreated = sail.lastHeartbeatAt ?? sail.createdAt;
   const lastSeen = Date.parse(heartbeatOrCreated);
   return Number.isFinite(lastSeen) && Date.now() - lastSeen > idlePauseMs;
+}
+
+async function ensureWorkspaceForAttach(accountId: string, body: Json): Promise<JsonRecord> {
+  ensureCloudRuntimeConfigured("fly");
+  const workspaceKey = stringField(body, "workspaceKey");
+  if (!workspaceKey || workspaceKey.length < 4 || workspaceKey.length > 128) {
+    throw badRequest("workspaceKey is required (4-128 chars)");
+  }
+  const repoName = stringField(body, "repoName");
+  const existingRow = findWorkspaceByKey.get(accountId, workspaceKey) as Record<string, unknown> | undefined;
+  if (existingRow) {
+    const existing = rowToWorkspace(existingRow);
+    return await reuseOrRestartWorkspace(existing, body, repoName);
+  }
+  return await createWorkspace(accountId, workspaceKey, body, repoName);
+}
+
+async function createWorkspace(
+  accountId: string,
+  workspaceKey: string,
+  body: Json,
+  repoName: string | undefined,
+): Promise<JsonRecord> {
+  const snapshot = await storeSnapshot(accountId, body);
+  const now = new Date().toISOString();
+  const id = uniqueWorkspaceId(repoName);
+  const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
+  insertWorkspace.run({
+    id,
+    accountId,
+    workspaceKey,
+    repoName: repoName ?? null,
+    status: "queued",
+    machineId: null,
+    machineState: null,
+    snapshotKey: snapshot.key,
+    workerTokenHash: tokenHash(workerToken),
+    lastActivityAt: now,
+    lastHeartbeatAt: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const snapshotUrl = await signedSnapshotUrl(snapshot.key);
+  const machine = await createFlyWorkspaceMachine({
+    workspaceId: id,
+    accountId,
+    snapshotUrl,
+    workerToken,
+    repoName,
+  });
+  const status = flyStateToWorkspaceStatus(machine.state);
+  updateWorkspaceMachine.run({
+    id,
+    status,
+    machineId: machine.id ?? null,
+    machineState: machine.state ?? null,
+    updatedAt: new Date().toISOString(),
+  });
+  const workspace = (findWorkspaceById.get(id) as Record<string, unknown> | undefined);
+  const result = workspace ? rowToWorkspace(workspace) : {
+    id,
+    accountId,
+    workspaceKey,
+    repoName,
+    status,
+    machineId: machine.id,
+    machineState: machine.state,
+    snapshotKey: snapshot.key,
+    createdAt: now,
+    updatedAt: now,
+  } as Workspace;
+  return { ...result, isNew: true } as unknown as JsonRecord;
+}
+
+async function reuseOrRestartWorkspace(
+  workspace: Workspace,
+  body: Json,
+  repoName: string | undefined,
+): Promise<JsonRecord> {
+  ensureFlyConfigured();
+  let machine: FlyMachine | null = null;
+  if (workspace.machineId) {
+    machine = await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}`,
+      { method: "GET" },
+    ).catch(() => null);
+  }
+  if (machine && machine.state && machine.state !== "destroyed" && machine.state !== "destroying") {
+    if (machine.state !== "started" && machine.state !== "starting") {
+      machine = await flyRequest<FlyMachine>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId!)}/start`,
+        { method: "POST", body: {} },
+      ).catch(() => machine);
+    }
+    const status = flyStateToWorkspaceStatus(machine?.state);
+    const now = new Date().toISOString();
+    updateWorkspaceMachine.run({
+      id: workspace.id,
+      status,
+      machineId: machine?.id ?? workspace.machineId ?? null,
+      machineState: machine?.state ?? null,
+      updatedAt: now,
+    });
+    updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+    const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
+    return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
+  }
+  const snapshotInput = objectField(body, "snapshot");
+  const snapshotKey = snapshotInput
+    ? (await storeSnapshot(workspace.accountId, body)).key
+    : workspace.snapshotKey;
+  if (!snapshotKey) {
+    throw badRequest("snapshot is required to restart this workspace");
+  }
+  const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
+  const now = new Date().toISOString();
+  updateWorkspaceSnapshot.run({ id: workspace.id, snapshotKey, updatedAt: now });
+  updateWorkspaceWorkerToken.run({ id: workspace.id, workerTokenHash: tokenHash(workerToken), updatedAt: now });
+  const snapshotUrl = await signedSnapshotUrl(snapshotKey);
+  const fresh = await createFlyWorkspaceMachine({
+    workspaceId: workspace.id,
+    accountId: workspace.accountId,
+    snapshotUrl,
+    workerToken,
+    repoName: repoName ?? workspace.repoName,
+  });
+  const status = flyStateToWorkspaceStatus(fresh.state);
+  updateWorkspaceMachine.run({
+    id: workspace.id,
+    status,
+    machineId: fresh.id ?? null,
+    machineState: fresh.state ?? null,
+    updatedAt: new Date().toISOString(),
+  });
+  updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+  const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
+  return { ...(next ? rowToWorkspace(next) : workspace), isNew: true } as unknown as JsonRecord;
+}
+
+async function createFlyWorkspaceMachine(params: {
+  workspaceId: string;
+  accountId: string;
+  snapshotUrl: string;
+  workerToken: string;
+  repoName?: string;
+}): Promise<FlyMachine> {
+  ensureFlyConfigured();
+  const machine = await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
+    method: "POST",
+    body: {
+      name: `rudder-ws-${params.workspaceId}`,
+      region: flyRegion,
+      config: {
+        image: flyWorkerImage,
+        env: {
+          RUDDER_WORKSPACE_ID: params.workspaceId,
+          RUDDER_ACCOUNT_ID: params.accountId,
+          RUDDER_CLOUD_URL: baseURL,
+          RUDDER_WORKER_TOKEN: params.workerToken,
+          RUDDER_SNAPSHOT_URL: params.snapshotUrl,
+          RUDDER_REPO_NAME: params.repoName || "",
+        },
+        guest: {
+          cpu_kind: flyWorkerCpuKind,
+          cpus: flyWorkerCpus,
+          memory_mb: flyWorkerMemoryMb,
+        },
+        restart: { policy: "no" },
+        auto_destroy: false,
+      },
+    },
+  });
+  if (!machine.id) {
+    return machine;
+  }
+  return await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machine.id)}/start`,
+    { method: "POST", body: {} },
+  ).catch(() => machine);
+}
+
+async function mutateWorkspace(workspace: Workspace, action: string): Promise<Workspace> {
+  if (!workspace.machineId) {
+    throw badRequest("workspace does not have a Fly machine yet");
+  }
+  let machine: FlyMachine;
+  if (action === "stop" || action === "pause") {
+    machine = await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/stop`,
+      { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
+    );
+  } else if (action === "resume") {
+    machine = await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/start`,
+      { method: "POST", body: {} },
+    );
+  } else {
+    throw badRequest(`unsupported workspace action: ${action}`);
+  }
+  const status = action === "stop" || action === "pause"
+    ? "stopped" as WorkspaceStatus
+    : flyStateToWorkspaceStatus(machine.state);
+  const now = new Date().toISOString();
+  updateWorkspaceMachine.run({
+    id: workspace.id,
+    status,
+    machineId: workspace.machineId,
+    machineState: machine.state ?? null,
+    updatedAt: now,
+  });
+  const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
+  return next ? rowToWorkspace(next) : { ...workspace, status, machineState: machine.state };
+}
+
+async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerResponse, workspaceId: string): Promise<void> {
+  const row = findWorkspaceById.get(workspaceId) as Record<string, unknown> | undefined;
+  if (!row) {
+    sendJson(res, 404, { error: "workspace not found" });
+    return;
+  }
+  requireWorkerBearer(req, row);
+  const body = await readJsonBody(req);
+  const state = stringField(body, "state");
+  const status: WorkspaceStatus = state === "failed" ? "failed" : "running";
+  const now = new Date().toISOString();
+  updateWorkspaceHeartbeat.run({
+    id: workspaceId,
+    status,
+    machineState: state || status,
+    lastHeartbeatAt: now,
+    lastActivityAt: now,
+    updatedAt: now,
+  });
+  sendJson(res, 200, { ok: true, status });
+}
+
+function listAccountWorkspaces(accountId: string): Workspace[] {
+  return (listWorkspacesForAccount.all(accountId) as unknown[]).map(rowToWorkspace);
+}
+
+function getAccountWorkspace(id: string, accountId: string): Workspace | null {
+  const row = findWorkspaceForAccount.get(id, accountId);
+  return row ? rowToWorkspace(row) : null;
+}
+
+function rowToWorkspace(row: unknown): Workspace {
+  const value = row as Record<string, unknown>;
+  return {
+    id: String(value.id),
+    accountId: String(value.account_id),
+    workspaceKey: String(value.workspace_key),
+    repoName: optionalString(value.repo_name),
+    status: String(value.status) as WorkspaceStatus,
+    machineId: optionalString(value.machine_id),
+    machineState: optionalString(value.machine_state),
+    snapshotKey: optionalString(value.snapshot_key),
+    lastActivityAt: optionalString(value.last_activity_at),
+    lastHeartbeatAt: optionalString(value.last_heartbeat_at),
+    createdAt: String(value.created_at),
+    updatedAt: String(value.updated_at),
+  };
+}
+
+function flyStateToWorkspaceStatus(state: string | undefined): WorkspaceStatus {
+  switch (state) {
+    case "started":
+    case "starting":
+      return "running";
+    case "stopped":
+    case "stopping":
+    case "suspended":
+      return "stopped";
+    case "destroyed":
+      return "stopped";
+    case "failed":
+      return "failed";
+    default:
+      return "queued";
+  }
+}
+
+function uniqueWorkspaceId(repoName: string | undefined): string {
+  const base = slugForWorkspaceId(repoName) || `workspace`;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const candidate = attempt === 0
+      ? `${base}-${randomBytes(2).toString("hex")}`
+      : `${base}-${randomBytes(3).toString("hex")}`;
+    if (!findWorkspaceById.get(candidate)) {
+      return candidate;
+    }
+  }
+  return `workspace-${randomBytes(5).toString("hex")}`;
+}
+
+function slugForWorkspaceId(value: string | undefined): string {
+  const slug = (value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24)
+    .replace(/-+$/g, "");
+  return slug || "";
 }
 
 async function flyRequest<T>(pathname: string, init: { method: string; body?: JsonRecord }): Promise<T> {

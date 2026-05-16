@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -180,6 +181,9 @@ export async function runCloudCommand(command: string, args: string[], options: 
       return;
     case "attach":
       await attach(rest, options);
+      return;
+    case "workspace":
+      await workspaceCommand(rest, options);
       return;
     case "onload":
       await onload(rest, options);
@@ -1353,17 +1357,144 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function workspaceCommand(args: string[], options: CloudCommandOptions): Promise<void> {
+  const sub = args[0] ?? "";
+  const rest = args.slice(1);
+  if (sub === "" || sub === "attach") {
+    await workspaceAttach(options);
+    return;
+  }
+  if (sub === "stop") {
+    await workspaceMutate("stop", rest, options);
+    return;
+  }
+  if (sub === "list" || sub === "ls") {
+    await workspaceList(options);
+    return;
+  }
+  throw new Error("Usage: rudder cloud workspace [attach|stop|list]");
+}
+
+function computeWorkspaceKey(repoRoot: string): string {
+  const normalized = path.resolve(repoRoot);
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
+}
+
+async function workspaceAttach(options: CloudCommandOptions): Promise<void> {
+  const repoRoot = findRepoRoot();
+  const workspaceKey = computeWorkspaceKey(repoRoot);
+  const repoName = path.basename(repoRoot);
+  const client = await cloudClient({ requireToken: true });
+
+  if (!options.json) {
+    process.stderr.write(`Resolving cloud workspace for ${repoName}...\n`);
+  }
+  const baseBody: Record<string, JsonValue> = { workspaceKey, repoName };
+  let result: JsonValue | null = null;
+  try {
+    result = await client.request<JsonValue>("/api/rudder/workspace/attach", {
+      method: "POST",
+      body: baseBody,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/snapshot/i.test(message)) {
+      throw error;
+    }
+    if (!options.json) {
+      process.stderr.write(`Uploading workspace snapshot...\n`);
+    }
+    const snapshot = await createSnapshot(repoRoot, options.homePaths ?? []);
+    try {
+      const body: Record<string, JsonValue> = {
+        ...baseBody,
+        snapshot: {
+          name: path.basename(snapshot.archivePath),
+          contentType: "application/gzip",
+          base64: await fsp.readFile(snapshot.archivePath, "base64"),
+          manifest: snapshot.manifest as unknown as JsonValue,
+        } as JsonValue,
+      };
+      result = await client.request<JsonValue>("/api/rudder/workspace/attach", {
+        method: "POST",
+        body,
+      });
+    } finally {
+      await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
+    }
+  }
+  if (!result) {
+    throw new Error("Workspace attach returned no result");
+  }
+  await attachToWorkspaceResult(result, options);
+}
+
+async function attachToWorkspaceResult(result: JsonValue, options: CloudCommandOptions): Promise<void> {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("Unexpected workspace response from cloud");
+  }
+  const record = result as Record<string, JsonValue>;
+  const workspaceId = typeof record.id === "string" ? record.id : undefined;
+  if (!workspaceId) {
+    throw new Error("Workspace response is missing id");
+  }
+  if (options.json) {
+    printJson(record);
+    return;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    process.stderr.write(`Workspace ${workspaceId} is ready. Run \`rudder cloud workspace attach\` from a TTY to take over.\n`);
+    return;
+  }
+  if (process.env.RUDDER_CLOUD_NO_ATTACH === "1") {
+    return;
+  }
+  await waitForWorkspaceWorker(workspaceId);
+  await runAttach({ kind: "workspace", id: workspaceId, label: `workspace ${workspaceId}` }, { ...options, quietBanner: false });
+}
+
+async function waitForWorkspaceWorker(workspaceId: string): Promise<void> {
+  // Give the Fly machine a moment to boot before the WS attach so users see the dashboard, not a wait-for-worker banner.
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  void workspaceId;
+}
+
+async function workspaceMutate(action: "stop", args: string[], options: CloudCommandOptions): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    throw new Error(`Usage: rudder cloud workspace ${action} <id>`);
+  }
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<JsonValue>(`/api/rudder/workspace/${encodeURIComponent(id)}/${action}`, {
+    method: "POST",
+    body: {} as JsonValue,
+  });
+  await printResult(result, options);
+}
+
+async function workspaceList(options: CloudCommandOptions): Promise<void> {
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<JsonValue>("/api/rudder/workspace", { method: "GET" });
+  await printResult(result, options);
+}
+
 async function attach(args: string[], options: CloudCommandOptions): Promise<void> {
   const sailId = args[0];
   if (!sailId) {
     throw new Error("Usage: rudder cloud attach <id>");
   }
-  await runAttach(sailId, options);
+  await runAttach({ kind: "sail", id: sailId, label: sailId }, options);
 }
+
+type AttachTarget = {
+  kind: "sail" | "workspace";
+  id: string;
+  label: string;
+};
 
 type AttachResult = "exited" | "failed";
 
-async function runAttach(sailId: string, options: CloudCommandOptions): Promise<AttachResult> {
+async function runAttach(target: AttachTarget, options: CloudCommandOptions): Promise<AttachResult> {
   const client = await cloudClient({ requireToken: true });
   const baseUrl = client.baseUrl;
   const state = await loadCloudAuth();
@@ -1373,7 +1504,7 @@ async function runAttach(sailId: string, options: CloudCommandOptions): Promise<
     throw new Error("Not logged in to Rudder Cloud. Run `rudder login` first.");
   }
   const wsUrl = baseUrl.replace(/^http/, "ws").replace(/\/$/, "")
-    + `/api/rudder/sail/${encodeURIComponent(sailId)}/attach`;
+    + `/api/rudder/${target.kind}/${encodeURIComponent(target.id)}/attach`;
 
   const stdin = process.stdin;
   const stdout = process.stdout;
@@ -1428,7 +1559,7 @@ async function runAttach(sailId: string, options: CloudCommandOptions): Promise<
       opened = true;
       if (!options.json && !options.quietBanner) {
         const tail = isInteractive ? " (Ctrl+C sends to remote; close this pane to detach)" : "";
-        process.stderr.write(`Attached to ${sailId}${tail}\n`);
+        process.stderr.write(`Attached to ${target.label}${tail}\n`);
       }
       sendResize();
       if (isInteractive) {
@@ -1525,7 +1656,7 @@ async function maybeAutoAttach(result: JsonValue, options: CloudCommandOptions):
     return;
   }
   try {
-    await runAttach(sailId, { ...options, quietBanner: false });
+    await runAttach({ kind: "sail", id: sailId, label: sailId }, { ...options, quietBanner: false });
   } catch (error) {
     console.warn(`Could not attach to ${sailId}: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -212,6 +212,7 @@ struct App {
     last_cloud_check: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
+    handoff_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -385,6 +386,7 @@ impl App {
             last_cloud_check: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
+            handoff_pending: false,
         }
     }
 
@@ -1876,6 +1878,27 @@ impl App {
                 if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
                     self.notice =
                         Some("not logged in to Rudder Cloud; run /login first".to_string());
+                    return true;
+                }
+                if raw_args.is_empty() {
+                    if !rudder_cloud_authenticated() {
+                        self.notice =
+                            Some("not logged in to Rudder Cloud; run /login first".to_string());
+                        return true;
+                    }
+                    match write_cloud_workspace_handoff() {
+                        Ok(_) => {
+                            self.notice = Some(
+                                "Switching this terminal to the cloud workspace...".to_string(),
+                            );
+                            self.handoff_pending = true;
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!(
+                                "could not request cloud workspace handoff: {error}"
+                            ));
+                        }
+                    }
                     return true;
                 }
                 if self.maybe_prompt_cloud_launch(&raw_args) {
@@ -4396,6 +4419,11 @@ fn run(terminal: &mut Tui) -> Result<()> {
         app.poll_agents();
         terminal.draw(|frame| render(frame, &mut app))?;
 
+        if app.handoff_pending {
+            app.shutdown();
+            return Ok(());
+        }
+
         if event::poll(TICK_RATE)? {
             if handle_event(&mut app, event::read()?) {
                 app.shutdown();
@@ -6111,6 +6139,24 @@ fn read_cloud_summary() -> CloudSummary {
                 .map(|value| if value == "byo-vm" { "byoc" } else { value }.to_string())
         });
     CloudSummary { connected, runtime }
+}
+
+fn write_cloud_workspace_handoff() -> Result<()> {
+    let Some(path) = env::var_os("RUDDER_HANDOFF_PATH") else {
+        return Err(anyhow::anyhow!(
+            "RUDDER_HANDOFF_PATH not set (older rudder wrapper?)"
+        ));
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "kind": "cloud-workspace-attach",
+        "writtenAt": ts,
+    });
+    fs::write(path, serde_json::to_string(&payload)?)?;
+    Ok(())
 }
 
 fn cloud_args_need_auth(args: &[&str]) -> bool {
