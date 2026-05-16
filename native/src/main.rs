@@ -595,6 +595,19 @@ impl App {
             _ => {}
         }
 
+        if self.selected_worker_is_finished_cloud_command() {
+            match key.code {
+                KeyCode::Char('r') => self.restart_selected_agent(),
+                KeyCode::Char('q') => return true,
+                _ => {
+                    self.notice = Some(
+                        "cloud command finished; run /cloud again or press r to rerun".to_string(),
+                    );
+                }
+            }
+            return false;
+        }
+
         let Some(bytes) = terminal_bytes_for_key(key) else {
             return false;
         };
@@ -967,6 +980,10 @@ impl App {
                             self.set_selected_review_error(error.to_string());
                         }
                     }
+                } else if self.selected_worker_is_finished_cloud_command() {
+                    self.notice = Some(
+                        "cloud command finished; run /cloud again or press r to rerun".to_string(),
+                    );
                 } else {
                     let capture_as_prompt = self.selected_worker_accepts_prompt_input();
                     let result = match self.selected_terminal_mut() {
@@ -1013,6 +1030,14 @@ impl App {
                 run.backend,
                 &terminal.visible_lines_snapshot(),
             )
+        })
+    }
+
+    fn selected_worker_is_finished_cloud_command(&self) -> bool {
+        self.agents.get(self.selected_agent).is_some_and(|run| {
+            run.terminal.is_some()
+                && is_cloud_agent(run)
+                && !matches!(run.status, AgentStatus::Running)
         })
     }
 
@@ -1955,33 +1980,16 @@ impl App {
     }
 
     fn start_cloud_prompt_choice(&mut self, prompt: CloudLaunchPrompt) {
-        match prompt.choice {
-            CloudLaunchChoice::Upload => {
-                if let Some(run_id) = prompt.selected_run_id {
-                    let args = vec!["cloud".to_string(), "onload".to_string(), run_id];
-                    let label = prompt
-                        .selected_task
-                        .as_deref()
-                        .map(|task| format!("cloud onload {}", short_task(task)))
-                        .unwrap_or_else(|| "cloud onload".to_string());
-                    self.start_rudder_cli_command_with_env(
-                        &label,
-                        args,
-                        &[("RUDDER_CLOUD_RUNTIME", "fly")],
-                    );
-                } else {
-                    self.notice = Some(
-                        "no current Rudder run selected; press Down then Enter to start scratch"
-                            .to_string(),
-                    );
-                }
-            }
-            CloudLaunchChoice::Scratch => {
+        match cloud_prompt_launch(&prompt) {
+            Ok(launch) => {
                 self.start_rudder_cli_command_with_env(
-                    &prompt.scratch_label,
-                    prompt.scratch_args,
+                    &launch.label,
+                    launch.args,
                     &[("RUDDER_CLOUD_RUNTIME", "fly")],
                 );
+            }
+            Err(message) => {
+                self.notice = Some(message.to_string());
             }
         }
     }
@@ -3614,6 +3622,94 @@ mod app_tests {
     }
 
     #[test]
+    fn cloud_prompt_highlights_onload_for_selected_local_run() {
+        let mut app = App::new();
+        app.agents.push(test_agent_run("run-1", "fix cloud launch"));
+        app.selected_agent = 0;
+
+        assert!(app.maybe_prompt_cloud_launch(&[]));
+
+        let prompt = app.cloud_prompt.as_ref().expect("cloud prompt");
+        assert_eq!(prompt.choice, CloudLaunchChoice::Upload);
+        assert_eq!(prompt.selected_run_id.as_deref(), Some("run-1"));
+        assert_eq!(prompt.selected_task.as_deref(), Some("fix cloud launch"));
+    }
+
+    #[test]
+    fn cloud_prompt_defaults_to_scratch_without_selected_local_run() {
+        let mut app = App::new();
+
+        assert!(app.maybe_prompt_cloud_launch(&[]));
+
+        let prompt = app.cloud_prompt.as_ref().expect("cloud prompt");
+        assert_eq!(prompt.choice, CloudLaunchChoice::Scratch);
+        assert!(prompt.selected_run_id.is_none());
+        assert_eq!(
+            prompt.scratch_args.first().map(String::as_str),
+            Some("cloud")
+        );
+        assert_eq!(prompt.scratch_args.len(), 2);
+    }
+
+    #[test]
+    fn cloud_prompt_enter_on_highlighted_onloads_current_run() {
+        let prompt = CloudLaunchPrompt {
+            scratch_args: vec!["cloud".to_string(), "bright-orbit".to_string()],
+            scratch_label: "cloud bright-orbit".to_string(),
+            selected_run_id: Some("run-1".to_string()),
+            selected_task: Some("fix the cloud modal".to_string()),
+            choice: CloudLaunchChoice::Upload,
+        };
+
+        assert_eq!(
+            cloud_prompt_launch(&prompt),
+            Ok(CloudPromptLaunch {
+                label: "cloud onload fix the cloud modal".to_string(),
+                args: vec![
+                    "cloud".to_string(),
+                    "onload".to_string(),
+                    "run-1".to_string()
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn cloud_prompt_down_then_enter_starts_scratch_worker() {
+        let prompt = CloudLaunchPrompt {
+            scratch_args: vec!["cloud".to_string(), "bright-orbit".to_string()],
+            scratch_label: "cloud bright-orbit".to_string(),
+            selected_run_id: Some("run-1".to_string()),
+            selected_task: Some("fix the cloud modal".to_string()),
+            choice: CloudLaunchChoice::Scratch,
+        };
+
+        assert_eq!(
+            cloud_prompt_launch(&prompt),
+            Ok(CloudPromptLaunch {
+                label: "cloud bright-orbit".to_string(),
+                args: vec!["cloud".to_string(), "bright-orbit".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn cloud_prompt_upload_without_selected_run_is_not_scratch() {
+        let prompt = CloudLaunchPrompt {
+            scratch_args: vec!["cloud".to_string(), "bright-orbit".to_string()],
+            scratch_label: "cloud bright-orbit".to_string(),
+            selected_run_id: None,
+            selected_task: None,
+            choice: CloudLaunchChoice::Upload,
+        };
+
+        assert_eq!(
+            cloud_prompt_launch(&prompt),
+            Err("no current Rudder run selected; press Down then Enter to start scratch")
+        );
+    }
+
+    #[test]
     fn slash_commands_rank_closest_matches() {
         let mut app = App::new();
 
@@ -3912,6 +4008,42 @@ mod app_tests {
         assert_eq!(app.focus, FocusPane::Agents);
         assert_eq!(app.selected_agent, 1);
         assert!(app.delete_pending.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn finished_cloud_command_does_not_write_to_dead_pty() {
+        let command = TerminalCommand::with_args("/bin/sh", ["-lc", "printf done"]);
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+        std::thread::sleep(Duration::from_millis(50));
+        pane.drain_output();
+
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut run = test_agent_run_with_terminal(&app, pane);
+        run.task = "cloud bright-orbit".to_string();
+        run.current_prompt = "cloud bright-orbit".to_string();
+        run.status = AgentStatus::Done;
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        app.handle_worker_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+
+        let run = app.agents.first().expect("run");
+        assert_eq!(run.status, AgentStatus::Done);
+        assert!(run.last_error.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("cloud command finished; run /cloud again or press r to rerun")
+        );
     }
 
     #[test]
@@ -6030,6 +6162,37 @@ fn cloud_agent_label(args: &[String]) -> String {
             .unwrap_or_else(|| format!("cloud {}", args[1])),
         Some(name) => format!("cloud {name}"),
         None => "cloud".to_string(),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CloudPromptLaunch {
+    label: String,
+    args: Vec<String>,
+}
+
+fn cloud_prompt_launch(prompt: &CloudLaunchPrompt) -> Result<CloudPromptLaunch, &'static str> {
+    match prompt.choice {
+        CloudLaunchChoice::Upload => {
+            let Some(run_id) = prompt.selected_run_id.clone() else {
+                return Err(
+                    "no current Rudder run selected; press Down then Enter to start scratch",
+                );
+            };
+            let label = prompt
+                .selected_task
+                .as_deref()
+                .map(|task| format!("cloud onload {}", short_task(task)))
+                .unwrap_or_else(|| "cloud onload".to_string());
+            Ok(CloudPromptLaunch {
+                label,
+                args: vec!["cloud".to_string(), "onload".to_string(), run_id],
+            })
+        }
+        CloudLaunchChoice::Scratch => Ok(CloudPromptLaunch {
+            label: prompt.scratch_label.clone(),
+            args: prompt.scratch_args.clone(),
+        }),
     }
 }
 
