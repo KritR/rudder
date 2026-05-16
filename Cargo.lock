@@ -1110,6 +1110,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "serde_json",
+ "uuid",
  "vt100",
 ]
 

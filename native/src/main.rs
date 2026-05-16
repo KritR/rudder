@@ -304,6 +304,7 @@ struct AgentRun {
     cwd: PathBuf,
     worktree_branch: Option<String>,
     worktree_path: Option<PathBuf>,
+    session_id: Option<String>,
     terminal: Option<TerminalPane>,
     terminal_size: Option<TerminalSize>,
     review_terminal: Option<TerminalPane>,
@@ -1630,7 +1631,8 @@ impl App {
         let model = self.model.clone();
         let backend = self.backend;
         let effort = self.effort;
-        let command = agent_command(backend, &model, effort, input, AgentMode::Execute);
+        let session_id = mint_session_id_for(backend);
+        let command = agent_command(backend, &model, effort, input, AgentMode::Execute, session_id.as_deref());
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -1658,6 +1660,7 @@ impl App {
             cwd: worktree.path.clone(),
             worktree_branch: worktree.branch.clone(),
             worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
+            session_id,
             terminal: None,
             terminal_size: None,
             review_terminal: None,
@@ -1700,7 +1703,8 @@ impl App {
         let model = self.model.clone();
         let backend = self.backend;
         let effort = self.effort;
-        let command = agent_command(backend, &model, effort, input, AgentMode::Plan);
+        let session_id = mint_session_id_for(backend);
+        let command = agent_command(backend, &model, effort, input, AgentMode::Plan, session_id.as_deref());
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(self.cwd.clone()),
@@ -1728,6 +1732,7 @@ impl App {
             cwd: self.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            session_id,
             terminal: None,
             terminal_size: None,
             review_terminal: None,
@@ -1766,6 +1771,58 @@ impl App {
         self.focus = FocusPane::Worker;
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
+        }
+    }
+
+    fn restore_running_claude_agents(&mut self) {
+        let snapshot: Vec<(usize, MigratedAgent)> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, run)| {
+                if run.terminal.is_some() || run.status != AgentStatus::Running {
+                    return None;
+                }
+                if run.backend != Backend::Claude {
+                    return None;
+                }
+                let session_id = run.session_id.clone()?;
+                Some((idx, MigratedAgent {
+                    run_id: run.id.clone(),
+                    session_id,
+                    worktree_path: run.worktree_path.clone().unwrap_or(run.cwd.clone()),
+                }))
+            })
+            .collect();
+        let total = snapshot.len();
+        if total == 0 {
+            return;
+        }
+        let mut resumed = 0;
+        for (idx, entry) in snapshot {
+            if self.spawn_claude_resume_for(idx, &entry) {
+                resumed += 1;
+            }
+        }
+        if resumed > 0 {
+            self.notice = Some(format!(
+                "resumed {resumed} agent(s) from last session via claude --resume"
+            ));
+        }
+        let needs_manual = self
+            .agents
+            .iter()
+            .filter(|run| {
+                run.terminal.is_none()
+                    && run.status == AgentStatus::Running
+                    && (run.backend != Backend::Claude || run.session_id.is_none())
+            })
+            .count();
+        if needs_manual > 0 {
+            let prefix = self.notice.take().map(|n| format!("{n}; ")).unwrap_or_default();
+            self.notice = Some(format!(
+                "{prefix}{needs_manual} agent(s) need restart (press r)"
+            ));
         }
     }
 
@@ -1853,7 +1910,8 @@ impl App {
         }
 
         let prompt = run.task.clone();
-        let command = agent_command(run.backend, &run.model, run.effort, &prompt, run.mode);
+        let session_id = mint_session_id_for(run.backend);
+        let command = agent_command(run.backend, &run.model, run.effort, &prompt, run.mode, session_id.as_deref());
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(run.cwd.clone()),
@@ -1865,6 +1923,7 @@ impl App {
                 let _ = terminal.drain_output();
                 run.terminal = Some(terminal);
                 run.status = AgentStatus::Running;
+                run.session_id = session_id;
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
                 run.autosteered = run.mode == AgentMode::Plan;
@@ -2203,6 +2262,7 @@ impl App {
             cwd: self.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            session_id: None,
             terminal: None,
             terminal_size: None,
             review_terminal: None,
@@ -2587,12 +2647,14 @@ impl App {
         self.conflict_prompt = None;
 
         let id = new_run_id("resolve merge conflicts");
+        let session_id = mint_session_id_for(self.backend);
         let command = agent_command(
             self.backend,
             &self.model,
             self.effort,
             &prompt,
             AgentMode::Execute,
+            session_id.as_deref(),
         );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
@@ -2622,6 +2684,7 @@ impl App {
             cwd: self.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            session_id,
             terminal: None,
             terminal_size: None,
             review_terminal: None,
@@ -2814,6 +2877,7 @@ impl App {
                 run.effort,
                 &prompt,
                 AgentMode::Execute,
+                run.session_id.as_deref(),
             );
             let size = run.terminal_size.unwrap_or_default();
             let options = TerminalPaneOptions {
@@ -3693,6 +3757,7 @@ mod app_tests {
             Some(EffortLevel::High),
             "implement the work",
             AgentMode::Execute,
+            None,
         );
         assert!(execute_codex
             .args
@@ -3714,6 +3779,7 @@ mod app_tests {
             None,
             "implement the work",
             AgentMode::Execute,
+            None,
         );
         assert!(execute_claude
             .env
@@ -3726,6 +3792,7 @@ mod app_tests {
             Some(EffortLevel::High),
             "plan the work",
             AgentMode::Plan,
+            None,
         );
         assert_eq!(codex.program, "codex");
         assert!(codex.args.iter().any(|arg| arg == "--no-alt-screen"));
@@ -3745,6 +3812,7 @@ mod app_tests {
             None,
             "plan the work",
             AgentMode::Plan,
+            None,
         );
         assert_eq!(claude.program, "claude");
         assert!(claude
@@ -4288,6 +4356,7 @@ mod app_tests {
             cwd: std::env::temp_dir(),
             worktree_branch: None,
             worktree_path: None,
+            session_id: None,
             terminal: None,
             terminal_size: None,
             review_terminal: None,
@@ -4381,6 +4450,7 @@ mod app_tests {
             cwd: app.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            session_id: None,
             terminal: None,
             terminal_size: None,
             review_terminal: None,
@@ -4613,6 +4683,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     app.resume_migrated_agents();
+    app.restore_running_claude_agents();
 
     loop {
         app.poll_agents();
@@ -7105,12 +7176,20 @@ fn backend_for_model(model: &str) -> Backend {
     }
 }
 
+fn mint_session_id_for(backend: Backend) -> Option<String> {
+    match backend {
+        Backend::Claude => Some(uuid::Uuid::new_v4().to_string()),
+        Backend::Codex => None,
+    }
+}
+
 fn agent_command(
     backend: Backend,
     model: &str,
     effort: Option<EffortLevel>,
     task: &str,
     mode: AgentMode,
+    session_id: Option<&str>,
 ) -> TerminalCommand {
     let prompt = match mode {
         AgentMode::Execute => execution_prompt(task),
@@ -7137,6 +7216,10 @@ fn agent_command(
             if let Some(effort) = effort {
                 args.push("--effort".to_string());
                 args.push(effort.as_str().to_string());
+            }
+            if let Some(sid) = session_id {
+                args.push("--session-id".to_string());
+                args.push(sid.to_string());
             }
             args.push(prompt);
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
@@ -8019,6 +8102,11 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned);
     let worktree_path = worktree_enabled.then_some(cwd.clone());
+    let session_id = record
+        .get("session")
+        .and_then(|value| value.get("nativeSessionId"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
 
     Some(AgentRun {
         id,
@@ -8036,6 +8124,7 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         cwd,
         worktree_branch,
         worktree_path,
+        session_id,
         terminal: None,
         terminal_size: None,
         review_terminal: None,
@@ -8162,6 +8251,7 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
         "turns": turns,
         "lastUserInputAt": run.last_user_input_at,
         "autoSteer": { "count": if run.autosteered { 1 } else { 0 }, "max": 2 },
+        "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),
     });
     let temp = record_path.with_extension(format!(
         "json.{}.{}.tmp",
