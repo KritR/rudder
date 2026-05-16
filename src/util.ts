@@ -96,7 +96,7 @@ export async function writeJson(
 }
 
 export function commandExists(command: string): boolean {
-  const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], {
+  const result = spawnSync("sh", ["-c", `command -v ${shellQuote(command)}`], {
     encoding: "utf8",
     env: commandEnv(),
   });
