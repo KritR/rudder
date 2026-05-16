@@ -116,6 +116,9 @@ export async function runCloudCommand(command, args, options = {}) {
         case "resume":
             await mutateSail("resume", rest, options);
             return;
+        case "stop":
+            await mutateSail("stop", rest, options);
+            return;
         case "setup-github":
             await setupOAuthProvider("github", rest, options);
             return;

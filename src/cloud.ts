@@ -187,6 +187,9 @@ export async function runCloudCommand(command: string, args: string[], options: 
     case "resume":
       await mutateSail("resume", rest, options);
       return;
+    case "stop":
+      await mutateSail("stop", rest, options);
+      return;
     case "setup-github":
       await setupOAuthProvider("github", rest, options);
       return;
@@ -591,7 +594,7 @@ async function bootstrap(args: string[], options: CloudCommandOptions): Promise<
   await printResult(result, options);
 }
 
-async function mutateSail(action: "onload" | "pause" | "resume", args: string[], options: CloudCommandOptions): Promise<void> {
+async function mutateSail(action: "onload" | "pause" | "resume" | "stop", args: string[], options: CloudCommandOptions): Promise<void> {
   const sailId = args[0];
   if (!sailId) {
     throw new Error(`Missing sail id. Usage: rudder sail ${action} <id>`);
