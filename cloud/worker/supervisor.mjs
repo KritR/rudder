@@ -447,7 +447,7 @@ function shSoft(cmd) {
 }
 
 function sh(cmd) {
-  const result = spawnSync("sh", ["-lc", cmd], { stdio: "inherit" });
+  const result = spawnSync("sh", ["-c", cmd], { stdio: "inherit" });
   if (result.status !== 0) {
     throw new Error(`command failed (${result.status}): ${cmd}`);
   }
