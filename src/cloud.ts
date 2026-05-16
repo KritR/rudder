@@ -1954,7 +1954,11 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
     socket.binaryType = "nodebuffer";
     let opened = false;
     let cleaned = false;
+    let firstFrameRendered = false;
     let result: AttachResult = "exited";
+
+    const splashAllowed = isInteractive && !options.json && !options.quietBanner;
+    const splash = splashAllowed ? new AttachSplash(stdout, target.label) : null;
 
     const sendResize = () => {
       if (socket.readyState !== WebSocket.OPEN) {
@@ -1973,7 +1977,10 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       socket.send(buffer, { binary: true });
     };
 
-    const onResize = () => sendResize();
+    const onResize = () => {
+      sendResize();
+      splash?.redraw();
+    };
 
     const cleanup = () => {
       if (cleaned) {
@@ -1982,6 +1989,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       cleaned = true;
       stdin.off("data", onStdin);
       stdout.off("resize", onResize);
+      splash?.dispose();
       if (isInteractive && stdin.isTTY) {
         try {
           stdin.setRawMode(false);
@@ -1994,7 +2002,10 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
 
     socket.on("open", () => {
       opened = true;
-      if (!options.json && !options.quietBanner) {
+      if (splash) {
+        splash.start();
+        splash.setStatus(`Booting cloud workspace · ${target.label}`);
+      } else if (!options.json && !options.quietBanner) {
         const tail = isInteractive ? " (Ctrl+C sends to remote; close this pane to detach)" : "";
         process.stderr.write(`Attached to ${target.label}${tail}\n`);
       }
@@ -2013,6 +2024,10 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
 
     socket.on("message", (data, isBinary) => {
       if (isBinary && Buffer.isBuffer(data)) {
+        if (!firstFrameRendered) {
+          firstFrameRendered = true;
+          splash?.handoff();
+        }
         stdout.write(data);
         return;
       }
@@ -2060,15 +2075,111 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         }
         return;
       }
-      if (message.type === "status" && !options.json && !options.quietBanner) {
-        if (message.state === "worker-disconnected") {
-          process.stderr.write("\nCloud worker disconnected; waiting for reconnect...\n");
-        } else if (message.state === "worker-connected") {
-          process.stderr.write("Cloud worker connected.\n");
+      if (message.type === "status") {
+        if (splash && !firstFrameRendered) {
+          if (message.state === "worker-waiting") {
+            splash.setStatus(`Waiting for cloud worker · ${target.label}`);
+          } else if (message.state === "worker-connected") {
+            splash.setStatus(`Cloud worker connected · loading dashboard`);
+          } else if (message.state === "worker-disconnected") {
+            splash.setStatus(`Cloud worker disconnected · waiting for reconnect`);
+          }
+        } else if (!options.json && !options.quietBanner) {
+          if (message.state === "worker-disconnected") {
+            process.stderr.write("\nCloud worker disconnected; waiting for reconnect...\n");
+          } else if (message.state === "worker-connected") {
+            process.stderr.write("Cloud worker connected.\n");
+          }
         }
       }
     }
   });
+}
+
+class AttachSplash {
+  private stdout: NodeJS.WriteStream;
+  private label: string;
+  private frame = 0;
+  private status: string;
+  private timer: NodeJS.Timeout | undefined;
+  private active = false;
+  private static FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+  constructor(stdout: NodeJS.WriteStream, label: string) {
+    this.stdout = stdout;
+    this.label = label;
+    this.status = `Connecting to ${label}`;
+  }
+
+  start(): void {
+    if (this.active) {
+      return;
+    }
+    this.active = true;
+    this.stdout.write("\x1b[?1049h\x1b[?25l");
+    this.redraw();
+    this.timer = setInterval(() => {
+      this.frame = (this.frame + 1) % AttachSplash.FRAMES.length;
+      this.redraw();
+    }, 100);
+    this.timer.unref?.();
+  }
+
+  setStatus(status: string): void {
+    this.status = status;
+    if (this.active) {
+      this.redraw();
+    }
+  }
+
+  redraw(): void {
+    if (!this.active) {
+      return;
+    }
+    const cols = this.stdout.columns ?? 80;
+    const rows = this.stdout.rows ?? 24;
+    const spinner = AttachSplash.FRAMES[this.frame] ?? "·";
+    const lines = [
+      `${spinner}  ${this.status}`,
+      `   Ctrl+C to disconnect`,
+    ];
+    const top = Math.max(1, Math.floor(rows / 2) - 1);
+    this.stdout.write("\x1b[2J");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] ?? "";
+      const visible = stripAnsi(line);
+      const left = Math.max(1, Math.floor((cols - visible.length) / 2) + 1);
+      this.stdout.write(`\x1b[${top + i};${left}H${line}`);
+    }
+  }
+
+  handoff(): void {
+    if (!this.active) {
+      return;
+    }
+    this.stop();
+    this.stdout.write("\x1b[?1049l\x1b[?25h");
+  }
+
+  dispose(): void {
+    if (!this.active) {
+      return;
+    }
+    this.stop();
+    this.stdout.write("\x1b[?25h");
+  }
+
+  private stop(): void {
+    this.active = false;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 }
 
 async function maybeAutoAttach(result: JsonValue, options: CloudCommandOptions): Promise<void> {

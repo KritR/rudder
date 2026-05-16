@@ -14,7 +14,11 @@ RUN apt-get update \
     python3 build-essential \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g acpx@latest @openai/codex@latest hunkdiff@latest \
+RUN npm install -g \
+    @anthropic-ai/claude-code@latest \
+    @openai/codex@latest \
+    acpx@latest \
+    hunkdiff@latest \
   && npm cache clean --force
 
 WORKDIR /opt/rudder

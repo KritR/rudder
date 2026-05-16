@@ -43,7 +43,7 @@ if (alreadyStaged()) {
 
 const cwd = process.cwd();
 console.log(`Rudder worker ready in ${cwd}`);
-sh("rudder doctor || true");
+shSoft("rudder doctor");
 
 const capturedEnv = loadCapturedEnv();
 if (Object.keys(capturedEnv).length > 0) {
@@ -256,8 +256,8 @@ function stageSnapshot() {
   if (fs.existsSync("unpacked/home")) {
     console.log("Restoring selected HOME config...");
     const home = os.homedir() || process.env.HOME || "/root";
-    sh(`cp -R unpacked/home/. ${shQuote(home + "/")} 2>/dev/null || true`);
-    sh(`find ${shQuote(home)} -name '._*' -delete 2>/dev/null || true`);
+    shSoft(`cp -R unpacked/home/. ${shQuote(home + "/")} 2>/dev/null`);
+    shSoft(`find ${shQuote(home)} -name '._*' -delete 2>/dev/null`);
   }
   let workdir;
   if (fs.existsSync("unpacked/repo")) {
@@ -316,7 +316,7 @@ function stageMigratedAgents(workdir) {
       fs.mkdirSync(cloudWorktree, { recursive: true });
       sh(`cp -R ${shQuote(stagedWorktree + "/.")} ${shQuote(cloudWorktree + "/")}`);
       if (!fs.existsSync(path.join(cloudWorktree, ".git"))) {
-        sh(`cd ${shQuote(cloudWorktree)} && git init -q && git config user.email rudder-cloud@local && git config user.name "Rudder Cloud" && git add -A && git commit -qm "rudder cloud baseline (migrated agent ${agent.runId})" || true`);
+        shSoft(`cd ${shQuote(cloudWorktree)} && git init -q && git config user.email rudder-cloud@local && git config user.name "Rudder Cloud" && git add -A && git commit -qm "rudder cloud baseline (migrated agent ${agent.runId})"`);
       }
     } else {
       fs.mkdirSync(cloudWorktree, { recursive: true });
@@ -440,6 +440,10 @@ function reportDone(state, code) {
     },
     body: JSON.stringify({ state, exitCode: code }),
   }).catch(() => undefined);
+}
+
+function shSoft(cmd) {
+  spawnSync("sh", ["-c", cmd], { stdio: "inherit" });
 }
 
 function sh(cmd) {
