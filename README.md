@@ -82,7 +82,9 @@ rudder login
 rudder cloud
 rudder cloud list
 rudder cloud byoc rudder-workstation
+rudder cloud onload
 rudder cloud onload <runId>
+rudder cloud logs <id>
 rudder cloud migration-lab
 rudder sail staging-worker
 ```
@@ -93,11 +95,12 @@ override it for local development or another deployment.
 
 Inside the dashboard, `/login` starts browser auth and `/cloud list` lists
 cloud workers after you are logged in. `/cloud` opens a confirmation pane before
-anything launches. The highlighted default option onloads the current Rudder run
-to the cloud. Press Down to choose a scratch Fly microVM in a fresh cloud
-directory, then Enter to start. `/cloud <name>` uses the same prompt but gives
-the scratch worker a specific name. `/cloud help` shows the cloud command
-reference.
+anything launches. The highlighted default option onloads the current Rudder
+workspace to the cloud, including the repo snapshot, selected HOME auth/config
+paths, `RUDDER.md`, and saved `.rudder/runs/*/run.json` metadata. Press Down to
+choose a scratch Fly microVM in a fresh cloud directory, then Enter to start.
+`/cloud <name>` uses the same prompt but gives the scratch worker a specific
+name. `/cloud help` shows the cloud command reference.
 
 Cloud workers use Fly Machines by default. To bring your own workstation or
 server instead, add it to `~/.ssh/config` and run:
@@ -138,8 +141,10 @@ use `RUDDER_GITHUB_CLIENT_ID`, `RUDDER_GITHUB_CLIENT_SECRET`,
 `RUDDER_GOOGLE_CLIENT_ID`, and `RUDDER_GOOGLE_CLIENT_SECRET`.
 
 `rudder cloud list` will show cloud-capable runs and remote workers. `rudder
-cloud onload <runId>` will move a local run to the cloud so it can continue from
-the same task context.
+cloud onload` uploads the current Rudder workspace. `rudder cloud onload
+<runId>` keeps the older single-run path for moving one local run to the cloud
+from the same task context. `rudder cloud logs <id>` currently shows worker
+status while full cloud log streaming is being wired up.
 
 Cloud onload is designed around Rudder's existing worktree model. If a task is
 already in a worktree, that worktree is the unit Rudder prepares for the cloud.
@@ -260,7 +265,7 @@ the shortcut predictable even if the CLI default runtime was changed to BYOC.
 ```text
 task pane /cloud
   -> confirmation pane
-       highlighted: onload current Rudder run to cloud
+       highlighted: onload current Rudder workspace to cloud
        Down: start scratch in a fresh cloud directory
   -> local CLI creates repo snapshot
   -> control plane stores snapshot in S3
@@ -385,11 +390,12 @@ through suggestions and `Enter` to choose one.
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/login` | Open browser login for Rudder Cloud |
-| `/cloud` | Ask whether to start a fresh Fly cloud worker or upload the selected local run |
+| `/cloud` | Ask whether to onload the current Rudder workspace or start a fresh Fly worker |
 | `/cloud <name>` | Ask the same question, using the name for the fresh Fly worker |
 | `/cloud byoc <ssh-host>` | Use an SSH host from `~/.ssh/config` for BYOC cloud workers |
 | `/cloud runtime [fly\|byoc]` | Show or set the saved cloud runtime |
 | `/cloud list` | List cloud workers |
+| `/cloud logs <id>` | Show cloud worker status while log streaming is pending |
 | `/cloud help` | Show cloud command help |
 | `/sail <name or task>` | Short alias for starting a cloud worker |
 | `/help` | Show the short command hint |

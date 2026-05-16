@@ -101,6 +101,9 @@ export async function runCloudCommand(command, args, options = {}) {
         case "status":
             await status(options);
             return;
+        case "logs":
+            await logs(rest, options);
+            return;
         case "onload":
             await onload(rest, options);
             return;
@@ -348,11 +351,10 @@ async function launch(args, options, mode = "name", explicitRuntime) {
 }
 async function onload(args, options) {
     const runId = args[0];
-    if (!runId) {
-        throw new Error("Missing run id. Usage: rudder cloud onload <runId>");
-    }
     const repoRoot = findRepoRoot();
-    const runRecord = await readJson(path.join(repoRoot, ".rudder", "runs", runId, "run.json"));
+    const runRecord = runId
+        ? await readJson(path.join(repoRoot, ".rudder", "runs", runId, "run.json"))
+        : null;
     const worktreePath = runRecord && typeof runRecord === "object" && !Array.isArray(runRecord)
         ? runRecord.worktree
         : undefined;
@@ -360,30 +362,64 @@ async function onload(args, options) {
         ? worktreePath.path
         : undefined;
     const snapshotRoot = sourceRoot && await pathExists(sourceRoot) ? sourceRoot : repoRoot;
-    const snapshot = await createSnapshot(snapshotRoot, options.homePaths ?? []);
+    const snapshot = await createSnapshot(snapshotRoot, options.homePaths ?? [], { includeRudderState: !runId });
     try {
         const client = await cloudClient({ requireToken: true });
         const runtime = await selectedCloudRuntime();
+        const name = runId ? undefined : `workspace-${path.basename(repoRoot)}`;
+        const body = {
+            repoName: path.basename(repoRoot),
+            run: runRecord ?? null,
+            workspace: !runId,
+            snapshot: {
+                name: path.basename(snapshot.archivePath),
+                contentType: "application/gzip",
+                base64: await fsp.readFile(snapshot.archivePath, "base64"),
+                manifest: snapshot.manifest,
+            },
+        };
+        if (runId) {
+            body.runId = runId;
+        }
+        else {
+            body.name = name ?? `workspace-${path.basename(repoRoot)}`;
+        }
+        if (runtime !== "fly") {
+            body.runtime = runtime;
+        }
         const result = await client.request("/api/rudder/sail/onload", {
             method: "POST",
-            body: {
-                runId,
-                repoName: path.basename(repoRoot),
-                run: runRecord ?? null,
-                ...(runtime !== "fly" ? { runtime } : {}),
-                snapshot: {
-                    name: path.basename(snapshot.archivePath),
-                    contentType: "application/gzip",
-                    base64: await fsp.readFile(snapshot.archivePath, "base64"),
-                    manifest: snapshot.manifest,
-                },
-            },
+            body,
         });
         await printResult(result, options);
     }
     finally {
         await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
     }
+}
+async function logs(args, options) {
+    const sailId = args[0];
+    if (!sailId) {
+        throw new Error("Usage: rudder cloud logs <id>");
+    }
+    const client = await cloudClient({ requireToken: true });
+    const result = await client.request("/api/rudder/sail", { method: "GET" });
+    const sails = Array.isArray(result)
+        ? result
+        : result && typeof result === "object" && !Array.isArray(result) && Array.isArray(result.sails)
+            ? result.sails
+            : [];
+    const match = sails.find((item) => item && typeof item === "object" && !Array.isArray(item) && item.id === sailId);
+    if (!match) {
+        throw new Error(`Cloud worker not found: ${sailId}`);
+    }
+    if (options.json) {
+        printJson(match);
+        return;
+    }
+    console.log("Cloud log streaming is not available yet.");
+    console.log("Worker status:");
+    printSailList([match]);
 }
 async function listSails(options) {
     const client = await cloudClient({ requireToken: true });
@@ -835,13 +871,14 @@ async function loadCloudAuth() {
 async function saveCloudAuth(state) {
     await writeJson(cloudAuthPath(), state, { mode: 0o600 });
 }
-async function createSnapshot(repoRoot, requestedHomePaths) {
+async function createSnapshot(repoRoot, requestedHomePaths, options = {}) {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-cloud-"));
     const stageDir = path.join(tempDir, "snapshot");
     const repoStage = path.join(stageDir, "repo");
     const homeStage = path.join(stageDir, "home");
     await ensureDir(repoStage);
     await copyRepoFiles(repoRoot, repoStage);
+    const rudderState = options.includeRudderState ? await copyRudderState(repoRoot, repoStage) : undefined;
     const homePaths = normalizeHomePaths(requestedHomePaths);
     const includedHomePaths = [];
     for (const homePath of homePaths) {
@@ -859,11 +896,43 @@ async function createSnapshot(repoRoot, requestedHomePaths) {
             commit: await currentCommit(repoRoot),
         },
         homePaths: includedHomePaths,
+        ...(rudderState ? { rudderState } : {}),
     };
     await writeJson(path.join(stageDir, "manifest.json"), manifest);
     const archivePath = path.join(tempDir, `${newRunId("cloud-snapshot")}.tgz`);
     await runCommand("tar", ["-czf", archivePath, "-C", stageDir, "."], { cwd: stageDir });
     return { tempDir, archivePath, manifest };
+}
+async function copyRudderState(repoRoot, repoStage) {
+    const copied = [];
+    const rudderMd = path.join(repoRoot, "RUDDER.md");
+    if (await pathExists(rudderMd)) {
+        const target = path.join(repoStage, "RUDDER.md");
+        await fsp.cp(rudderMd, target, { force: true });
+        copied.push("RUDDER.md");
+    }
+    const runsDir = path.join(repoRoot, ".rudder", "runs");
+    const entries = await fsp.readdir(runsDir, { withFileTypes: true }).catch(() => []);
+    let runs = 0;
+    for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.includes("/") || entry.name.includes("\\")) {
+            continue;
+        }
+        const runJson = path.join(runsDir, entry.name, "run.json");
+        if (!(await pathExists(runJson))) {
+            continue;
+        }
+        const relative = path.join(".rudder", "runs", entry.name, "run.json");
+        const target = path.join(repoStage, relative);
+        if (!isInside(repoRoot, runJson) || !isInside(repoStage, target)) {
+            continue;
+        }
+        await ensureDir(path.dirname(target));
+        await fsp.cp(runJson, target, { force: true });
+        copied.push(relative);
+        runs += 1;
+    }
+    return { runs, files: copied };
 }
 async function copyRepoFiles(repoRoot, repoStage) {
     const result = await runCommand("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
@@ -1062,6 +1131,22 @@ async function printResult(result, options) {
             printSailList(sails);
             return;
         }
+        if (typeof record.id === "string" && (typeof record.status === "string" || typeof record.runtime === "string")) {
+            const parts = [
+                record.id,
+                typeof record.status === "string" ? record.status : undefined,
+                typeof record.runtime === "string" ? record.runtime : undefined,
+                typeof record.repoName === "string" ? record.repoName : undefined,
+            ].filter(Boolean);
+            console.log(parts.join("  "));
+            if (record.workspace === true || (record.run === null && typeof record.task !== "string")) {
+                console.log("Rudder workspace uploaded. Use /cloud list to track it.");
+            }
+            else {
+                console.log("Cloud worker created. Use /cloud list to track it.");
+            }
+            return;
+        }
     }
     console.log(JSON.stringify(result, null, 2));
 }
@@ -1105,7 +1190,9 @@ Usage:
   rudder cloud byoc [ssh-host]
   rudder cloud vm ["task"]
   rudder cloud list
-  rudder cloud onload <runId>
+  rudder cloud onload [runId]
+      no runId uploads the current Rudder workspace state
+  rudder cloud logs <id>
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]
   rudder cloud setup-byoc <ssh-host>   compatibility alias
