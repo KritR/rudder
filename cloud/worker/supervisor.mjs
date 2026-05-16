@@ -242,6 +242,125 @@ function stageSnapshot() {
     sh("git add -A");
     sh('git commit -qm "rudder cloud baseline" || true');
   }
+  stageMigratedAgents(workdir);
+}
+
+function stageMigratedAgents(workdir) {
+  const migrationPath = "/workspace/unpacked/migration.json";
+  if (!fs.existsSync(migrationPath)) {
+    return;
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(migrationPath, "utf8"));
+  } catch (error) {
+    console.error(`Migration manifest unreadable: ${error.message}`);
+    return;
+  }
+  const agents = Array.isArray(manifest?.agents) ? manifest.agents : [];
+  if (agents.length === 0) {
+    return;
+  }
+  console.log(`Restoring ${agents.length} migrated agent(s)...`);
+  const home = os.homedir() || process.env.HOME || "/root";
+  const placed = [];
+  for (const agent of agents) {
+    if (!agent || typeof agent !== "object") {
+      continue;
+    }
+    if (typeof agent.runId !== "string" || typeof agent.sessionId !== "string") {
+      continue;
+    }
+    const cloudWorktree = typeof agent.cloudWorktreeRelativePath === "string"
+      ? agent.cloudWorktreeRelativePath
+      : null;
+    if (!cloudWorktree) {
+      continue;
+    }
+    const stagedWorktree = path.join("/workspace/unpacked/migrated-worktrees", agent.runId);
+    if (fs.existsSync(stagedWorktree)) {
+      fs.mkdirSync(cloudWorktree, { recursive: true });
+      sh(`cp -R ${shQuote(stagedWorktree + "/.")} ${shQuote(cloudWorktree + "/")}`);
+      if (!fs.existsSync(path.join(cloudWorktree, ".git"))) {
+        sh(`cd ${shQuote(cloudWorktree)} && git init -q && git config user.email rudder-cloud@local && git config user.name "Rudder Cloud" && git add -A && git commit -qm "rudder cloud baseline (migrated agent ${agent.runId})" || true`);
+      }
+    } else {
+      fs.mkdirSync(cloudWorktree, { recursive: true });
+    }
+
+    const stagedJsonl = path.join(
+      "/workspace/unpacked",
+      agent.sessionJsonlSnapshotPath || `migrated-sessions/${agent.runId}.jsonl`,
+    );
+    if (fs.existsSync(stagedJsonl)) {
+      const encoded = encodeClaudeProjectsCwd(cloudWorktree);
+      const claudeProjectDir = path.join(home, ".claude", "projects", encoded);
+      fs.mkdirSync(claudeProjectDir, { recursive: true });
+      const dest = path.join(claudeProjectDir, `${agent.sessionId}.jsonl`);
+      sh(`cp ${shQuote(stagedJsonl)} ${shQuote(dest)}`);
+      placed.push({
+        runId: agent.runId,
+        sessionId: agent.sessionId,
+        worktreePath: cloudWorktree,
+        worktreeBranch: agent.worktreeBranch || null,
+        task: agent.task || "",
+        taskSummary: agent.taskSummary || "",
+        backend: agent.backend || "claude",
+      });
+    } else {
+      console.log(`Skipping migrated agent ${agent.runId}: jsonl missing in snapshot`);
+    }
+  }
+
+  if (placed.length === 0) {
+    return;
+  }
+
+  for (const entry of placed) {
+    const runJsonPath = path.join(workdir, ".rudder", "runs", entry.runId, "run.json");
+    if (!fs.existsSync(runJsonPath)) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(runJsonPath, "utf8"));
+    } catch {
+      continue;
+    }
+    record.repoRoot = workdir;
+    record.worktree = {
+      ...(record.worktree || {}),
+      enabled: true,
+      path: entry.worktreePath,
+      branch: entry.worktreeBranch || record.worktree?.branch,
+    };
+    record.session = {
+      ...(record.session || {}),
+      nativeSessionId: entry.sessionId,
+    };
+    record.status = record.status === "completed" || record.status === "merged" ? record.status : "running";
+    record.migration = {
+      origin: "local",
+      pendingResume: true,
+      sessionId: entry.sessionId,
+      migratedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(runJsonPath, JSON.stringify(record, null, 2));
+  }
+
+  const summary = {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    agents: placed,
+  };
+  const summaryDir = path.join(workdir, ".rudder");
+  fs.mkdirSync(summaryDir, { recursive: true });
+  fs.writeFileSync(path.join(summaryDir, "migration.json"), JSON.stringify(summary, null, 2));
+  console.log(`Migrated ${placed.length} agent(s); dashboard will resume them on startup.`);
+}
+
+function encodeClaudeProjectsCwd(absolutePath) {
+  return String(absolutePath).replace(/[^A-Za-z0-9-]/g, "-");
 }
 
 function heartbeatUrl() {

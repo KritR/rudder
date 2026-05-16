@@ -5,15 +5,28 @@ import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
 import { currentBranch, currentCommit, findRepoRoot } from "./git.js";
+import {
+  type MigrationCandidate,
+  type MigrationManifestEntry,
+  type MigrationPlan,
+  type MigrationSnapshotManifest,
+  applyDefaultDecisions,
+  cloudWorktreeAbsolutePath,
+  findMigrationCandidates,
+  migrationSummary,
+  summaryAsJson,
+} from "./migration.js";
 import { cloudAuthPath } from "./state.js";
 import type { CloudAuthState, CloudSail, JsonValue } from "./types.js";
 import {
   ensureDir,
   commandExists,
   expandHome,
+  isTty,
   newRunId,
   nowIso,
   pathExists,
+  promptConfirm,
   promptText,
   promptSelect,
   promptSecret,
@@ -64,10 +77,15 @@ type SnapshotManifest = {
     runs: number;
     files: string[];
   };
+  migratedAgents?: number;
 };
 
 type SnapshotOptions = {
   includeRudderState?: boolean;
+  migration?: {
+    repoName: string;
+    plan: MigrationPlan;
+  };
 };
 
 type CloudClient = {
@@ -1052,6 +1070,23 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     }
   }
 
+  let migratedAgentsCount = 0;
+  if (options.migration && options.migration.plan.migrated.length > 0) {
+    const entries = await stageMigratedAgents(
+      stageDir,
+      repoRoot,
+      options.migration.repoName,
+      options.migration.plan.migrated,
+    );
+    const migrationManifest: MigrationSnapshotManifest = {
+      version: 1,
+      createdAt: nowIso(),
+      agents: entries,
+    };
+    await writeJson(path.join(stageDir, "migration.json"), migrationManifest as unknown as JsonValue);
+    migratedAgentsCount = entries.length;
+  }
+
   const manifest: SnapshotManifest = {
     version: 1,
     createdAt: nowIso(),
@@ -1062,12 +1097,80 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     },
     homePaths: includedHomePaths,
     ...(rudderState ? { rudderState } : {}),
+    ...(migratedAgentsCount > 0 ? { migratedAgents: migratedAgentsCount } : {}),
   };
   await writeJson(path.join(stageDir, "manifest.json"), manifest);
 
   const archivePath = path.join(tempDir, `${newRunId("cloud-snapshot")}.tgz`);
   await runCommand("tar", ["-czf", archivePath, "-C", stageDir, "."], { cwd: stageDir });
   return { tempDir, archivePath, manifest };
+}
+
+async function stageMigratedAgents(
+  stageDir: string,
+  repoRoot: string,
+  repoName: string,
+  migrated: MigrationCandidate[],
+): Promise<MigrationManifestEntry[]> {
+  const worktreesStage = path.join(stageDir, "migrated-worktrees");
+  const sessionsStage = path.join(stageDir, "migrated-sessions");
+  const entries: MigrationManifestEntry[] = [];
+  for (const candidate of migrated) {
+    if (!candidate.sessionId || !candidate.sessionJsonlPath) {
+      continue;
+    }
+    if (!(await pathExists(candidate.worktreePath))) {
+      continue;
+    }
+    if (!(await pathExists(candidate.sessionJsonlPath))) {
+      continue;
+    }
+    const worktreeDest = path.join(worktreesStage, candidate.runId);
+    await ensureDir(worktreeDest);
+    await copyWorktreeFiles(candidate.worktreePath, worktreeDest, repoRoot);
+    const jsonlDest = path.join(sessionsStage, `${candidate.runId}.jsonl`);
+    await ensureDir(path.dirname(jsonlDest));
+    await fsp.cp(candidate.sessionJsonlPath, jsonlDest, { force: true });
+    const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId);
+    entries.push({
+      runId: candidate.runId,
+      task: candidate.task,
+      taskSummary: candidate.taskSummary,
+      backend: candidate.backend,
+      sessionId: candidate.sessionId,
+      localWorktreePath: candidate.worktreePath,
+      cloudWorktreeRelativePath: cloudWorktreeAbs,
+      sessionJsonlSnapshotPath: path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`),
+      worktreeBranch: candidate.worktreeBranch,
+    });
+  }
+  return entries;
+}
+
+async function copyWorktreeFiles(worktreePath: string, target: string, _repoRoot: string): Promise<void> {
+  const result = await runCommand("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
+    cwd: worktreePath,
+    allowFailure: true,
+  });
+  const files = result.code === 0
+    ? result.stdout.split("\0").filter(Boolean)
+    : await listFiles(worktreePath);
+  for (const relative of files) {
+    if (!relative || relative.startsWith(".git/") || relative === ".git" || relative.startsWith(".rudder/")) {
+      continue;
+    }
+    const source = path.join(worktreePath, relative);
+    const dest = path.join(target, relative);
+    if (!isInside(worktreePath, source) || !isInside(target, dest)) {
+      continue;
+    }
+    const stat = await fsp.lstat(source).catch(() => null);
+    if (!stat || stat.isDirectory() || !(await shouldIncludeSnapshotPath(source))) {
+      continue;
+    }
+    await ensureDir(path.dirname(dest));
+    await fsp.cp(source, dest, { dereference: false, force: true });
+  }
 }
 
 async function copyRudderState(repoRoot: string, repoStage: string): Promise<{ runs: number; files: string[] }> {
@@ -1402,22 +1505,34 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
   if (!options.json) {
     process.stderr.write(`Resolving cloud workspace for ${repoName}...\n`);
   }
+
+  const migrationPlan = await planAgentMigration(repoRoot, options);
+  const mustUploadSnapshot = Boolean(migrationPlan && migrationPlan.migrated.length > 0);
+
   const baseBody: Record<string, JsonValue> = { workspaceKey, repoName };
   let result: JsonValue | null = null;
-  try {
-    result = await client.request<JsonValue>("/api/rudder/workspace/attach", {
-      method: "POST",
-      body: baseBody,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/snapshot/i.test(message)) {
-      throw error;
+  if (!mustUploadSnapshot) {
+    try {
+      result = await client.request<JsonValue>("/api/rudder/workspace/attach", {
+        method: "POST",
+        body: baseBody,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/snapshot/i.test(message)) {
+        throw error;
+      }
+      result = null;
     }
+  }
+  if (!result) {
     if (!options.json) {
       process.stderr.write(`Uploading workspace snapshot...\n`);
     }
-    const snapshot = await createSnapshot(repoRoot, options.homePaths ?? []);
+    const snapshot = await createSnapshot(repoRoot, options.homePaths ?? [], {
+      includeRudderState: true,
+      migration: migrationPlan ? { repoName, plan: migrationPlan } : undefined,
+    });
     try {
       const body: Record<string, JsonValue> = {
         ...baseBody,
@@ -1428,6 +1543,9 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
           manifest: snapshot.manifest as unknown as JsonValue,
         } as JsonValue,
       };
+      if (migrationPlan && migrationPlan.migrated.length > 0) {
+        body.migratedAgents = summaryAsJson(migrationPlan);
+      }
       result = await client.request<JsonValue>("/api/rudder/workspace/attach", {
         method: "POST",
         body,
@@ -1436,10 +1554,43 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
       await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
     }
   }
+  if (migrationPlan && !options.json) {
+    process.stderr.write(`${migrationSummary(migrationPlan)}\n`);
+  }
   if (!result) {
     throw new Error("Workspace attach returned no result");
   }
   await attachToWorkspaceResult(result, options);
+}
+
+async function planAgentMigration(
+  repoRoot: string,
+  options: CloudCommandOptions,
+): Promise<MigrationPlan | null> {
+  const candidates = await findMigrationCandidates(repoRoot);
+  if (candidates.length === 0) {
+    return null;
+  }
+  const plan = applyDefaultDecisions(candidates);
+  if (options.json) {
+    return plan;
+  }
+  if (!isTty()) {
+    return plan;
+  }
+  console.log(migrationSummary(plan));
+  if (plan.migrated.length === 0) {
+    return plan;
+  }
+  const confirmed = await promptConfirm("Move resumable agents to cloud?", true);
+  if (confirmed) {
+    return plan;
+  }
+  return {
+    candidates,
+    migrated: [],
+    stayedLocal: candidates.map((c) => ({ ...c, decision: "stay" as const })),
+  };
 }
 
 async function attachToWorkspaceResult(result: JsonValue, options: CloudCommandOptions): Promise<void> {

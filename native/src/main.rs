@@ -217,6 +217,15 @@ struct App {
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
     handoff_pending: bool,
+    pending_migration_resumes: Vec<MigratedAgent>,
+    migration_resumes_attempted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MigratedAgent {
+    run_id: String,
+    session_id: String,
+    worktree_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +374,11 @@ impl App {
         } else {
             load_persisted_agents(&cwd)
         };
+        let pending_migration_resumes = if cfg!(test) {
+            Vec::new()
+        } else {
+            read_migration_manifest(&cwd)
+        };
         let cloud = read_cloud_summary();
         Self {
             focus: FocusPane::Task,
@@ -404,6 +418,8 @@ impl App {
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
             handoff_pending: false,
+            pending_migration_resumes,
+            migration_resumes_attempted: false,
         }
     }
 
@@ -1750,6 +1766,79 @@ impl App {
         self.focus = FocusPane::Worker;
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
+        }
+    }
+
+    fn resume_migrated_agents(&mut self) {
+        if self.migration_resumes_attempted {
+            return;
+        }
+        self.migration_resumes_attempted = true;
+        if self.pending_migration_resumes.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_migration_resumes);
+        let mut resumed = 0usize;
+        for entry in pending {
+            if let Some(idx) = self.agents.iter().position(|run| run.id == entry.run_id) {
+                if self.spawn_claude_resume_for(idx, &entry) {
+                    resumed += 1;
+                }
+            }
+        }
+        if resumed > 0 {
+            self.notice = Some(format!("resumed {resumed} migrated agent(s) via claude --resume"));
+        }
+    }
+
+    fn spawn_claude_resume_for(&mut self, index: usize, entry: &MigratedAgent) -> bool {
+        let Some(run) = self.agents.get_mut(index) else {
+            return false;
+        };
+        if run.terminal.is_some() && run.status == AgentStatus::Running {
+            return false;
+        }
+        let mut args: Vec<String> = vec![
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+        ];
+        if !run.model.trim().is_empty() {
+            args.push("--model".to_string());
+            args.push(run.model.clone());
+        }
+        if let Some(effort) = run.effort {
+            args.push("--effort".to_string());
+            args.push(effort.as_str().to_string());
+        }
+        args.push("--resume".to_string());
+        args.push(entry.session_id.clone());
+        let command = TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0");
+        let cwd = if entry.worktree_path.as_os_str().is_empty() {
+            run.cwd.clone()
+        } else {
+            entry.worktree_path.clone()
+        };
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.completed_at = None;
+                run.last_output_at = Instant::now();
+                run.last_error = None;
+                run.cwd = cwd;
+                let _ = save_native_run_record(&self.cwd, run);
+                true
+            }
+            Err(error) => {
+                run.last_error = Some(error.to_string());
+                false
+            }
         }
     }
 
@@ -4523,6 +4612,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 
 fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
+    app.resume_migrated_agents();
 
     loop {
         app.poll_agents();
@@ -7802,6 +7892,48 @@ fn native_runs_dir(repo_root: &Path) -> PathBuf {
 
 fn native_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     native_runs_dir(repo_root).join(run_id)
+}
+
+fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
+    let manifest_path = repo_root.join(".rudder").join("migration.json");
+    let Ok(raw) = fs::read_to_string(&manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let agents = value
+        .get("agents")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for agent in agents {
+        let run_id = agent
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let session_id = agent
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let worktree_path = agent
+            .get("worktreePath")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root.to_path_buf());
+        if run_id.is_empty() || session_id.is_empty() {
+            continue;
+        }
+        out.push(MigratedAgent {
+            run_id,
+            session_id,
+            worktree_path,
+        });
+    }
+    out
 }
 
 fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
