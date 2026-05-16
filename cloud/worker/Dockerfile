@@ -35,9 +35,16 @@ RUN npm install --omit=dev --no-audit --no-fund \
   && npm cache clean --force
 COPY cloud/worker/supervisor.mjs ./supervisor.mjs
 
-WORKDIR /workspace
-
 COPY cloud/worker/entrypoint.sh /usr/local/bin/rudder-worker
 RUN chmod +x /usr/local/bin/rudder-worker
+
+# Claude refuses --permission-mode bypassPermissions as root, so we run the
+# supervisor (and everything it spawns) as a non-root user.
+RUN useradd --create-home --shell /bin/bash --uid 1000 rudder \
+  && mkdir -p /workspace \
+  && chown -R rudder:rudder /workspace /opt/rudder-worker
+
+USER rudder
+WORKDIR /workspace
 
 ENTRYPOINT ["rudder-worker"]

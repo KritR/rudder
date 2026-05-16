@@ -2027,6 +2027,12 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         if (!firstFrameRendered) {
           firstFrameRendered = true;
           splash?.handoff();
+          // Re-send resize right after handoff and once more on a small
+          // delay; some terminals don't surface accurate columns/rows
+          // until after alt-screen exits, so the initial resize at WS
+          // open can race.
+          sendResize();
+          setTimeout(sendResize, 150);
         }
         stdout.write(data);
         return;
