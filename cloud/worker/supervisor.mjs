@@ -302,7 +302,7 @@ function stageMigratedAgents(workdir) {
     if (!agent || typeof agent !== "object") {
       continue;
     }
-    if (typeof agent.runId !== "string" || typeof agent.sessionId !== "string") {
+    if (typeof agent.runId !== "string") {
       continue;
     }
     const cloudWorktree = typeof agent.cloudWorktreeRelativePath === "string"
@@ -322,28 +322,35 @@ function stageMigratedAgents(workdir) {
       fs.mkdirSync(cloudWorktree, { recursive: true });
     }
 
-    const stagedJsonl = path.join(
-      "/workspace/unpacked",
-      agent.sessionJsonlSnapshotPath || `migrated-sessions/${agent.runId}.jsonl`,
-    );
-    if (fs.existsSync(stagedJsonl)) {
-      const encoded = encodeClaudeProjectsCwd(cloudWorktree);
-      const claudeProjectDir = path.join(home, ".claude", "projects", encoded);
-      fs.mkdirSync(claudeProjectDir, { recursive: true });
-      const dest = path.join(claudeProjectDir, `${agent.sessionId}.jsonl`);
-      sh(`cp ${shQuote(stagedJsonl)} ${shQuote(dest)}`);
-      placed.push({
-        runId: agent.runId,
-        sessionId: agent.sessionId,
-        worktreePath: cloudWorktree,
-        worktreeBranch: agent.worktreeBranch || null,
-        task: agent.task || "",
-        taskSummary: agent.taskSummary || "",
-        backend: agent.backend || "claude",
-      });
-    } else {
-      console.log(`Skipping migrated agent ${agent.runId}: jsonl missing in snapshot`);
+    const sessionId = typeof agent.sessionId === "string" && agent.sessionId.trim().length > 0
+      ? agent.sessionId.trim()
+      : "";
+    const sessionPathHint = typeof agent.sessionJsonlSnapshotPath === "string"
+      ? agent.sessionJsonlSnapshotPath.trim()
+      : "";
+    let sessionPlaced = "";
+    if (sessionId && sessionPathHint) {
+      const stagedJsonl = path.join("/workspace/unpacked", sessionPathHint);
+      if (fs.existsSync(stagedJsonl)) {
+        const encoded = encodeClaudeProjectsCwd(cloudWorktree);
+        const claudeProjectDir = path.join(home, ".claude", "projects", encoded);
+        fs.mkdirSync(claudeProjectDir, { recursive: true });
+        const dest = path.join(claudeProjectDir, `${sessionId}.jsonl`);
+        sh(`cp ${shQuote(stagedJsonl)} ${shQuote(dest)}`);
+        sessionPlaced = sessionId;
+      } else {
+        console.log(`Migrated agent ${agent.runId}: jsonl missing in snapshot, falling back to fresh restart`);
+      }
     }
+    placed.push({
+      runId: agent.runId,
+      sessionId: sessionPlaced,
+      worktreePath: cloudWorktree,
+      worktreeBranch: agent.worktreeBranch || null,
+      task: agent.task || "",
+      taskSummary: agent.taskSummary || "",
+      backend: agent.backend || "claude",
+    });
   }
 
   if (placed.length === 0) {
@@ -368,15 +375,19 @@ function stageMigratedAgents(workdir) {
       path: entry.worktreePath,
       branch: entry.worktreeBranch || record.worktree?.branch,
     };
-    record.session = {
-      ...(record.session || {}),
-      nativeSessionId: entry.sessionId,
-    };
+    if (entry.sessionId) {
+      record.session = {
+        ...(record.session || {}),
+        nativeSessionId: entry.sessionId,
+      };
+    }
     record.status = record.status === "completed" || record.status === "merged" ? record.status : "running";
     record.migration = {
       origin: "local",
-      pendingResume: true,
-      sessionId: entry.sessionId,
+      pendingResume: Boolean(entry.sessionId),
+      pendingFresh: !entry.sessionId,
+      sessionId: entry.sessionId || null,
+      backend: entry.backend,
       migratedAt: new Date().toISOString(),
     };
     fs.writeFileSync(runJsonPath, JSON.stringify(record, null, 2));

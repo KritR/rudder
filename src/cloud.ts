@@ -1243,31 +1243,34 @@ async function stageMigratedAgents(
   const sessionsStage = path.join(stageDir, "migrated-sessions");
   const entries: MigrationManifestEntry[] = [];
   for (const candidate of migrated) {
-    if (!candidate.sessionId || !candidate.sessionJsonlPath) {
-      continue;
-    }
     if (!(await pathExists(candidate.worktreePath))) {
       continue;
     }
-    if (!(await pathExists(candidate.sessionJsonlPath))) {
-      continue;
-    }
+    const hasSession = Boolean(
+      candidate.sessionId
+        && candidate.sessionJsonlPath
+        && (await pathExists(candidate.sessionJsonlPath)),
+    );
     const worktreeDest = path.join(worktreesStage, candidate.runId);
     await ensureDir(worktreeDest);
     await copyWorktreeFiles(candidate.worktreePath, worktreeDest, repoRoot);
-    const jsonlDest = path.join(sessionsStage, `${candidate.runId}.jsonl`);
-    await ensureDir(path.dirname(jsonlDest));
-    await fsp.cp(candidate.sessionJsonlPath, jsonlDest, { force: true });
+    let sessionJsonlSnapshotPath: string | undefined;
+    if (hasSession) {
+      const jsonlDest = path.join(sessionsStage, `${candidate.runId}.jsonl`);
+      await ensureDir(path.dirname(jsonlDest));
+      await fsp.cp(candidate.sessionJsonlPath!, jsonlDest, { force: true });
+      sessionJsonlSnapshotPath = path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`);
+    }
     const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId);
     entries.push({
       runId: candidate.runId,
       task: candidate.task,
       taskSummary: candidate.taskSummary,
       backend: candidate.backend,
-      sessionId: candidate.sessionId,
+      sessionId: candidate.sessionId ?? "",
       localWorktreePath: candidate.worktreePath,
       cloudWorktreeRelativePath: cloudWorktreeAbs,
-      sessionJsonlSnapshotPath: path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`),
+      sessionJsonlSnapshotPath: sessionJsonlSnapshotPath ?? "",
       worktreeBranch: candidate.worktreeBranch,
     });
   }

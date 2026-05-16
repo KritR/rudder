@@ -1860,25 +1860,43 @@ impl App {
         if run.terminal.is_some() && run.status == AgentStatus::Running {
             return false;
         }
-        let mut args: Vec<String> = vec![
-            "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
-        ];
-        if !run.model.trim().is_empty() {
-            args.push("--model".to_string());
-            args.push(run.model.clone());
-        }
-        if let Some(effort) = run.effort {
-            args.push("--effort".to_string());
-            args.push(effort.as_str().to_string());
-        }
-        args.push("--resume".to_string());
-        args.push(entry.session_id.clone());
-        let command = TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0");
         let cwd = if entry.worktree_path.as_os_str().is_empty() {
             run.cwd.clone()
         } else {
             entry.worktree_path.clone()
+        };
+        // If we have a session_id and the backend is Claude, resume the conversation.
+        // Otherwise fall back to spawning a fresh agent with the original task
+        // (codex/acpx don't support resume, and Claude with no jsonl is best-effort).
+        let resume_path = run.backend == Backend::Claude && !entry.session_id.is_empty();
+        let command = if resume_path {
+            let mut args: Vec<String> = vec![
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ];
+            if !run.model.trim().is_empty() {
+                args.push("--model".to_string());
+                args.push(run.model.clone());
+            }
+            if let Some(effort) = run.effort {
+                args.push("--effort".to_string());
+                args.push(effort.as_str().to_string());
+            }
+            args.push("--resume".to_string());
+            args.push(entry.session_id.clone());
+            TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+        } else {
+            let session_id = mint_session_id_for(run.backend);
+            let cmd = agent_command(
+                run.backend,
+                &run.model,
+                run.effort,
+                &run.task,
+                run.mode,
+                session_id.as_deref(),
+            );
+            run.session_id = session_id;
+            cmd
         };
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
@@ -8077,7 +8095,7 @@ fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
             .unwrap_or_else(|| repo_root.to_path_buf());
-        if run_id.is_empty() || session_id.is_empty() {
+        if run_id.is_empty() {
             continue;
         }
         out.push(MigratedAgent {

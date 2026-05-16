@@ -4,7 +4,7 @@ import path from "node:path";
 import type { JsonValue, RunRecord } from "./types.js";
 import { pathExists, readJson } from "./util.js";
 
-export type MigrationDecision = "migrate" | "stay" | "stop";
+export type MigrationDecision = "migrate" | "migrate-fresh" | "stay" | "stop";
 
 export type MigrationCandidate = {
   runId: string;
@@ -107,15 +107,17 @@ async function classify(record: RunRecord): Promise<MigrationCandidate | null> {
     return { ...base, reason: "missing-worktree", decision: "stay" };
   }
   if (!RESUMABLE_BACKENDS.has(record.backend)) {
-    return { ...base, reason: "unsupported-backend", decision: "stay" };
+    // Non-Claude backends can't resume a conversation, but we can still move
+    // them to the cloud by restarting fresh from the original task.
+    return { ...base, reason: "unsupported-backend", decision: "migrate-fresh" };
   }
   const sessionId = record.session?.nativeSessionId;
   if (!sessionId) {
-    return { ...base, reason: "no-session", decision: "stay" };
+    return { ...base, reason: "no-session", decision: "migrate-fresh" };
   }
   const jsonl = claudeSessionJsonlPath(worktreePath, sessionId);
   if (!(await pathExists(jsonl))) {
-    return { ...base, reason: "no-jsonl", sessionJsonlPath: jsonl, decision: "stay" };
+    return { ...base, reason: "no-jsonl", sessionJsonlPath: jsonl, decision: "migrate-fresh" };
   }
   return { ...base, sessionJsonlPath: jsonl, reason: "resumable", decision: "migrate" };
 }
@@ -172,8 +174,8 @@ export function formatCandidateReason(candidate: MigrationCandidate): string {
 }
 
 export function applyDefaultDecisions(candidates: MigrationCandidate[]): MigrationPlan {
-  const migrated = candidates.filter((c) => c.decision === "migrate");
-  const stayedLocal = candidates.filter((c) => c.decision !== "migrate");
+  const migrated = candidates.filter((c) => c.decision === "migrate" || c.decision === "migrate-fresh");
+  const stayedLocal = candidates.filter((c) => c.decision !== "migrate" && c.decision !== "migrate-fresh");
   return { candidates, migrated, stayedLocal };
 }
 
@@ -182,11 +184,15 @@ export function migrationSummary(plan: MigrationPlan): string {
   lines.push(`${plan.migrated.length} agent${plan.migrated.length === 1 ? "" : "s"} will move to cloud, ${plan.stayedLocal.length} will stay local.`);
   for (const c of plan.migrated) {
     const short = (c.taskSummary || c.task || c.runId).slice(0, 72);
-    lines.push(`  move  ${c.runId}  ${short}`);
+    const tag = c.decision === "migrate-fresh" ? "move*" : "move ";
+    lines.push(`  ${tag} ${c.runId}  ${short}`);
   }
   for (const c of plan.stayedLocal) {
     const short = (c.taskSummary || c.task || c.runId).slice(0, 60);
     lines.push(`  stay  ${c.runId}  ${short}  (${formatCandidateReason(c)})`);
+  }
+  if (plan.migrated.some((c) => c.decision === "migrate-fresh")) {
+    lines.push("  (* fresh restart in cloud; conversation not preserved)");
   }
   return lines.join("\n");
 }
