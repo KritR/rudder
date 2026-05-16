@@ -241,6 +241,13 @@ struct CloudLaunchPrompt {
     scratch_label: String,
     selected_run_id: Option<String>,
     selected_task: Option<String>,
+    choice: CloudLaunchChoice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudLaunchChoice {
+    Upload,
+    Scratch,
 }
 
 struct CloudSummary {
@@ -1862,6 +1869,9 @@ impl App {
                     return true;
                 }
                 let raw_args = parts.collect::<Vec<_>>();
+                if self.maybe_prompt_cloud_launch(&raw_args) {
+                    return true;
+                }
                 let args = self.cloud_command_args(raw_args);
                 let label = cloud_agent_label(&args);
                 self.start_rudder_cli_command(&label, args);
@@ -1885,19 +1895,27 @@ impl App {
         let (selected_run_id, selected_task) = selected
             .map(|(id, task)| (Some(id), Some(task)))
             .unwrap_or((None, None));
+        let choice = if selected_run_id.is_some() {
+            CloudLaunchChoice::Upload
+        } else {
+            CloudLaunchChoice::Scratch
+        };
         self.cloud_prompt = Some(CloudLaunchPrompt {
             scratch_args,
             scratch_label,
             selected_run_id,
             selected_task,
+            choice,
         });
-        self.notice =
-            Some("Cloud launch: press n for new Fly worker, o to upload selected local run, Esc to cancel".to_string());
+        self.notice = Some(
+            "Cloud launch: Up/Down chooses upload or scratch, Enter starts, Esc cancels"
+                .to_string(),
+        );
         true
     }
 
     fn handle_cloud_prompt_key(&mut self, key: KeyEvent) -> bool {
-        let Some(prompt) = self.cloud_prompt.take() else {
+        let Some(mut prompt) = self.cloud_prompt.take() else {
             return false;
         };
         match key.code {
@@ -1905,15 +1923,40 @@ impl App {
                 self.notice = Some("cloud launch cancelled".to_string());
                 true
             }
-            KeyCode::Char('n') | KeyCode::Enter => {
-                self.start_rudder_cli_command_with_env(
-                    &prompt.scratch_label,
-                    prompt.scratch_args,
-                    &[("RUDDER_CLOUD_RUNTIME", "fly")],
-                );
+            KeyCode::Up | KeyCode::Char('k') => {
+                prompt.choice = CloudLaunchChoice::Upload;
+                self.cloud_prompt = Some(prompt);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                prompt.choice = CloudLaunchChoice::Scratch;
+                self.cloud_prompt = Some(prompt);
+                true
+            }
+            KeyCode::Char('n') => {
+                prompt.choice = CloudLaunchChoice::Scratch;
+                self.start_cloud_prompt_choice(prompt);
                 true
             }
             KeyCode::Char('o') => {
+                prompt.choice = CloudLaunchChoice::Upload;
+                self.start_cloud_prompt_choice(prompt);
+                true
+            }
+            KeyCode::Enter => {
+                self.start_cloud_prompt_choice(prompt);
+                true
+            }
+            _ => {
+                self.cloud_prompt = Some(prompt);
+                false
+            }
+        }
+    }
+
+    fn start_cloud_prompt_choice(&mut self, prompt: CloudLaunchPrompt) {
+        match prompt.choice {
+            CloudLaunchChoice::Upload => {
                 if let Some(run_id) = prompt.selected_run_id {
                     let args = vec!["cloud".to_string(), "onload".to_string(), run_id];
                     let label = prompt
@@ -1927,13 +1970,18 @@ impl App {
                         &[("RUDDER_CLOUD_RUNTIME", "fly")],
                     );
                 } else {
-                    self.notice = Some("no local agent selected to upload; press /cloud again and choose new".to_string());
+                    self.notice = Some(
+                        "no local agent selected; press Down then Enter to start from scratch"
+                            .to_string(),
+                    );
                 }
-                true
             }
-            _ => {
-                self.cloud_prompt = Some(prompt);
-                false
+            CloudLaunchChoice::Scratch => {
+                self.start_rudder_cli_command_with_env(
+                    &prompt.scratch_label,
+                    prompt.scratch_args,
+                    &[("RUDDER_CLOUD_RUNTIME", "fly")],
+                );
             }
         }
     }
@@ -1966,6 +2014,7 @@ impl App {
             "bootstrap",
             "runtime",
             "setup",
+            "byoc",
             "setup-byoc",
             "setup-vm",
             "setup-fly",
@@ -3565,6 +3614,51 @@ mod app_tests {
     }
 
     #[test]
+    fn slash_commands_rank_closest_matches() {
+        let mut app = App::new();
+
+        app.task_input = "/cl".to_string();
+        assert_eq!(
+            suggestions_for(&app)
+                .first()
+                .map(|suggestion| suggestion.label.as_str()),
+            Some("/cloud")
+        );
+
+        app.task_input = "/cloud l".to_string();
+        assert_eq!(
+            suggestions_for(&app)
+                .first()
+                .map(|suggestion| suggestion.label.as_str()),
+            Some("/cloud list")
+        );
+
+        app.task_input = "/lgoin".to_string();
+        assert_eq!(
+            suggestions_for(&app)
+                .first()
+                .map(|suggestion| suggestion.label.as_str()),
+            Some("/login")
+        );
+    }
+
+    #[test]
+    fn model_picker_uses_ranked_provider_and_effort_matches() {
+        assert_eq!(
+            provider_suggestions("cdx")
+                .first()
+                .map(|suggestion| suggestion.label.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            effort_suggestions_for(Backend::Codex, "gpt-5.5", "xh")
+                .first()
+                .map(|suggestion| suggestion.label.as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
     fn task_history_walks_backward_forward_and_restores_draft() {
         let history = vec![
             "first task".to_string(),
@@ -4331,13 +4425,12 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ListItem::new(Line::from(vec![
             Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
             Span::styled(
-                if app.cloud_connected { "cloud connected" } else { "cloud offline" },
+                if app.cloud_connected {
+                    "cloud connected"
+                } else {
+                    "cloud offline"
+                },
                 cloud_style(app.cloud_connected, focused),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                app.cloud_runtime.as_deref().unwrap_or("fly"),
-                muted_style(focused),
             ),
         ])),
         ListItem::new(Line::default()),
@@ -4375,6 +4468,14 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
         lines.push(ListItem::new(Line::from(vec![
             Span::styled(marker, accent_style(focused)),
+            if is_cloud_agent(agent) {
+                Span::styled(
+                    "☁ ",
+                    cloud_style(true, focused).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
             Span::styled(truncate_chars(&task_label, task_width), task_style),
         ])));
         lines.push(ListItem::new(Line::from(vec![
@@ -4879,20 +4980,40 @@ fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = prompt
         .selected_task
         .as_deref()
-        .map(|task| format!("Upload selected local run: {}", short_task(task)))
-        .unwrap_or_else(|| "No local run selected to upload".to_string());
+        .map(|task| format!("upload selected local run: {}", short_task(task)))
+        .unwrap_or_else(|| "upload selected local run: none selected".to_string());
+    let upload_selected = prompt.choice == CloudLaunchChoice::Upload;
+    let scratch_selected = prompt.choice == CloudLaunchChoice::Scratch;
+    let row_style = |selected: bool| {
+        if selected {
+            accent_style(true).add_modifier(Modifier::BOLD)
+        } else {
+            app_style()
+        }
+    };
+    let marker = |selected: bool| if selected { "> " } else { "  " };
     let lines = vec![
-        Line::from(Span::styled("Start this work in Rudder Cloud on a Fly microVM.", app_style())),
+        Line::from(Span::styled(
+            "Start this work in Rudder Cloud on a Fly microVM.",
+            app_style(),
+        )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Enter / n ", accent_style(true)),
-            Span::styled("start a fresh cloud worker from this repo", app_style()),
+            Span::styled(marker(upload_selected), accent_style(true)),
+            Span::styled(selected, row_style(upload_selected)),
         ]),
         Line::from(vec![
-            Span::styled("o ", accent_style(true)),
-            Span::styled(selected, app_style()),
+            Span::styled(marker(scratch_selected), accent_style(true)),
+            Span::styled(
+                "start scratch on cloud from this repo",
+                row_style(scratch_selected),
+            ),
         ]),
         Line::from(vec![
+            Span::styled("Up/Down ", muted_style(true)),
+            Span::styled("choose  ", muted_style(true)),
+            Span::styled("Enter ", muted_style(true)),
+            Span::styled("start  ", muted_style(true)),
             Span::styled("Esc ", muted_style(true)),
             Span::styled("cancel", muted_style(true)),
         ]),
@@ -5114,7 +5235,11 @@ fn model_style(focused: bool) -> Style {
 }
 
 fn cloud_style(connected: bool, focused: bool) -> Style {
-    let color = if connected { CLOUD_COLOR } else { INACTIVE_COLOR };
+    let color = if connected {
+        CLOUD_COLOR
+    } else {
+        INACTIVE_COLOR
+    };
     if focused {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     } else {
@@ -5835,7 +5960,9 @@ fn read_cloud_summary() -> CloudSummary {
     {
         return CloudSummary {
             connected: true,
-            runtime: env::var("RUDDER_CLOUD_RUNTIME").ok().filter(|value| !value.trim().is_empty()),
+            runtime: env::var("RUDDER_CLOUD_RUNTIME")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         };
     }
 
@@ -5852,13 +5979,11 @@ fn read_cloud_summary() -> CloudSummary {
         };
     };
     let data = serde_json::from_str::<serde_json::Value>(&raw).ok();
-    let connected = data
-        .as_ref()
-        .is_some_and(|data| {
-            data.get("token")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|token| !token.trim().is_empty())
-        });
+    let connected = data.as_ref().is_some_and(|data| {
+        data.get("token")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.trim().is_empty())
+    });
     let runtime = env::var("RUDDER_CLOUD_RUNTIME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -5883,7 +6008,7 @@ fn cloud_args_start_worker(args: &[&str]) -> bool {
         Some(
             "help" | "login" | "list" | "ls" | "status" | "runtime" | "setup" | "setup-byoc"
             | "setup-vm" | "setup-fly" | "bootstrap" | "pause" | "resume" | "stop" | "logs"
-            | "onload",
+            | "onload" | "byoc" | "vm" | "byo-vm",
         ) => false,
         Some(_) => true,
     }
@@ -6058,15 +6183,137 @@ fn suggestions_for(app: &App) -> Vec<Suggestion> {
         );
     }
 
-    let query = input.trim_start_matches('/').to_ascii_lowercase();
-    command_suggestions()
+    rank_suggestions(command_suggestions(), input.trim_start_matches('/'))
+}
+
+fn rank_suggestions(suggestions: Vec<Suggestion>, query: &str) -> Vec<Suggestion> {
+    let query = normalize_search_text(query);
+    if query.is_empty() {
+        return suggestions;
+    }
+
+    let mut ranked = suggestions
         .into_iter()
-        .filter(|suggestion| {
-            query.is_empty()
-                || suggestion.label.trim_start_matches('/').starts_with(&query)
-                || suggestion.detail.to_ascii_lowercase().contains(&query)
+        .enumerate()
+        .filter_map(|(index, suggestion)| {
+            suggestion_match_score(&suggestion, &query).map(|score| (index, score, suggestion))
         })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked
+        .into_iter()
+        .map(|(_, _, suggestion)| suggestion)
         .collect()
+}
+
+fn suggestion_match_score(suggestion: &Suggestion, query: &str) -> Option<i32> {
+    let label = normalize_search_text(&suggestion.label);
+    let detail = normalize_search_text(&suggestion.detail);
+    [
+        text_match_score(&label, query, 10_000),
+        text_match_score(&detail, query, 3_000),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+fn text_match_score(text: &str, query: &str, base: i32) -> Option<i32> {
+    if text.is_empty() || query.is_empty() {
+        return None;
+    }
+    if text == query {
+        return Some(base + 6_000);
+    }
+    if text.starts_with(query) {
+        return Some(base + 5_000 - text.len() as i32);
+    }
+    if let Some(position) = text.find(query) {
+        return Some(base + 4_000 - (position as i32 * 10) - text.len() as i32);
+    }
+    if let Some(score) = token_prefix_score(text, query) {
+        return Some(base + 3_500 + score);
+    }
+    if let Some(score) = fuzzy_subsequence_score(text, query) {
+        return Some(base + 2_500 + score);
+    }
+
+    let distance = bounded_edit_distance(text, query, 3);
+    let threshold = ((query.chars().count() + 2) / 3).clamp(1, 3);
+    if distance <= threshold {
+        return Some(base + 1_500 - (distance as i32 * 200) - text.len() as i32);
+    }
+    None
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn token_prefix_score(text: &str, query: &str) -> Option<i32> {
+    let mut tokens = text.split_whitespace();
+    let mut score = 0;
+    for part in query.split_whitespace() {
+        let token = tokens.find(|token| token.starts_with(part))?;
+        score += 200 - token.len() as i32;
+    }
+    Some(score)
+}
+
+fn fuzzy_subsequence_score(text: &str, query: &str) -> Option<i32> {
+    let query_chars = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    if query_chars.is_empty() {
+        return None;
+    }
+
+    let mut positions = Vec::with_capacity(query_chars.len());
+    let mut text_iter = text.char_indices();
+    for query_char in query_chars {
+        let (position, _) = text_iter.find(|(_, text_char)| *text_char == query_char)?;
+        positions.push(position as i32);
+    }
+
+    let first = *positions.first().unwrap_or(&0);
+    let last = *positions.last().unwrap_or(&first);
+    let compactness = 800 - (last - first).max(0) * 20;
+    let early = 300 - first * 15;
+    Some(compactness + early)
+}
+
+fn bounded_edit_distance(left: &str, right: &str, max_distance: usize) -> usize {
+    let left = left.chars().take(40).collect::<Vec<_>>();
+    let right = right.chars().take(40).collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > max_distance {
+        return max_distance + 1;
+    }
+
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        let mut row_min = current[0];
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution_cost = usize::from(left_char != right_char);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + substitution_cost);
+            row_min = row_min.min(current[j + 1]);
+        }
+        if row_min > max_distance {
+            return max_distance + 1;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 fn command_suggestions() -> Vec<Suggestion> {
@@ -6107,9 +6354,9 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/cloud list".to_string()),
         },
         Suggestion {
-            label: "/cloud setup-byoc".to_string(),
+            label: "/cloud byoc".to_string(),
             detail: "bring your own computer for cloud workers".to_string(),
-            action: SuggestionAction::RunCommand("/cloud setup-byoc".to_string()),
+            action: SuggestionAction::RunCommand("/cloud byoc".to_string()),
         },
         Suggestion {
             label: "/sail".to_string(),
@@ -6152,22 +6399,18 @@ fn model_provider_or_model_suggestions(rest: &str) -> Vec<Suggestion> {
 }
 
 fn provider_suggestions(query: &str) -> Vec<Suggestion> {
-    [
+    let suggestions = [
         (Backend::Claude, "Claude Code models"),
         (Backend::Codex, "Codex models"),
     ]
     .into_iter()
-    .filter(|(backend, detail)| {
-        query.is_empty()
-            || backend.as_str().starts_with(query)
-            || detail.to_ascii_lowercase().contains(query)
-    })
     .map(|(backend, detail)| Suggestion {
         label: backend.as_str().to_string(),
         detail: detail.to_string(),
         action: SuggestionAction::ChooseModelProvider(backend),
     })
-    .collect()
+    .collect();
+    rank_suggestions(suggestions, query)
 }
 
 fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec<Suggestion> {
@@ -6185,23 +6428,12 @@ fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec<Suggestion
         }
     }
 
-    suggestions
-        .into_iter()
-        .filter(|suggestion| {
-            query.is_empty()
-                || suggestion.label.to_ascii_lowercase().contains(query)
-                || suggestion.detail.to_ascii_lowercase().contains(query)
-        })
-        .collect()
+    rank_suggestions(suggestions, query)
 }
 
 fn effort_suggestions_for(backend: Backend, model: &str, query: &str) -> Vec<Suggestion> {
-    effort_options_for(backend, model)
+    let suggestions = effort_options_for(backend, model)
         .into_iter()
-        .filter(|effort| {
-            let label = effort_label(*effort);
-            query.is_empty() || label.starts_with(&query.to_ascii_lowercase())
-        })
         .map(|effort| {
             let label = effort_label(effort).to_string();
             Suggestion {
@@ -6214,7 +6446,8 @@ fn effort_suggestions_for(backend: Backend, model: &str, query: &str) -> Vec<Sug
                 },
             }
         })
-        .collect()
+        .collect();
+    rank_suggestions(suggestions, query)
 }
 
 fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)> {

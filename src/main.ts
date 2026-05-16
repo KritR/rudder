@@ -652,9 +652,9 @@ Usage:
   rudder login
   rudder cloud [name or task]
   rudder cloud help
-  rudder cloud setup-byoc <ssh-host>
+  rudder cloud byoc <ssh-host>
   rudder cloud runtime [fly|byoc]
-  rudder cloud byoc <task>
+  rudder cloud vm <task>
   rudder cloud list
   rudder cloud onload <runId>
   rudder cloud bootstrap <id>
@@ -680,9 +680,9 @@ Cloud:
   rudder cloud [name or task]     Start a cloud worker from this repo snapshot
   rudder cloud list               List cloud workers/runs
   rudder cloud help               Show cloud command help
-  rudder cloud setup-byoc <ssh>   Use your own SSH host for future cloud launches
+  rudder cloud byoc <ssh>         Use your own SSH host for BYOC cloud launches
   rudder cloud runtime [runtime]  Show or set fly/byoc cloud runtime
-  rudder cloud byoc <task>        Prepare a BYOC worker command for a task
+  rudder cloud vm <task>          Prepare a BYOC worker command for a task
   rudder cloud onload <runId>     Move a local Rudder run to cloud
   rudder cloud bootstrap <id>     Regenerate a BYOC worker command
   rudder cloud pause <id>         Pause an idle cloud worker

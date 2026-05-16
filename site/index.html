@@ -308,9 +308,9 @@ rudder</code>
               <div class="row"><code>/model</code><span>Choose Claude or Codex, then model and effort.</span></div>
               <div class="row"><code>/plan</code><span>Use native read-only planning before implementation.</span></div>
               <div class="row"><code>/login</code><span>Authenticate Rudder Cloud in the browser.</span></div>
-              <div class="row"><code>/cloud</code><span>Start a cloud worker with a generated name.</span></div>
+              <div class="row"><code>/cloud</code><span>Upload the selected run, or choose scratch on Fly.</span></div>
               <div class="row"><code>/cloud list</code><span>List cloud workers.</span></div>
-              <div class="row"><code>/cloud setup-byoc</code><span>Use an SSH host from ~/.ssh/config for future workers.</span></div>
+              <div class="row"><code>/cloud byoc</code><span>Use an SSH host from ~/.ssh/config for BYOC workers.</span></div>
               <div class="row"><code>/sail</code><span>Short alias for starting a cloud worker.</span></div>
             </div>
           </div>
@@ -339,9 +339,10 @@ rudder</code>
             <h2>Cloud</h2>
             <div class="rows">
               <div class="row"><code>rudder login</code><span>Open browser auth and connect this machine.</span></div>
-              <div class="row"><code>rudder cloud</code><span>Start a worker from the current repo snapshot.</span></div>
+              <div class="row"><code>rudder cloud</code><span>Start a Fly worker from the current repo snapshot.</span></div>
               <div class="row"><code>rudder cloud list</code><span>Show cloud workers for your account.</span></div>
-              <div class="row"><code>rudder cloud setup-byoc</code><span>Store an SSH host and start BYOC workers there.</span></div>
+              <div class="row"><code>rudder cloud byoc</code><span>Store an SSH host for BYOC workers.</span></div>
+              <div class="row"><code>rudder cloud vm</code><span>Start a BYOC worker task on that SSH host.</span></div>
               <div class="row"><code>rudder cloud runtime</code><span>Show or change Fly versus BYOC runtime.</span></div>
               <div class="row"><code>rudder cloud onload</code><span>Move a local run into the cloud.</span></div>
               <div class="row"><code>rudder sail</code><span>Start a worker from the current repo.</span></div>

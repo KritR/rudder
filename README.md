@@ -81,7 +81,7 @@ should run locally or be handed to a cloud worker.
 rudder login
 rudder cloud
 rudder cloud list
-rudder cloud setup-byoc rudder-workstation
+rudder cloud byoc rudder-workstation
 rudder cloud onload <runId>
 rudder cloud migration-lab
 rudder sail staging-worker
@@ -93,28 +93,26 @@ override it for local development or another deployment.
 
 Inside the dashboard, `/login` starts browser auth and `/cloud list` lists
 cloud workers after you are logged in. `/cloud` opens a confirmation pane before
-anything launches. Press `Enter` or `n` to start a fresh Fly microVM from the
-current repo, or press `o` to upload the selected local run and continue it in
-the cloud. `/cloud <name>` uses the same prompt but gives the fresh worker a
-specific name. `/cloud help` shows the cloud command reference.
+anything launches. The default option uploads the selected local run and
+recreates it in the cloud. Press Down to choose a scratch Fly microVM from the
+current repo, then Enter to start. `/cloud <name>` uses the same prompt but
+gives the scratch worker a specific name. `/cloud help` shows the cloud command
+reference.
 
 Cloud workers use Fly Machines by default. To bring your own workstation or
 server instead, add it to `~/.ssh/config` and run:
 
 ```bash
-rudder cloud setup-byoc rudder-workstation
+rudder cloud byoc rudder-workstation
 ```
 
 That SSH host should use key-based auth and have Docker available to your SSH
-user. Rudder checks the host and stores it in `~/.rudder/cloud-auth.json`.
 user. Rudder checks the host and stores it in `~/.rudder/cloud.json`.
-After that, `rudder cloud <task>` and `/sail <task>` prepare a BYOC run and
-Rudder tries to start it on that host over SSH. Dashboard `/cloud` always uses
-Fly for its fresh cloud-worker path so the main cloud shortcut behaves
-consistently. Use `rudder cloud setup-fly` to switch future CLI launches back to
-Fly, or `rudder cloud runtime [fly|byoc]` to inspect or change the saved CLI
-runtime. For one BYOC launch without changing the default, use
-`rudder cloud byoc "<task>"`.
+After setup, `rudder cloud vm <task>` prepares a BYOC run and Rudder tries to
+start it on that host over SSH. Dashboard `/cloud` and `/sail` always use Fly
+for their scratch cloud-worker path so the main cloud shortcut behaves
+consistently. Use `rudder cloud runtime [fly|byoc]` to inspect or change the
+saved CLI runtime.
 Set `RUDDER_BYOC_AUTOSTART=0` if you always want Rudder to print the Docker
 command instead of starting it over SSH.
 
@@ -271,19 +269,19 @@ task pane /cloud
 ```
 
 The cloud indicator in the agents pane shows whether the local dashboard is
-connected to Rudder Cloud and which saved CLI runtime is configured.
+connected to Rudder Cloud.
 
 ### BYOC Path
 
 BYOC is for a server you own, reachable through SSH.
 
 ```text
-rudder cloud setup-byoc <ssh-host>
+rudder cloud byoc <ssh-host>
   -> read ~/.ssh/config
   -> verify SSH and Docker
   -> save host in ~/.rudder/cloud.json
 
-rudder cloud byoc "task"
+rudder cloud vm "task"
   -> upload snapshot to Rudder Cloud
   -> receive docker run bootstrap command
   -> run it over SSH with nohup
@@ -389,7 +387,7 @@ through suggestions and `Enter` to choose one.
 | `/login` | Open browser login for Rudder Cloud |
 | `/cloud` | Ask whether to start a fresh Fly cloud worker or upload the selected local run |
 | `/cloud <name>` | Ask the same question, using the name for the fresh Fly worker |
-| `/cloud setup-byoc <ssh-host>` | Use an SSH host from `~/.ssh/config` for future cloud workers |
+| `/cloud byoc <ssh-host>` | Use an SSH host from `~/.ssh/config` for BYOC cloud workers |
 | `/cloud runtime [fly\|byoc]` | Show or set the saved cloud runtime |
 | `/cloud list` | List cloud workers |
 | `/cloud help` | Show cloud command help |
