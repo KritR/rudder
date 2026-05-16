@@ -2012,6 +2012,20 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         return;
       }
       const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      // While the loading splash is up (no remote frame has rendered yet),
+      // Ctrl+C should cancel the local attach instead of being forwarded to
+      // a remote dashboard the user can't see.
+      if (!firstFrameRendered && buffer.length === 1 && buffer[0] === 0x03) {
+        try { socket.close(1000, "client-cancel"); } catch { /* ignore */ }
+        cleanup();
+        if (!opened) {
+          reject(new Error("Cloud attach cancelled"));
+        } else {
+          process.stderr.write("\nCancelled.\n");
+          resolve("exited");
+        }
+        return;
+      }
       socket.send(buffer, { binary: true });
     };
 
@@ -2120,13 +2134,27 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         return;
       }
       if (message.type === "status") {
+        // If the worker dies before we've ever seen a remote frame, the
+        // session is effectively dead. Don't sit on a splash spinner pretending
+        // it'll come back; bail.
+        if (message.state === "worker-disconnected" && !firstFrameRendered) {
+          splash?.dispose();
+          try { socket.close(1000, "worker-gone"); } catch { /* ignore */ }
+          cleanup();
+          if (!opened) {
+            reject(new Error("Cloud worker exited before the dashboard started"));
+          } else {
+            process.stderr.write("\nCloud worker exited before the dashboard started.\n");
+            result = "failed";
+            resolve(result);
+          }
+          return;
+        }
         if (splash && !firstFrameRendered) {
           if (message.state === "worker-waiting") {
             splash.setStatus(`Waiting for cloud worker · ${target.label}`);
           } else if (message.state === "worker-connected") {
             splash.setStatus(`Cloud worker connected · loading dashboard`);
-          } else if (message.state === "worker-disconnected") {
-            splash.setStatus(`Cloud worker disconnected · waiting for reconnect`);
           }
         } else if (!options.json && !options.quietBanner) {
           if (message.state === "worker-disconnected") {
