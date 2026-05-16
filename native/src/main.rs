@@ -1908,7 +1908,7 @@ impl App {
             choice,
         });
         self.notice = Some(
-            "Cloud launch: Up/Down chooses upload or scratch, Enter starts, Esc cancels"
+            "Cloud launch: Enter onloads current run; Down selects scratch cloud directory"
                 .to_string(),
         );
         true
@@ -1971,7 +1971,7 @@ impl App {
                     );
                 } else {
                     self.notice = Some(
-                        "no local agent selected; press Down then Enter to start from scratch"
+                        "no current Rudder run selected; press Down then Enter to start scratch"
                             .to_string(),
                     );
                 }
@@ -4980,8 +4980,8 @@ fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = prompt
         .selected_task
         .as_deref()
-        .map(|task| format!("upload selected local run: {}", short_task(task)))
-        .unwrap_or_else(|| "upload selected local run: none selected".to_string());
+        .map(|task| format!("onload current Rudder run to cloud: {}", short_task(task)))
+        .unwrap_or_else(|| "onload current Rudder run to cloud: none selected".to_string());
     let upload_selected = prompt.choice == CloudLaunchChoice::Upload;
     let scratch_selected = prompt.choice == CloudLaunchChoice::Scratch;
     let row_style = |selected: bool| {
@@ -4994,7 +4994,7 @@ fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let marker = |selected: bool| if selected { "> " } else { "  " };
     let lines = vec![
         Line::from(Span::styled(
-            "Start this work in Rudder Cloud on a Fly microVM.",
+            "Move the current run to Rudder Cloud, or start a fresh cloud worker.",
             app_style(),
         )),
         Line::from(""),
@@ -5005,7 +5005,7 @@ fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(marker(scratch_selected), accent_style(true)),
             Span::styled(
-                "start scratch on cloud from this repo",
+                "start scratch in a fresh cloud directory",
                 row_style(scratch_selected),
             ),
         ]),

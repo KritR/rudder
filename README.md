@@ -93,10 +93,10 @@ override it for local development or another deployment.
 
 Inside the dashboard, `/login` starts browser auth and `/cloud list` lists
 cloud workers after you are logged in. `/cloud` opens a confirmation pane before
-anything launches. The default option uploads the selected local run and
-recreates it in the cloud. Press Down to choose a scratch Fly microVM from the
-current repo, then Enter to start. `/cloud <name>` uses the same prompt but
-gives the scratch worker a specific name. `/cloud help` shows the cloud command
+anything launches. The highlighted default option onloads the current Rudder run
+to the cloud. Press Down to choose a scratch Fly microVM in a fresh cloud
+directory, then Enter to start. `/cloud <name>` uses the same prompt but gives
+the scratch worker a specific name. `/cloud help` shows the cloud command
 reference.
 
 Cloud workers use Fly Machines by default. To bring your own workstation or
@@ -260,8 +260,8 @@ the shortcut predictable even if the CLI default runtime was changed to BYOC.
 ```text
 task pane /cloud
   -> confirmation pane
-       Enter or n: fresh Fly microVM
-       o: upload selected local run
+       highlighted: onload current Rudder run to cloud
+       Down: start scratch in a fresh cloud directory
   -> local CLI creates repo snapshot
   -> control plane stores snapshot in S3
   -> control plane creates Fly Machine
