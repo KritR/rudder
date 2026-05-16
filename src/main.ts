@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
@@ -557,43 +556,18 @@ async function runNativeDashboard(): Promise<boolean> {
     return false;
   }
   try {
-    let handoffPath = process.env.RUDDER_HANDOFF_PATH;
-    let handoffPathOwned = false;
-    if (!handoffPath) {
-      handoffPath = path.join(os.tmpdir(), `rudder-handoff-${process.pid}-${Date.now()}.json`);
-      handoffPathOwned = true;
-    }
-    const env = { ...process.env, RUDDER_HANDOFF_PATH: handoffPath };
     const code = await new Promise<number | null>((resolve, reject) => {
       const child = spawn(nativeBinary, process.argv.slice(2), {
         stdio: "inherit",
-        env,
+        env: process.env,
       });
       child.on("error", reject);
       child.on("exit", (exitCode) => resolve(exitCode));
     });
-    const handoff = handoffPathOwned ? await readHandoff(handoffPath) : null;
-    if (handoffPathOwned) {
-      await fsp.unlink(handoffPath).catch(() => undefined);
-    }
-    if (handoff?.kind === "cloud-workspace-attach") {
-      await runCloudCommand("cloud", ["workspace"], {});
-      process.exitCode = process.exitCode ?? 0;
-      return true;
-    }
     process.exitCode = code ?? 1;
     return true;
   } catch {
     return false;
-  }
-}
-
-async function readHandoff(handoffPath: string): Promise<{ kind?: string } | null> {
-  try {
-    const raw = await fsp.readFile(handoffPath, "utf8");
-    return JSON.parse(raw) as { kind?: string };
-  } catch {
-    return null;
   }
 }
 

@@ -216,9 +216,10 @@ struct App {
     last_user_activity: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
-    handoff_pending: bool,
     pending_migration_resumes: Vec<MigratedAgent>,
     migration_resumes_attempted: bool,
+    cloud_takeover: Option<TerminalPane>,
+    cloud_takeover_size: Option<TerminalSize>,
 }
 
 #[derive(Clone, Debug)]
@@ -418,9 +419,10 @@ impl App {
             last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
-            handoff_pending: false,
             pending_migration_resumes,
             migration_resumes_attempted: false,
+            cloud_takeover: None,
+            cloud_takeover_size: None,
         }
     }
 
@@ -440,6 +442,9 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.note_user_activity();
+        if self.cloud_takeover.is_some() {
+            return self.handle_cloud_takeover_key(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
@@ -1899,6 +1904,75 @@ impl App {
         }
     }
 
+    fn enter_cloud_takeover(&mut self) {
+        if self.cloud_takeover.is_some() {
+            self.notice = Some("cloud workspace is already attached; press Esc to detach".to_string());
+            return;
+        }
+        let rudder = locate_rudder_cli();
+        let program = rudder
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "rudder".to_string());
+        let command = TerminalCommand::with_args(program, vec!["cloud".to_string(), "workspace".to_string()])
+            .with_env("RUDDER_CLOUD_NO_ATTACH", "0");
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                self.cloud_takeover = Some(terminal);
+                self.cloud_takeover_size = None;
+                self.notice = Some("cloud workspace attached; press Esc to detach".to_string());
+            }
+            Err(error) => {
+                self.notice = Some(format!("could not launch cloud workspace: {error}"));
+            }
+        }
+    }
+
+    fn handle_cloud_takeover_key(&mut self, key: KeyEvent) -> bool {
+        // Esc twice in a row to detach so single-Esc keystrokes in the remote
+        // dashboard still pass through. Ctrl+] is the explicit detach.
+        if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.exit_cloud_takeover("Ctrl+]");
+            return false;
+        }
+        let Some(terminal) = self.cloud_takeover.as_mut() else {
+            return false;
+        };
+        if let Some(bytes) = terminal_bytes_for_key(key) {
+            let _ = terminal.write_input(&bytes);
+        }
+        false
+    }
+
+    fn exit_cloud_takeover(&mut self, reason: &str) {
+        if self.cloud_takeover.take().is_some() {
+            self.cloud_takeover_size = None;
+            self.notice = Some(format!("cloud workspace detached ({reason})"));
+        }
+    }
+
+    fn poll_cloud_takeover(&mut self) {
+        let alive = self
+            .cloud_takeover
+            .as_mut()
+            .map(|terminal| {
+                let _ = terminal.drain_output();
+                terminal.is_alive()
+            })
+            .unwrap_or(true);
+        if !alive {
+            self.cloud_takeover = None;
+            self.cloud_takeover_size = None;
+            self.notice = Some("cloud workspace detached".to_string());
+        }
+    }
+
     fn restart_selected_agent(&mut self) {
         let Some(run) = self.agents.get_mut(self.selected_agent) else {
             self.notice = Some("no agent selected".to_string());
@@ -2052,19 +2126,7 @@ impl App {
                             Some("not logged in to Rudder Cloud; run /login first".to_string());
                         return true;
                     }
-                    match write_cloud_workspace_handoff() {
-                        Ok(_) => {
-                            self.notice = Some(
-                                "Switching this terminal to the cloud workspace...".to_string(),
-                            );
-                            self.handoff_pending = true;
-                        }
-                        Err(error) => {
-                            self.notice = Some(format!(
-                                "could not request cloud workspace handoff: {error}"
-                            ));
-                        }
-                    }
+                    self.enter_cloud_takeover();
                     return true;
                 }
                 if self.maybe_prompt_cloud_launch(&raw_args) {
@@ -2775,6 +2837,7 @@ impl App {
             self.last_cloud_check = Instant::now();
         }
 
+        self.poll_cloud_takeover();
         self.refresh_cloud_workspace_status();
         self.maybe_notify_workspace_idle();
 
@@ -4689,11 +4752,6 @@ fn run(terminal: &mut Tui) -> Result<()> {
         app.poll_agents();
         terminal.draw(|frame| render(frame, &mut app))?;
 
-        if app.handoff_pending {
-            app.shutdown();
-            return Ok(());
-        }
-
         if event::poll(TICK_RATE)? {
             if handle_event(&mut app, event::read()?) {
                 app.shutdown();
@@ -4734,6 +4792,12 @@ fn handle_event(app: &mut App, event: Event) -> bool {
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
+
+    if app.cloud_takeover.is_some() {
+        render_cloud_takeover(frame, area, app);
+        return;
+    }
+
     let task_height = task_pane_height(app, area.width);
 
     let rows = Layout::default()
@@ -4941,6 +5005,30 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .block(pane_block("agents", focused, app.nav_mode)),
         area,
     );
+}
+
+fn render_cloud_takeover(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let target_size = TerminalSize::new(area.height.max(1), area.width.max(1)).ok();
+    if let (Some(terminal), Some(size)) = (app.cloud_takeover.as_mut(), target_size) {
+        if app.cloud_takeover_size != Some(size) && terminal.resize(size).is_ok() {
+            app.cloud_takeover_size = Some(size);
+        }
+    }
+    let Some(terminal) = app.cloud_takeover.as_mut() else {
+        return;
+    };
+    let lines = terminal
+        .styled_lines()
+        .into_iter()
+        .map(|cells| styled_terminal_line(cells, None))
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(lines).style(app_style()).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+
+    let cursor = terminal.cursor();
+    if cursor.visible && cursor.row < area.height && cursor.col < area.width {
+        frame.set_cursor_position((area.x + cursor.col, area.y + cursor.row));
+    }
 }
 
 fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -6507,24 +6595,6 @@ fn locate_rudder_cli() -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn write_cloud_workspace_handoff() -> Result<()> {
-    let Some(path) = env::var_os("RUDDER_HANDOFF_PATH") else {
-        return Err(anyhow::anyhow!(
-            "RUDDER_HANDOFF_PATH not set (older rudder wrapper?)"
-        ));
-    };
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let payload = serde_json::json!({
-        "kind": "cloud-workspace-attach",
-        "writtenAt": ts,
-    });
-    fs::write(path, serde_json::to_string(&payload)?)?;
-    Ok(())
 }
 
 fn cloud_args_need_auth(args: &[&str]) -> bool {

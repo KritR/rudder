@@ -221,6 +221,14 @@ impl TerminalPane {
         self.writer.flush().context("failed to flush PTY input")
     }
 
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(_) => false,
+        }
+    }
+
     pub fn resize(&mut self, size: TerminalSize) -> Result<()> {
         self.master
             .resize(size.pty_size())
