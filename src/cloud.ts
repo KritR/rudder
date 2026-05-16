@@ -1106,6 +1106,14 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     }
   }
 
+  // On macOS, Claude Code stores its OAuth token in the Keychain rather than
+  // ~/.claude/.credentials.json, so the home-paths copy above doesn't pick it
+  // up. Extract it from the Keychain and stage it as a credentials file so
+  // the cloud worker boots already logged in.
+  if (await stageClaudeKeychainCredentials(homeStage)) {
+    includedHomePaths.push("~/.claude/.credentials.json (keychain)");
+  }
+
   const capturedEnv = captureCloudEnv();
   let capturedEnvCount = 0;
   if (Object.keys(capturedEnv).length > 0) {
@@ -1412,6 +1420,36 @@ function normalizeHomePaths(requested: string[]): string[] {
     paths.push(resolved);
   }
   return paths;
+}
+
+async function stageClaudeKeychainCredentials(homeStage: string): Promise<boolean> {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+  if (!commandExists("security")) {
+    return false;
+  }
+  const result = await runCommand(
+    "security",
+    ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+    { allowFailure: true },
+  );
+  if (result.code !== 0) {
+    return false;
+  }
+  const payload = result.stdout.trim();
+  if (!payload || !payload.startsWith("{")) {
+    return false;
+  }
+  try {
+    JSON.parse(payload);
+  } catch {
+    return false;
+  }
+  const targetDir = path.join(homeStage, ".claude");
+  await ensureDir(targetDir);
+  await fsp.writeFile(path.join(targetDir, ".credentials.json"), payload + "\n", { mode: 0o600 });
+  return true;
 }
 
 async function copyHomePath(source: string, homeStage: string): Promise<boolean> {
