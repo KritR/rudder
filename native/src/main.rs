@@ -210,6 +210,10 @@ struct App {
     cloud_connected: bool,
     cloud_runtime: Option<String>,
     last_cloud_check: Instant,
+    cloud_workspace: Option<CloudWorkspaceStatus>,
+    last_workspace_check: Option<Instant>,
+    workspace_idle_notified: bool,
+    last_user_activity: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
     handoff_pending: bool,
@@ -253,6 +257,15 @@ enum CloudLaunchChoice {
 struct CloudSummary {
     connected: bool,
     runtime: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CloudWorkspaceStatus {
+    id: Option<String>,
+    status: Option<String>,
+    active_agents: bool,
+    client_count: u32,
+    idle_minutes: Option<u32>,
 }
 
 enum MergeIntent {
@@ -384,6 +397,10 @@ impl App {
             cloud_connected: cloud.connected,
             cloud_runtime: cloud.runtime,
             last_cloud_check: Instant::now(),
+            cloud_workspace: None,
+            last_workspace_check: None,
+            workspace_idle_notified: false,
+            last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
             handoff_pending: false,
@@ -405,6 +422,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.note_user_activity();
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
@@ -1924,6 +1942,7 @@ impl App {
                 self.start_rudder_cli_command(&label, args);
                 true
             }
+            Some("/cloud-stop") => self.start_cloud_workspace_stop(),
             _ => false,
         }
     }
@@ -2126,6 +2145,93 @@ impl App {
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
         self.focus = FocusPane::Worker;
+    }
+
+    fn refresh_cloud_workspace_status(&mut self) {
+        if env::var("RUDDER_OFFLINE")
+            .ok()
+            .is_some_and(|value| value == "1")
+        {
+            return;
+        }
+        if !self.cloud_connected {
+            self.cloud_workspace = None;
+            return;
+        }
+        let due = match self.last_workspace_check {
+            None => true,
+            Some(at) => at.elapsed() >= Duration::from_secs(30),
+        };
+        if !due {
+            return;
+        }
+        self.last_workspace_check = Some(Instant::now());
+        let snapshot = query_cloud_workspace_status(&self.cwd);
+        if snapshot.is_some() {
+            self.cloud_workspace = snapshot;
+        } else {
+            self.cloud_workspace = None;
+        }
+    }
+
+    fn maybe_notify_workspace_idle(&mut self) {
+        let Some(workspace) = self.cloud_workspace.as_ref() else {
+            self.workspace_idle_notified = false;
+            return;
+        };
+        let running = workspace
+            .status
+            .as_deref()
+            .is_some_and(|value| value == "running");
+        if !running {
+            self.workspace_idle_notified = false;
+            return;
+        }
+        if workspace.client_count > 0 {
+            self.workspace_idle_notified = false;
+            return;
+        }
+        if self.last_user_activity.elapsed() < Duration::from_secs(30 * 60) {
+            return;
+        }
+        if self.workspace_idle_notified {
+            return;
+        }
+        self.workspace_idle_notified = true;
+        self.notice = Some(
+            "Cloud workspace running idle. Press /cloud-stop to shut it down.".to_string(),
+        );
+    }
+
+    fn note_user_activity(&mut self) {
+        self.last_user_activity = Instant::now();
+        self.workspace_idle_notified = false;
+    }
+
+    fn start_cloud_workspace_stop(&mut self) -> bool {
+        let Some(workspace) = self.cloud_workspace.as_ref() else {
+            self.notice = Some("No cloud workspace tracked for this repo.".to_string());
+            return true;
+        };
+        let Some(id) = workspace.id.clone() else {
+            self.notice = Some("Cloud workspace has no id; refresh and retry.".to_string());
+            return true;
+        };
+        if !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return true;
+        }
+        let args = vec![
+            "cloud".to_string(),
+            "workspace".to_string(),
+            "stop".to_string(),
+            id.clone(),
+        ];
+        let label = format!("cloud workspace stop {id}");
+        self.start_rudder_cli_command(&label, args);
+        // Force a refresh next poll.
+        self.last_workspace_check = None;
+        true
     }
 
     fn selected_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
@@ -2516,6 +2622,9 @@ impl App {
             self.cloud_runtime = cloud.runtime;
             self.last_cloud_check = Instant::now();
         }
+
+        self.refresh_cloud_workspace_status();
+        self.maybe_notify_workspace_idle();
 
         let repo_root = self.cwd.clone();
         for run in &mut self.agents {
@@ -4578,6 +4687,13 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 cloud_style(app.cloud_connected, focused),
             ),
         ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
+            Span::styled(
+                cloud_workspace_label(app.cloud_workspace.as_ref()),
+                cloud_style(app.cloud_workspace.is_some(), focused),
+            ),
+        ])),
         ListItem::new(Line::default()),
     ];
 
@@ -6141,6 +6257,97 @@ fn read_cloud_summary() -> CloudSummary {
     CloudSummary { connected, runtime }
 }
 
+fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) -> String {
+    let Some(workspace) = workspace else {
+        return "cloud workspace · none".to_string();
+    };
+    let status = workspace.status.as_deref().unwrap_or("unknown");
+    if workspace.client_count > 0 {
+        format!(
+            "cloud workspace · {status} · {} attached",
+            workspace.client_count
+        )
+    } else if workspace.active_agents {
+        format!("cloud workspace · {status} · active")
+    } else if let Some(idle) = workspace.idle_minutes {
+        format!("cloud workspace · {status} · idle {idle}m")
+    } else {
+        format!("cloud workspace · {status}")
+    }
+}
+
+fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceStatus> {
+    let rudder = locate_rudder_cli()?;
+    let output = Command::new(rudder)
+        .args(["cloud", "workspace", "status", "--json"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(text.trim()).ok()?;
+    if value.get("offline").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    if value.get("workspace").is_some_and(|v| v.is_null()) {
+        return Some(CloudWorkspaceStatus::default());
+    }
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+    if id.is_none() {
+        return None;
+    }
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+    let client_count = value
+        .get("clientCount")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let active_agents = value
+        .get("activeAgents")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let idle_minutes = value
+        .get("idleMinutes")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as u32);
+    Some(CloudWorkspaceStatus {
+        id,
+        status,
+        active_agents,
+        client_count,
+        idle_minutes,
+    })
+}
+
+fn locate_rudder_cli() -> Option<PathBuf> {
+    if let Ok(value) = env::var("RUDDER_CLI") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // PATH lookup
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join("rudder");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn write_cloud_workspace_handoff() -> Result<()> {
     let Some(path) = env::var_os("RUDDER_HANDOFF_PATH") else {
         return Err(anyhow::anyhow!(
@@ -6546,6 +6753,11 @@ fn command_suggestions() -> Vec<Suggestion> {
             label: "/cloud byoc".to_string(),
             detail: "bring your own computer for cloud workers".to_string(),
             action: SuggestionAction::RunCommand("/cloud byoc".to_string()),
+        },
+        Suggestion {
+            label: "/cloud-stop".to_string(),
+            detail: "shut down the cloud workspace for this repo".to_string(),
+            action: SuggestionAction::RunCommand("/cloud-stop".to_string()),
         },
         Suggestion {
             label: "/sail".to_string(),

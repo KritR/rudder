@@ -1449,7 +1449,25 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
 
   const authContext = requireBearer(req);
   if (req.method === "GET" && url.pathname === "/api/rudder/workspace") {
-    sendJson(res, 200, { workspaces: listAccountWorkspaces(authContext.accountId) });
+    sendJson(res, 200, {
+      workspaces: listAccountWorkspaces(authContext.accountId).map(annotateWorkspaceClients),
+    });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/rudder/workspace/lookup") {
+    const key = url.searchParams.get("key");
+    if (!key) {
+      sendJson(res, 400, { error: "key is required" });
+      return;
+    }
+    const row = findWorkspaceByKey.get(authContext.accountId, key) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) {
+      sendJson(res, 404, { error: "workspace not found" });
+      return;
+    }
+    sendJson(res, 200, annotateWorkspaceClients(rowToWorkspace(row)));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/workspace/attach") {
@@ -2111,6 +2129,11 @@ async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerRespons
 
 function listAccountWorkspaces(accountId: string): Workspace[] {
   return (listWorkspacesForAccount.all(accountId) as unknown[]).map(rowToWorkspace);
+}
+
+function annotateWorkspaceClients(workspace: Workspace): Workspace & { clientCount: number } {
+  const channel = workspaceChannels.get(workspace.id);
+  return { ...workspace, clientCount: channel ? channel.clients.size : 0 };
 }
 
 function getAccountWorkspace(id: string, accountId: string): Workspace | null {
