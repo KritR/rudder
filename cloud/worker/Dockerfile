@@ -40,7 +40,7 @@ RUN chmod +x /usr/local/bin/rudder-worker
 
 # Claude refuses --permission-mode bypassPermissions as root, so we run the
 # supervisor (and everything it spawns) as a non-root user.
-RUN useradd --create-home --shell /bin/bash --uid 1000 rudder \
+RUN useradd --create-home --shell /bin/bash --uid 1500 rudder \
   && mkdir -p /workspace \
   && chown -R rudder:rudder /workspace /opt/rudder-worker
 
