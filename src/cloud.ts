@@ -1361,7 +1361,15 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
   const sub = args[0] ?? "";
   const rest = args.slice(1);
   if (sub === "" || sub === "attach") {
-    await workspaceAttach(options);
+    await workspaceAttach(rest, options);
+    return;
+  }
+  if (sub === "share") {
+    await workspaceShare(options);
+    return;
+  }
+  if (sub === "status") {
+    await workspaceStatus(options);
     return;
   }
   if (sub === "stop") {
@@ -1372,7 +1380,7 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
     await workspaceList(options);
     return;
   }
-  throw new Error("Usage: rudder cloud workspace [attach|stop|list]");
+  throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|stop|list]");
 }
 
 function computeWorkspaceKey(repoRoot: string): string {
@@ -1380,7 +1388,12 @@ function computeWorkspaceKey(repoRoot: string): string {
   return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
 }
 
-async function workspaceAttach(options: CloudCommandOptions): Promise<void> {
+async function workspaceAttach(args: string[], options: CloudCommandOptions): Promise<void> {
+  const explicitId = args[0];
+  if (explicitId) {
+    await workspaceAttachById(explicitId, options);
+    return;
+  }
   const repoRoot = findRepoRoot();
   const workspaceKey = computeWorkspaceKey(repoRoot);
   const repoName = path.basename(repoRoot);
@@ -1457,6 +1470,141 @@ async function waitForWorkspaceWorker(workspaceId: string): Promise<void> {
   // Give the Fly machine a moment to boot before the WS attach so users see the dashboard, not a wait-for-worker banner.
   await new Promise((resolve) => setTimeout(resolve, 1500));
   void workspaceId;
+}
+
+async function workspaceAttachById(workspaceId: string, options: CloudCommandOptions): Promise<void> {
+  if (options.json) {
+    printJson({ id: workspaceId, attaching: true });
+  } else if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    process.stderr.write(`Workspace ${workspaceId}: attach requires a TTY.\n`);
+    return;
+  }
+  if (process.env.RUDDER_CLOUD_NO_ATTACH === "1") {
+    return;
+  }
+  await runAttach(
+    { kind: "workspace", id: workspaceId, label: `workspace ${workspaceId}` },
+    { ...options, quietBanner: false },
+  );
+}
+
+async function lookupWorkspaceForRepo(
+  options: CloudCommandOptions,
+): Promise<Record<string, JsonValue> | null> {
+  void options;
+  const repoRoot = findRepoRoot();
+  const workspaceKey = computeWorkspaceKey(repoRoot);
+  const client = await cloudClient({ requireToken: true });
+  try {
+    const result = await client.request<JsonValue>(
+      `/api/rudder/workspace/lookup?key=${encodeURIComponent(workspaceKey)}`,
+      { method: "GET" },
+    );
+    if (result && typeof result === "object" && !Array.isArray(result)) {
+      return result as Record<string, JsonValue>;
+    }
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/not found/i.test(message) || /404/.test(message)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function workspaceShare(options: CloudCommandOptions): Promise<void> {
+  const workspace = await lookupWorkspaceForRepo(options);
+  if (!workspace) {
+    if (options.json) {
+      printJson({ workspace: null });
+      return;
+    }
+    console.log("No cloud workspace exists for this repo yet. Run `rudder cloud workspace attach` to create one.");
+    return;
+  }
+  const id = typeof workspace.id === "string" ? workspace.id : "";
+  if (!id) {
+    throw new Error("Workspace lookup returned no id");
+  }
+  if (options.json) {
+    printJson({
+      id,
+      attachCommand: `rudder cloud workspace attach ${id}`,
+      status: workspace.status ?? null,
+    });
+    return;
+  }
+  console.log("Share this workspace with a teammate by sending them:");
+  console.log("");
+  console.log(`  rudder cloud workspace attach ${id}`);
+  console.log("");
+  console.log("They must already be logged in to Rudder Cloud with their own account (run `rudder cloud login` if not).");
+}
+
+async function workspaceStatus(options: CloudCommandOptions): Promise<void> {
+  if (process.env.RUDDER_OFFLINE === "1") {
+    if (options.json) {
+      printJson({ offline: true, workspace: null });
+    } else {
+      console.log("RUDDER_OFFLINE is set; skipping cloud workspace status check.");
+    }
+    return;
+  }
+  const workspace = await lookupWorkspaceForRepo(options).catch((error) => {
+    if (!options.json) {
+      console.warn(`Could not reach Rudder Cloud: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return null;
+  });
+  if (!workspace) {
+    if (options.json) {
+      printJson({ workspace: null });
+    } else {
+      console.log("No cloud workspace for this repo.");
+    }
+    return;
+  }
+  const id = typeof workspace.id === "string" ? workspace.id : "";
+  const status = typeof workspace.status === "string" ? workspace.status : "unknown";
+  const clientCount = typeof workspace.clientCount === "number" ? workspace.clientCount : 0;
+  const lastActivityAt = typeof workspace.lastActivityAt === "string" ? workspace.lastActivityAt : undefined;
+  const idleMinutes = computeIdleMinutes(lastActivityAt);
+  const activeAgents = clientCount > 0 || (idleMinutes !== null && idleMinutes < 5);
+  if (options.json) {
+    printJson({
+      id,
+      status,
+      clientCount,
+      lastActivityAt: lastActivityAt ?? null,
+      idleMinutes,
+      activeAgents,
+      repoName: typeof workspace.repoName === "string" ? workspace.repoName : null,
+    });
+    return;
+  }
+  const idlePart = idleMinutes !== null ? `  idle ${idleMinutes}m` : "";
+  console.log(`workspace ${id}  ${status}  clients=${clientCount}${idlePart}`);
+  if (activeAgents) {
+    console.log("Active agents likely running.");
+  } else {
+    console.log("No recent activity.");
+  }
+}
+
+function computeIdleMinutes(lastActivityAt: string | undefined): number | null {
+  if (!lastActivityAt) {
+    return null;
+  }
+  const ms = Date.parse(lastActivityAt);
+  if (!Number.isFinite(ms)) {
+    return null;
+  }
+  const diff = Date.now() - ms;
+  if (diff < 0) {
+    return 0;
+  }
+  return Math.floor(diff / 60_000);
 }
 
 async function workspaceMutate(action: "stop", args: string[], options: CloudCommandOptions): Promise<void> {
@@ -1685,6 +1833,8 @@ Usage:
   rudder cloud logs <id>
   rudder cloud attach <id>
       stream the live cloud worker terminal into this pane
+  rudder cloud workspace [attach [id]|share|status [--json]|stop <id>|list]
+      shared cloud workspace for this repo
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]
   rudder cloud setup-byoc <ssh-host>   compatibility alias
