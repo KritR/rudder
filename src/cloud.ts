@@ -78,6 +78,7 @@ type SnapshotManifest = {
     files: string[];
   };
   migratedAgents?: number;
+  capturedEnvVars?: number;
 };
 
 type SnapshotOptions = {
@@ -101,6 +102,7 @@ const DEFAULT_CLOUD_URL = "https://rudder-cloud-control.fly.dev";
 const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
 const DEFAULT_HOME_PATHS = [
+  // Agent CLIs
   "~/.claude/.credentials.json",
   "~/.claude/settings.json",
   "~/.claude/CLAUDE.md",
@@ -110,19 +112,46 @@ const DEFAULT_HOME_PATHS = [
   "~/.codex/AGENTS.md",
   "~/.codex/hooks.json",
   "~/.codex/rules",
-  "~/.config/gh",
+  // Git + GitHub
   "~/.gitconfig",
+  "~/.config/gh",
+  // Shell rc so PATH/aliases/env exports come along
+  "~/.zshrc",
+  "~/.zprofile",
+  "~/.bashrc",
+  "~/.bash_profile",
+  "~/.profile",
+  "~/.envrc",
+  // Package managers
   "~/.npmrc",
+  "~/.yarnrc",
+  "~/.yarnrc.yml",
+  "~/.cargo/config",
+  "~/.cargo/config.toml",
+  // Cloud provider CLIs
   "~/.vercel",
   "~/.config/vercel",
+  "~/.aws/config",
+  "~/.aws/credentials",
+  "~/.config/gcloud/configurations",
+  "~/.config/gcloud/active_config",
+  "~/.config/gcloud/credentials.db",
+  "~/.config/gcloud/access_tokens.db",
+  "~/.config/gcloud/application_default_credentials.json",
+  "~/.kube/config",
+  // Netrc for tools that auth via netrc
+  "~/.netrc",
+  // Rudder + Hunk
   "~/.config/hunk",
 ];
+// Paths or path components that should never be uploaded under any
+// circumstance — even if a user's DEFAULT_HOME_PATHS entry references them.
+// Specifically leaving out .aws/.kube/.docker so the corresponding configs
+// can ship; .ssh/.gnupg/keychains stay blocked because they contain
+// private key material that isn't recoverable if leaked.
 const SECRET_PATH_PARTS = new Set([
-  ".aws",
   ".ssh",
   ".gnupg",
-  ".kube",
-  ".docker",
   "keychains",
 ]);
 const BULKY_HOME_PATH_PARTS = new Set([
@@ -149,7 +178,6 @@ const SECRET_BASENAMES = new Set([
   ".env.development",
   "id_rsa",
   "id_ed25519",
-  "credentials",
   "known_hosts",
 ]);
 const BULKY_HOME_BASENAME_PATTERNS = [
@@ -1070,6 +1098,14 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     }
   }
 
+  const capturedEnv = captureCloudEnv();
+  let capturedEnvCount = 0;
+  if (Object.keys(capturedEnv).length > 0) {
+    await ensureDir(path.join(stageDir, "env"));
+    await writeJson(path.join(stageDir, "env", "cloud-env.json"), capturedEnv as unknown as JsonValue);
+    capturedEnvCount = Object.keys(capturedEnv).length;
+  }
+
   let migratedAgentsCount = 0;
   if (options.migration && options.migration.plan.migrated.length > 0) {
     const entries = await stageMigratedAgents(
@@ -1098,12 +1134,103 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     homePaths: includedHomePaths,
     ...(rudderState ? { rudderState } : {}),
     ...(migratedAgentsCount > 0 ? { migratedAgents: migratedAgentsCount } : {}),
+    ...(capturedEnvCount > 0 ? { capturedEnvVars: capturedEnvCount } : {}),
   };
   await writeJson(path.join(stageDir, "manifest.json"), manifest);
 
   const archivePath = path.join(tempDir, `${newRunId("cloud-snapshot")}.tgz`);
   await runCommand("tar", ["-czf", archivePath, "-C", stageDir, "."], { cwd: stageDir });
   return { tempDir, archivePath, manifest };
+}
+
+const CLOUD_ENV_DEFAULT_NAMES = new Set([
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "GOOGLE_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "AWS_PROFILE",
+  "VERCEL_TOKEN",
+  "VERCEL_ORG_ID",
+  "VERCEL_PROJECT_ID",
+  "NETLIFY_AUTH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GITLAB_TOKEN",
+  "NPM_TOKEN",
+  "CARGO_REGISTRY_TOKEN",
+  "HUGGING_FACE_HUB_TOKEN",
+  "HF_TOKEN",
+  "DATABASE_URL",
+  "REDIS_URL",
+  "POSTGRES_URL",
+  "STRIPE_API_KEY",
+  "STRIPE_SECRET_KEY",
+  "SLACK_BOT_TOKEN",
+  "DISCORD_TOKEN",
+]);
+const CLOUD_ENV_SUFFIX_PATTERNS = [/_API_KEY$/, /_AUTH_TOKEN$/, /_ACCESS_TOKEN$/, /_TOKEN$/, /_SECRET$/, /_SECRET_KEY$/];
+const CLOUD_ENV_BLOCKLIST = new Set([
+  // Things we explicitly do not want shipping
+  "PATH",
+  "HOME",
+  "USER",
+  "PWD",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "LOGNAME",
+  "SHLVL",
+  "OLDPWD",
+  "DISPLAY",
+  "EDITOR",
+  "PAGER",
+  "LANG",
+  "LC_ALL",
+  // Rudder-internal vars that are set by the worker itself
+  "RUDDER_WORKSPACE_ID",
+  "RUDDER_SAIL_ID",
+  "RUDDER_WORKER_TOKEN",
+  "RUDDER_CLOUD_URL",
+  "RUDDER_SNAPSHOT_URL",
+  "RUDDER_CLOUD_TOKEN",
+  "RUDDER_TASK",
+  "RUDDER_REPO_NAME",
+  "RUDDER_ACCOUNT_ID",
+  "RUDDER_HANDOFF_PATH",
+]);
+
+function captureCloudEnv(): Record<string, string> {
+  const extra = (process.env.RUDDER_CLOUD_ENV_VARS || "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const blockExtra = (process.env.RUDDER_CLOUD_ENV_BLOCKLIST || "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const blocked = new Set([...CLOUD_ENV_BLOCKLIST, ...blockExtra]);
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!name || typeof value !== "string" || !value) {
+      continue;
+    }
+    if (blocked.has(name)) {
+      continue;
+    }
+    const matches = CLOUD_ENV_DEFAULT_NAMES.has(name)
+      || CLOUD_ENV_SUFFIX_PATTERNS.some((pattern) => pattern.test(name))
+      || extra.includes(name);
+    if (!matches) {
+      continue;
+    }
+    out[name] = value;
+  }
+  return out;
 }
 
 async function stageMigratedAgents(

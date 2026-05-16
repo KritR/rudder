@@ -45,6 +45,11 @@ const cwd = process.cwd();
 console.log(`Rudder worker ready in ${cwd}`);
 sh("rudder doctor || true");
 
+const capturedEnv = loadCapturedEnv();
+if (Object.keys(capturedEnv).length > 0) {
+  console.log(`Loaded ${Object.keys(capturedEnv).length} captured env var(s) from local snapshot.`);
+}
+
 const command = "rudder";
 const args = isWorkspaceMode
   ? []
@@ -57,6 +62,7 @@ const term = pty.spawn(command, args, {
   cwd,
   env: {
     ...process.env,
+    ...capturedEnv,
     TERM: "xterm-256color",
     COLORTERM: "truecolor",
     RUDDER_HEADLESS: "0",
@@ -181,6 +187,34 @@ function handleControl(text) {
       // ignore
     }
   }
+}
+
+function loadCapturedEnv() {
+  const candidates = [
+    "/workspace/unpacked/env/cloud-env.json",
+    path.join(process.cwd(), ".rudder", "cloud-env.json"),
+  ];
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) {
+      continue;
+    }
+    try {
+      const raw = fs.readFileSync(candidate, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const out = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof k === "string" && typeof v === "string") {
+            out[k] = v;
+          }
+        }
+        return out;
+      }
+    } catch (error) {
+      console.error(`Failed to load captured env ${candidate}: ${error.message}`);
+    }
+  }
+  return {};
 }
 
 function stagedMarkerPath() {
