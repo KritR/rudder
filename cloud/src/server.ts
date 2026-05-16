@@ -1244,7 +1244,18 @@ async function mutateSail(sail: Sail, accountId: string, action: string): Promis
   if (sail.runtime === "fly") {
     return await mutateFlySail(sail, accountId, action);
   }
-  throw badRequest("BYO VM sails cannot be paused, resumed, or stopped from Rudder Cloud. Stop the worker on your VM instead.");
+  if (action === "stop") {
+    updateSail.run({
+      id: sail.id,
+      accountId,
+      status: "stopped",
+      machineId: sail.machineId ?? null,
+      machineState: "stopped",
+      updatedAt: new Date().toISOString(),
+    });
+    return getAccountSail(sail.id, accountId) ?? sail;
+  }
+  throw badRequest("BYO VM sails cannot be paused or resumed from Rudder Cloud. Stop the worker on your VM, or use stop to mark it stopped.");
 }
 
 async function mutateFlySail(sail: Sail, accountId: string, action: string): Promise<Sail> {
