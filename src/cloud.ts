@@ -198,6 +198,14 @@ export async function runCloudCommand(command: string, args: string[], options: 
     return;
   }
 
+  // `rudder cloud` with no further args means "open the cloud workspace for
+  // this repo". Explicit subcommands (sail, launch, etc.) keep their old
+  // behavior. `rudder sail` and `rudder cloud sail` still launch a sail.
+  if (command === "cloud" && subcommand === "") {
+    await workspaceCommand([], options);
+    return;
+  }
+
   switch (subcommand) {
     case "login":
       await login(options);
