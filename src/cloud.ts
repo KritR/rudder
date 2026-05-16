@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { WebSocket } from "ws";
 import { currentBranch, currentCommit, findRepoRoot } from "./git.js";
 import { cloudAuthPath } from "./state.js";
 import type { CloudAuthState, CloudSail, JsonValue } from "./types.js";
@@ -26,6 +27,8 @@ type CloudCommandOptions = {
   json?: boolean;
   homePaths?: string[];
   sshHost?: string;
+  noAttach?: boolean;
+  quietBanner?: boolean;
 };
 
 type LoginStartResponse = {
@@ -75,7 +78,7 @@ type CloudRuntime = "fly" | "byo-vm";
 
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
-const DEFAULT_CLOUD_URL = "https://mpd2pmnpep.us-east-1.awsapprunner.com";
+const DEFAULT_CLOUD_URL = "https://rudder-cloud-control.fly.dev";
 const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
 const DEFAULT_HOME_PATHS = [
@@ -174,6 +177,9 @@ export async function runCloudCommand(command: string, args: string[], options: 
       return;
     case "logs":
       await logs(rest, options);
+      return;
+    case "attach":
+      await attach(rest, options);
       return;
     case "onload":
       await onload(rest, options);
@@ -456,6 +462,7 @@ async function launch(
       body,
     });
     await printResult(result, options);
+    await maybeAutoAttach(result, options);
   } finally {
     await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
   }
@@ -503,6 +510,7 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
       body,
     });
     await printResult(result, options);
+    await maybeAutoAttach(result, options);
   } finally {
     await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
   }
@@ -1345,6 +1353,191 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function attach(args: string[], options: CloudCommandOptions): Promise<void> {
+  const sailId = args[0];
+  if (!sailId) {
+    throw new Error("Usage: rudder cloud attach <id>");
+  }
+  await runAttach(sailId, options);
+}
+
+type AttachResult = "exited" | "failed";
+
+async function runAttach(sailId: string, options: CloudCommandOptions): Promise<AttachResult> {
+  const client = await cloudClient({ requireToken: true });
+  const baseUrl = client.baseUrl;
+  const state = await loadCloudAuth();
+  const envToken = process.env.RUDDER_CLOUD_TOKEN?.trim();
+  const token = envToken || (state?.cloudUrl === baseUrl ? state.token : undefined);
+  if (!token) {
+    throw new Error("Not logged in to Rudder Cloud. Run `rudder login` first.");
+  }
+  const wsUrl = baseUrl.replace(/^http/, "ws").replace(/\/$/, "")
+    + `/api/rudder/sail/${encodeURIComponent(sailId)}/attach`;
+
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  const isInteractive = Boolean(stdin.isTTY && stdout.isTTY);
+
+  return await new Promise<AttachResult>((resolve, reject) => {
+    const socket = new WebSocket(wsUrl, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    socket.binaryType = "nodebuffer";
+    let opened = false;
+    let cleaned = false;
+    let result: AttachResult = "exited";
+
+    const sendResize = () => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const cols = stdout.columns ?? 120;
+      const rows = stdout.rows ?? 32;
+      socket.send(JSON.stringify({ type: "resize", cols, rows }));
+    };
+
+    const onStdin = (chunk: Buffer | string) => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      socket.send(buffer, { binary: true });
+    };
+
+    const onResize = () => sendResize();
+
+    const cleanup = () => {
+      if (cleaned) {
+        return;
+      }
+      cleaned = true;
+      stdin.off("data", onStdin);
+      stdout.off("resize", onResize);
+      if (isInteractive && stdin.isTTY) {
+        try {
+          stdin.setRawMode(false);
+        } catch {
+          // ignore
+        }
+      }
+      stdin.pause();
+    };
+
+    socket.on("open", () => {
+      opened = true;
+      if (!options.json && !options.quietBanner) {
+        const tail = isInteractive ? " (Ctrl+C sends to remote; close this pane to detach)" : "";
+        process.stderr.write(`Attached to ${sailId}${tail}\n`);
+      }
+      sendResize();
+      if (isInteractive) {
+        try {
+          stdin.setRawMode(true);
+        } catch {
+          // ignore
+        }
+      }
+      stdin.resume();
+      stdin.on("data", onStdin);
+      stdout.on("resize", onResize);
+    });
+
+    socket.on("message", (data, isBinary) => {
+      if (isBinary && Buffer.isBuffer(data)) {
+        stdout.write(data);
+        return;
+      }
+      const text = Buffer.isBuffer(data)
+        ? data.toString("utf8")
+        : Array.isArray(data)
+          ? Buffer.concat(data).toString("utf8")
+          : Buffer.from(data as ArrayBuffer).toString("utf8");
+      handleControlText(text);
+    });
+
+    socket.on("close", (code, reason) => {
+      cleanup();
+      if (!opened) {
+        const reasonText = reason && reason.length ? reason.toString("utf8") : "";
+        reject(new Error(`Cloud attach failed (code ${code}${reasonText ? `: ${reasonText}` : ""})`));
+        return;
+      }
+      resolve(result);
+    });
+
+    socket.on("error", (err) => {
+      if (!opened) {
+        cleanup();
+        reject(new Error(`Cloud attach failed: ${err.message}`));
+      }
+    });
+
+    function handleControlText(text: string): void {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        stdout.write(text);
+        return;
+      }
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+      const message = payload as { type?: string; state?: string; code?: number };
+      if (message.type === "exit") {
+        result = message.code === 0 ? "exited" : "failed";
+        if (typeof process.exitCode !== "number" && message.code !== undefined) {
+          process.exitCode = message.code;
+        }
+        return;
+      }
+      if (message.type === "status" && !options.json && !options.quietBanner) {
+        if (message.state === "worker-disconnected") {
+          process.stderr.write("\nCloud worker disconnected; waiting for reconnect...\n");
+        } else if (message.state === "worker-connected") {
+          process.stderr.write("Cloud worker connected.\n");
+        }
+      }
+    }
+  });
+}
+
+async function maybeAutoAttach(result: JsonValue, options: CloudCommandOptions): Promise<void> {
+  if (options.json || options.noAttach) {
+    return;
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return;
+  }
+  if (process.env.RUDDER_CLOUD_NO_ATTACH === "1") {
+    return;
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return;
+  }
+  const record = result as Record<string, JsonValue>;
+  if (typeof record.bootstrapCommand === "string") {
+    return;
+  }
+  const sailId = extractSailId(record);
+  if (!sailId) {
+    return;
+  }
+  try {
+    await runAttach(sailId, { ...options, quietBanner: false });
+  } catch (error) {
+    console.warn(`Could not attach to ${sailId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function extractSailId(record: Record<string, JsonValue>): string | undefined {
+  if (typeof record.id === "string" && record.id) {
+    return record.id;
+  }
+  return undefined;
+}
+
 function printCloudHelp(): void {
   console.log(`rudder cloud
 
@@ -1359,6 +1552,8 @@ Usage:
   rudder cloud onload [runId]
       no runId uploads the current Rudder workspace state
   rudder cloud logs <id>
+  rudder cloud attach <id>
+      stream the live cloud worker terminal into this pane
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]
   rudder cloud setup-byoc <ssh-host>   compatibility alias

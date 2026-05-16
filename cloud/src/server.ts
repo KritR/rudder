@@ -9,6 +9,8 @@ import Database from "better-sqlite3";
 import { toNodeHandler } from "better-auth/node";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import type { Duplex } from "node:stream";
+import { WebSocket, WebSocketServer } from "ws";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -68,8 +70,8 @@ const awsRegion = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "u
 const snapshotBucket = process.env.RUDDER_S3_BUCKET || "";
 const flyApiToken = process.env.FLY_API_TOKEN || "";
 const flyApiBase = (process.env.FLY_API_HOSTNAME || "https://api.machines.dev").replace(/\/$/, "");
-const flyAppName = process.env.FLY_APP_NAME || "";
-const flyRegion = process.env.FLY_REGION || "iad";
+const flyAppName = (process.env.RUDDER_FLY_APP_NAME || process.env.FLY_APP_NAME || "").trim();
+const flyRegion = (process.env.RUDDER_FLY_REGION || process.env.FLY_REGION || "iad").trim();
 const flyWorkerImage = process.env.RUDDER_WORKER_IMAGE || "ghcr.io/viraatdas/rudder-worker:latest";
 const flyWorkerMemoryMb = Number(process.env.RUDDER_WORKER_MEMORY_MB || 1024);
 const flyWorkerCpus = Number(process.env.RUDDER_WORKER_CPUS || 1);
@@ -308,9 +310,201 @@ const server = http.createServer(async (req, res) => {
     const status = error && typeof error === "object" && "status" in error && typeof error.status === "number"
       ? error.status
       : 500;
+    console.error(`request error ${req.method} ${req.url} -> ${status}`, error);
     sendJson(res, status, { error: error instanceof Error ? error.message : String(error) });
   }
 });
+
+const ATTACH_PATH_RE = /^\/api\/rudder\/sail\/([^/]+)\/(worker|attach)$/;
+const SAIL_REPLAY_BYTES = 256 * 1024;
+
+type SailChannel = {
+  worker?: WebSocket;
+  clients: Set<WebSocket>;
+  buffer: Buffer[];
+  bufferBytes: number;
+};
+
+const sailChannels = new Map<string, SailChannel>();
+
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+  try {
+    const url = new URL(req.url || "/", baseURL);
+    const match = ATTACH_PATH_RE.exec(url.pathname);
+    if (!match) {
+      destroyUpgrade(socket, 404);
+      return;
+    }
+    const sailId = match[1];
+    const role = match[2] as "worker" | "attach";
+    const sailRow = findSailById.get(sailId) as Record<string, unknown> | undefined;
+    if (!sailRow) {
+      destroyUpgrade(socket, 404);
+      return;
+    }
+    if (role === "worker") {
+      try {
+        requireWorkerBearer(req, sailRow);
+      } catch {
+        destroyUpgrade(socket, 401);
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => attachWorker(sailId, ws));
+      return;
+    }
+    let auth;
+    try {
+      auth = requireBearer(req);
+    } catch {
+      destroyUpgrade(socket, 401);
+      return;
+    }
+    if (String(sailRow.account_id) !== auth.accountId) {
+      destroyUpgrade(socket, 403);
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => attachClient(sailId, ws));
+  } catch {
+    destroyUpgrade(socket, 500);
+  }
+});
+
+function destroyUpgrade(socket: Duplex, status: number): void {
+  const reason = status === 401 ? "Unauthorized"
+    : status === 403 ? "Forbidden"
+    : status === 404 ? "Not Found"
+    : "Internal Server Error";
+  try {
+    socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  } catch {
+    // ignore
+  }
+  socket.destroy();
+}
+
+function getChannel(sailId: string): SailChannel {
+  let channel = sailChannels.get(sailId);
+  if (!channel) {
+    channel = { clients: new Set(), buffer: [], bufferBytes: 0 };
+    sailChannels.set(sailId, channel);
+  }
+  return channel;
+}
+
+function disposeChannelIfEmpty(sailId: string): void {
+  const channel = sailChannels.get(sailId);
+  if (!channel) {
+    return;
+  }
+  if (!channel.worker && channel.clients.size === 0) {
+    sailChannels.delete(sailId);
+  }
+}
+
+function attachWorker(sailId: string, ws: WebSocket): void {
+  const channel = getChannel(sailId);
+  if (channel.worker && channel.worker.readyState === WebSocket.OPEN) {
+    try {
+      channel.worker.close(4000, "replaced");
+    } catch {
+      // ignore
+    }
+  }
+  channel.worker = ws;
+  channel.buffer = [];
+  channel.bufferBytes = 0;
+  broadcastStatus(channel, "worker-connected");
+
+  ws.on("message", (data, isBinary) => {
+    if (isBinary && data instanceof Buffer) {
+      pushBuffer(channel, data);
+      for (const client of channel.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(data, { binary: true });
+        }
+      }
+      return;
+    }
+    if (data instanceof Buffer) {
+      const text = data.toString("utf8");
+      forwardTextToClients(channel, text);
+    }
+  });
+
+  ws.on("close", () => {
+    if (channel.worker === ws) {
+      channel.worker = undefined;
+    }
+    broadcastStatus(channel, "worker-disconnected");
+    disposeChannelIfEmpty(sailId);
+  });
+  ws.on("error", () => undefined);
+}
+
+function attachClient(sailId: string, ws: WebSocket): void {
+  const channel = getChannel(sailId);
+  channel.clients.add(ws);
+
+  ws.send(JSON.stringify({
+    type: "status",
+    state: channel.worker ? "worker-connected" : "worker-waiting",
+  }));
+  for (const chunk of channel.buffer) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(chunk, { binary: true });
+    }
+  }
+
+  ws.on("message", (data, isBinary) => {
+    const worker = channel.worker;
+    if (!worker || worker.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (isBinary && data instanceof Buffer) {
+      worker.send(data, { binary: true });
+      return;
+    }
+    if (data instanceof Buffer) {
+      worker.send(data.toString("utf8"));
+    }
+  });
+
+  ws.on("close", () => {
+    channel.clients.delete(ws);
+    disposeChannelIfEmpty(sailId);
+  });
+  ws.on("error", () => undefined);
+}
+
+function pushBuffer(channel: SailChannel, chunk: Buffer): void {
+  channel.buffer.push(chunk);
+  channel.bufferBytes += chunk.length;
+  while (channel.bufferBytes > SAIL_REPLAY_BYTES && channel.buffer.length > 1) {
+    const dropped = channel.buffer.shift();
+    if (dropped) {
+      channel.bufferBytes -= dropped.length;
+    }
+  }
+}
+
+function forwardTextToClients(channel: SailChannel, text: string): void {
+  for (const client of channel.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(text);
+    }
+  }
+}
+
+function broadcastStatus(channel: SailChannel, state: string): void {
+  const payload = JSON.stringify({ type: "status", state });
+  for (const client of channel.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
 
 server.listen(port, () => {
   console.log(`rudder cloud listening on ${baseURL}`);

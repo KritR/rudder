@@ -686,6 +686,7 @@ Cloud:
   rudder cloud vm <task>          Prepare a BYOC worker command for a task
   rudder cloud onload [runId]     Move this Rudder workspace, or one run, to cloud
   rudder cloud logs <id>          Show cloud worker status while log streaming is pending
+  rudder cloud attach <id>        Attach this terminal to a live cloud worker
   rudder cloud bootstrap <id>     Regenerate a BYOC worker command
   rudder cloud pause <id>         Pause an idle cloud worker
   rudder cloud resume <id>        Resume a cloud worker
