@@ -2074,15 +2074,17 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       socket.send(JSON.stringify({ type: "resize", cols, rows }));
     };
 
+    let lastCtrlC = 0;
     const onStdin = (chunk: Buffer | string) => {
       if (socket.readyState !== WebSocket.OPEN) {
         return;
       }
       const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      const isCtrlC = buffer.length === 1 && buffer[0] === 0x03;
       // While the loading splash is up (no remote frame has rendered yet),
       // Ctrl+C should cancel the local attach instead of being forwarded to
       // a remote dashboard the user can't see.
-      if (!firstFrameRendered && buffer.length === 1 && buffer[0] === 0x03) {
+      if (isCtrlC && !firstFrameRendered) {
         try { socket.close(1000, "client-cancel"); } catch { /* ignore */ }
         cleanup();
         if (!opened) {
@@ -2092,6 +2094,20 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
           resolve("exited");
         }
         return;
+      }
+      // After handoff: forward Ctrl+C to the remote so Claude/codex can be
+      // cancelled, but if the user mashes Ctrl+C twice within 2 seconds we
+      // take it as "the remote is unresponsive; get me out".
+      if (isCtrlC && firstFrameRendered) {
+        const now = Date.now();
+        if (now - lastCtrlC < 2000) {
+          process.stderr.write("\nForce-exiting local attach (press Ctrl+C again to re-enter).\n");
+          try { socket.close(1000, "client-force-quit"); } catch { /* ignore */ }
+          cleanup();
+          resolve("exited");
+          return;
+        }
+        lastCtrlC = now;
       }
       socket.send(buffer, { binary: true });
     };
@@ -2108,6 +2124,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       cleaned = true;
       stdin.off("data", onStdin);
       stdout.off("resize", onResize);
+      process.off("SIGINT", onSigint);
       splash?.dispose();
       if (isInteractive && stdin.isTTY) {
         try {
@@ -2118,6 +2135,20 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       }
       stdin.pause();
     };
+
+    const onSigint = () => {
+      // Belt-and-suspenders: if raw mode failed for any reason, Node still
+      // sees SIGINT. Close cleanly so the user never gets a frozen terminal.
+      process.stderr.write("\nReceived SIGINT, closing cloud attach.\n");
+      try { socket.close(1000, "sigint"); } catch { /* ignore */ }
+      cleanup();
+      if (!opened) {
+        reject(new Error("Cloud attach cancelled"));
+      } else {
+        resolve("exited");
+      }
+    };
+    process.once("SIGINT", onSigint);
 
     socket.on("open", () => {
       opened = true;
