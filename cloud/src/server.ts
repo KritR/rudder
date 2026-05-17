@@ -2004,12 +2004,14 @@ async function reuseOrRestartWorkspace(
     ).catch(() => null);
   }
   const snapshotInput = objectField(body, "snapshot");
-  const snapshotKey = snapshotInput
-    ? (await storeSnapshot(workspace.accountId, body)).key
-    : workspace.snapshotKey;
-  if (!snapshotKey) {
-    throw badRequest("snapshot is required to restart this workspace");
+  // Always require a fresh snapshot when we have to (re)create a machine:
+  // the stored snapshot can be days old and miss credentials, env vars, or
+  // shell-rc-files the user has since changed. Forcing the CLI to re-upload
+  // keeps the cloud workspace in sync with whatever the user has locally.
+  if (!snapshotInput) {
+    throw badRequest("snapshot is required to (re)create this workspace");
   }
+  const snapshotKey = (await storeSnapshot(workspace.accountId, body)).key;
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const now = new Date().toISOString();
   updateWorkspaceSnapshot.run({ id: workspace.id, snapshotKey, updatedAt: now });
