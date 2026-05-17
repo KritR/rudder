@@ -2029,12 +2029,6 @@ async function reuseOrRestartWorkspace(
   // env with a freshly-signed snapshot URL and start it; the supervisor
   // skips re-staging because the marker file is still there. Much faster
   // than destroy+recreate.
-  console.log(
-    `workspace ${workspace.id} attach: state=${machine?.state ?? "absent"} `
-    + `storedFp=${workspace.snapshotFingerprint?.slice(0, 8) ?? "none"} `
-    + `incomingFp=${incomingFingerprint?.slice(0, 8) ?? "none"} `
-    + `match=${fingerprintMatches}`,
-  );
   if (
     machine
     && machine.id
@@ -2128,7 +2122,6 @@ async function warmRestartWorkspaceMachine(params: {
   // (Workers can fetch a fresh snapshot URL on demand from the control plane
   // if they ever need to re-stage.)
   void params.snapshotKey;
-  console.log(`warm restart ${params.machineId}: starting (reusing staged /workspace)`);
   try {
     return await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}/start`,
