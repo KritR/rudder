@@ -1693,9 +1693,11 @@ async function detectFlyRegion(baseUrl: string): Promise<string | undefined> {
   return undefined;
 }
 
-async function computeSnapshotFingerprint(repoRoot: string, requestedHomePaths: string[]): Promise<string> {
+async function computeSnapshotFingerprint(repoRoot: string, _requestedHomePaths: string[]): Promise<string> {
   const hash = createHash("sha256");
-  // Repo: HEAD commit + dirty file list
+  // Repo state: HEAD commit + the porcelain dirty file list. Two attaches
+  // from the same repo at the same commit with no edits should produce the
+  // same fingerprint.
   const headCommit = await currentCommit(repoRoot).catch(() => "");
   hash.update(`repo:head:${headCommit}\n`);
   const status = await runCommand("git", ["status", "--porcelain", "-z"], {
@@ -1705,14 +1707,8 @@ async function computeSnapshotFingerprint(repoRoot: string, requestedHomePaths: 
   if (status.code === 0) {
     hash.update(`repo:status:${status.stdout}\n`);
   }
-  // Home paths content
-  const paths = normalizeHomePaths(requestedHomePaths);
-  for (const homePath of paths) {
-    const stat = await fsp.stat(homePath).catch(() => null);
-    if (!stat) continue;
-    hash.update(`home:${homePath}:${stat.size}:${stat.mtimeMs}\n`);
-  }
-  // macOS Keychain credentials (since we ship them too)
+  // macOS Keychain claude credentials: hash content so re-logging in
+  // invalidates the cache but a steady-state user keeps it.
   if (process.platform === "darwin") {
     const creds = await runCommand("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
       allowFailure: true,
@@ -1721,9 +1717,11 @@ async function computeSnapshotFingerprint(repoRoot: string, requestedHomePaths: 
       hash.update(`keychain:claude:${createHash("sha256").update(creds.stdout).digest("hex")}\n`);
     }
   }
-  // Captured env vars
+  // Captured env vars (excluding ones we know rotate like AWS session tokens).
   const env = captureCloudEnv();
+  const unstable = new Set(["AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"]);
   for (const key of Object.keys(env).sort()) {
+    if (unstable.has(key)) continue;
     hash.update(`env:${key}:${createHash("sha256").update(env[key] ?? "").digest("hex")}\n`);
   }
   return hash.digest("hex").slice(0, 32);
