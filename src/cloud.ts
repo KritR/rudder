@@ -1667,6 +1667,68 @@ function computeWorkspaceKey(repoRoot: string): string {
   return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
 }
 
+let cachedFlyRegion: string | undefined;
+async function detectFlyRegion(baseUrl: string): Promise<string | undefined> {
+  if (process.env.RUDDER_CLOUD_REGION) {
+    return process.env.RUDDER_CLOUD_REGION.trim().toLowerCase();
+  }
+  if (cachedFlyRegion) {
+    return cachedFlyRegion;
+  }
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/health`, { method: "GET" });
+    const requestId = response.headers.get("fly-request-id");
+    if (requestId) {
+      // Fly request-id format: <ulid>-<region>
+      const dash = requestId.lastIndexOf("-");
+      const region = dash > 0 ? requestId.slice(dash + 1).trim().toLowerCase() : "";
+      if (region && region.length <= 6 && /^[a-z]+$/.test(region)) {
+        cachedFlyRegion = region;
+        return region;
+      }
+    }
+  } catch {
+    // ignore — server will fall back to its default region
+  }
+  return undefined;
+}
+
+async function computeSnapshotFingerprint(repoRoot: string, requestedHomePaths: string[]): Promise<string> {
+  const hash = createHash("sha256");
+  // Repo: HEAD commit + dirty file list
+  const headCommit = await currentCommit(repoRoot).catch(() => "");
+  hash.update(`repo:head:${headCommit}\n`);
+  const status = await runCommand("git", ["status", "--porcelain", "-z"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  if (status.code === 0) {
+    hash.update(`repo:status:${status.stdout}\n`);
+  }
+  // Home paths content
+  const paths = normalizeHomePaths(requestedHomePaths);
+  for (const homePath of paths) {
+    const stat = await fsp.stat(homePath).catch(() => null);
+    if (!stat) continue;
+    hash.update(`home:${homePath}:${stat.size}:${stat.mtimeMs}\n`);
+  }
+  // macOS Keychain credentials (since we ship them too)
+  if (process.platform === "darwin") {
+    const creds = await runCommand("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
+      allowFailure: true,
+    });
+    if (creds.code === 0) {
+      hash.update(`keychain:claude:${createHash("sha256").update(creds.stdout).digest("hex")}\n`);
+    }
+  }
+  // Captured env vars
+  const env = captureCloudEnv();
+  for (const key of Object.keys(env).sort()) {
+    hash.update(`env:${key}:${createHash("sha256").update(env[key] ?? "").digest("hex")}\n`);
+  }
+  return hash.digest("hex").slice(0, 32);
+}
+
 async function workspaceAttach(args: string[], options: CloudCommandOptions): Promise<void> {
   const explicitId = args[0];
   if (explicitId) {
@@ -1685,7 +1747,14 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
   const migrationPlan = await planAgentMigration(repoRoot, options);
   const mustUploadSnapshot = Boolean(migrationPlan && migrationPlan.migrated.length > 0);
 
-  const baseBody: Record<string, JsonValue> = { workspaceKey, repoName };
+  const region = await detectFlyRegion(client.baseUrl).catch(() => undefined);
+  const fingerprint = await computeSnapshotFingerprint(repoRoot, options.homePaths ?? []);
+  const baseBody: Record<string, JsonValue> = {
+    workspaceKey,
+    repoName,
+    snapshotFingerprint: fingerprint,
+    ...(region ? { region } : {}),
+  };
   let result: JsonValue | null = null;
   if (!mustUploadSnapshot) {
     try {

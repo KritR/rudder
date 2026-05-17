@@ -64,6 +64,8 @@ type Workspace = {
   machineId?: string;
   machineState?: string;
   snapshotKey?: string;
+  snapshotFingerprint?: string;
+  region?: string;
   lastActivityAt?: string;
   lastHeartbeatAt?: string;
   createdAt: string;
@@ -206,6 +208,8 @@ database.exec(`
 ensureColumn("rudder_sails", "worker_token_hash", "text");
 ensureColumn("rudder_sails", "last_heartbeat_at", "text");
 ensureColumn("rudder_sails", "runtime", "text");
+ensureColumn("rudder_workspaces", "region", "text");
+ensureColumn("rudder_workspaces", "snapshot_fingerprint", "text");
 
 const insertToken = database.prepare(`
   insert or replace into rudder_tokens (token_hash, account_id, email, created_at, last_used_at)
@@ -252,10 +256,12 @@ const updateWorkerToken = database.prepare(`
 const insertWorkspace = database.prepare(`
   insert into rudder_workspaces (
     id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
-    snapshot_key, worker_token_hash, last_activity_at, last_heartbeat_at, created_at, updated_at
+    snapshot_key, snapshot_fingerprint, region, worker_token_hash, last_activity_at,
+    last_heartbeat_at, created_at, updated_at
   ) values (
     @id, @accountId, @workspaceKey, @repoName, @status, @machineId, @machineState,
-    @snapshotKey, @workerTokenHash, @lastActivityAt, @lastHeartbeatAt, @createdAt, @updatedAt
+    @snapshotKey, @snapshotFingerprint, @region, @workerTokenHash, @lastActivityAt,
+    @lastHeartbeatAt, @createdAt, @updatedAt
   )
 `);
 const findWorkspaceByKey = database.prepare(
@@ -282,6 +288,7 @@ const updateWorkspaceMachine = database.prepare(`
 const updateWorkspaceSnapshot = database.prepare(`
   update rudder_workspaces
   set snapshot_key = @snapshotKey,
+      snapshot_fingerprint = @snapshotFingerprint,
       updated_at = @updatedAt
   where id = @id
 `);
@@ -425,7 +432,16 @@ type ChannelKind = "sail" | "workspace";
 const sailChannels = new Map<string, Channel>();
 const workspaceChannels = new Map<string, Channel>();
 
-const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wss = new WebSocketServer({
+  noServer: true,
+  // Compress large terminal redraws (a single Claude frame can be many kB of
+  // ANSI). Skip small frames so per-keystroke echoes don't pay the deflate
+  // tax.
+  perMessageDeflate: {
+    threshold: 1024,
+    zlibDeflateOptions: { level: 1 },
+  },
+});
 
 server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
   try {
@@ -1914,7 +1930,9 @@ async function createWorkspace(
   body: Json,
   repoName: string | undefined,
 ): Promise<JsonRecord> {
+  const region = sanitizeRegion(stringField(body, "region"));
   const snapshot = await storeSnapshot(accountId, body);
+  const snapshotFingerprint = stringField(body, "snapshotFingerprint") ?? null;
   const now = new Date().toISOString();
   const id = uniqueWorkspaceId(repoName);
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
@@ -1927,6 +1945,8 @@ async function createWorkspace(
     machineId: null,
     machineState: null,
     snapshotKey: snapshot.key,
+    snapshotFingerprint,
+    region,
     workerTokenHash: tokenHash(workerToken),
     lastActivityAt: now,
     lastHeartbeatAt: null,
@@ -1940,6 +1960,7 @@ async function createWorkspace(
     snapshotUrl,
     workerToken,
     repoName,
+    region: region ?? undefined,
   });
   const status = flyStateToWorkspaceStatus(machine.state);
   updateWorkspaceMachine.run({
@@ -1959,6 +1980,8 @@ async function createWorkspace(
     machineId: machine.id,
     machineState: machine.state,
     snapshotKey: snapshot.key,
+    snapshotFingerprint: snapshotFingerprint ?? undefined,
+    region: region ?? undefined,
     createdAt: now,
     updatedAt: now,
   } as Workspace;
@@ -1978,17 +2001,12 @@ async function reuseOrRestartWorkspace(
       { method: "GET" },
     ).catch(() => null);
   }
-  // Only reuse a machine that is currently running. Stopped/suspended
-  // machines hold a stale (presigned, 1-hour-expiring) snapshot URL in their
-  // env, so trying to start them again hits a 403 from S3 and the supervisor
-  // crashes. Tear down anything that isn't already running and create a fresh
-  // machine with a freshly-signed snapshot URL.
+  // Path 1: machine already running -> just attach.
   if (machine && (machine.state === "started" || machine.state === "starting")) {
-    const status = flyStateToWorkspaceStatus(machine.state);
     const now = new Date().toISOString();
     updateWorkspaceMachine.run({
       id: workspace.id,
-      status,
+      status: flyStateToWorkspaceStatus(machine.state),
       machineId: machine.id ?? workspace.machineId ?? null,
       machineState: machine.state ?? null,
       updatedAt: now,
@@ -1997,24 +2015,65 @@ async function reuseOrRestartWorkspace(
     const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
     return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
   }
+
+  const incomingFingerprint = stringField(body, "snapshotFingerprint") ?? null;
+  const snapshotInput = objectField(body, "snapshot");
+  const fingerprintMatches = Boolean(
+    incomingFingerprint
+      && workspace.snapshotFingerprint
+      && incomingFingerprint === workspace.snapshotFingerprint,
+  );
+
+  // Path 2: warm restart — machine exists but is stopped, and the user's
+  // local state hasn't changed (fingerprint matches). Update the machine's
+  // env with a freshly-signed snapshot URL and start it; the supervisor
+  // skips re-staging because the marker file is still there. Much faster
+  // than destroy+recreate.
+  if (
+    machine
+    && machine.id
+    && (machine.state === "stopped" || machine.state === "suspended")
+    && fingerprintMatches
+    && workspace.snapshotKey
+  ) {
+    const restarted = await warmRestartWorkspaceMachine({
+      machineId: machine.id,
+      snapshotKey: workspace.snapshotKey,
+    }).catch(() => null);
+    if (restarted) {
+      const now = new Date().toISOString();
+      updateWorkspaceMachine.run({
+        id: workspace.id,
+        status: flyStateToWorkspaceStatus(restarted.state),
+        machineId: restarted.id ?? machine.id,
+        machineState: restarted.state ?? null,
+        updatedAt: now,
+      });
+      updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+      const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
+      return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
+    }
+    // Warm restart failed (env update error, etc.) — fall through to
+    // destroy+recreate so the user always gets a working machine.
+  }
+
+  // Path 3: must (re)create a machine. Either no machine, machine is gone,
+  // or fingerprint mismatch (user's local state changed). Need a fresh
+  // snapshot from the CLI.
   if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
     await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
       { method: "DELETE" },
     ).catch(() => null);
   }
-  const snapshotInput = objectField(body, "snapshot");
-  // Always require a fresh snapshot when we have to (re)create a machine:
-  // the stored snapshot can be days old and miss credentials, env vars, or
-  // shell-rc-files the user has since changed. Forcing the CLI to re-upload
-  // keeps the cloud workspace in sync with whatever the user has locally.
   if (!snapshotInput) {
     throw badRequest("snapshot is required to (re)create this workspace");
   }
   const snapshotKey = (await storeSnapshot(workspace.accountId, body)).key;
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const now = new Date().toISOString();
-  updateWorkspaceSnapshot.run({ id: workspace.id, snapshotKey, updatedAt: now });
+  const region = sanitizeRegion(stringField(body, "region")) ?? workspace.region ?? null;
+  updateWorkspaceSnapshot.run({ id: workspace.id, snapshotKey, snapshotFingerprint: incomingFingerprint, updatedAt: now });
   updateWorkspaceWorkerToken.run({ id: workspace.id, workerTokenHash: tokenHash(workerToken), updatedAt: now });
   const snapshotUrl = await signedSnapshotUrl(snapshotKey);
   const fresh = await createFlyWorkspaceMachine({
@@ -2023,11 +2082,11 @@ async function reuseOrRestartWorkspace(
     snapshotUrl,
     workerToken,
     repoName: repoName ?? workspace.repoName,
+    region: region ?? undefined,
   });
-  const status = flyStateToWorkspaceStatus(fresh.state);
   updateWorkspaceMachine.run({
     id: workspace.id,
-    status,
+    status: flyStateToWorkspaceStatus(fresh.state),
     machineId: fresh.id ?? null,
     machineState: fresh.state ?? null,
     updatedAt: new Date().toISOString(),
@@ -2037,19 +2096,57 @@ async function reuseOrRestartWorkspace(
   return { ...(next ? rowToWorkspace(next) : workspace), isNew: true } as unknown as JsonRecord;
 }
 
+const FLY_REGIONS = new Set([
+  "ams","arn","atl","bog","bom","bos","cdg","den","dfw","ewr","eze","fra","gdl",
+  "gig","gru","hkg","iad","jnb","lax","lhr","mad","maa","mia","nrt","ord","otp",
+  "phx","qro","scl","sea","sin","sjc","syd","waw","yul","yyz",
+]);
+
+function sanitizeRegion(value: string | undefined): string | null {
+  if (!value) return null;
+  const lower = value.trim().toLowerCase();
+  return FLY_REGIONS.has(lower) ? lower : null;
+}
+
+async function warmRestartWorkspaceMachine(params: {
+  machineId: string;
+  snapshotKey: string;
+}): Promise<FlyMachine | null> {
+  ensureFlyConfigured();
+  const snapshotUrl = await signedSnapshotUrl(params.snapshotKey);
+  // Pull current config, patch RUDDER_SNAPSHOT_URL, push back. Fly's PATCH
+  // semantics need a full config object so we round-trip.
+  const current = await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}`,
+    { method: "GET" },
+  );
+  const config = (current?.config as JsonRecord | undefined) ?? {};
+  const env = ((config as JsonRecord).env as JsonRecord | undefined) ?? {};
+  const newConfig = { ...config, env: { ...env, RUDDER_SNAPSHOT_URL: snapshotUrl } } as JsonRecord;
+  await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}`,
+    { method: "POST", body: { config: newConfig } },
+  );
+  return await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}/start`,
+    { method: "POST", body: {} },
+  );
+}
+
 async function createFlyWorkspaceMachine(params: {
   workspaceId: string;
   accountId: string;
   snapshotUrl: string;
   workerToken: string;
   repoName?: string;
+  region?: string;
 }): Promise<FlyMachine> {
   ensureFlyConfigured();
   const machine = await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
     method: "POST",
     body: {
       name: `rudder-ws-${params.workspaceId}`,
-      region: flyRegion,
+      region: params.region || flyRegion,
       config: {
         image: flyWorkerImage,
         env: {
@@ -2159,6 +2256,8 @@ function rowToWorkspace(row: unknown): Workspace {
     machineId: optionalString(value.machine_id),
     machineState: optionalString(value.machine_state),
     snapshotKey: optionalString(value.snapshot_key),
+    snapshotFingerprint: optionalString(value.snapshot_fingerprint),
+    region: optionalString(value.region),
     lastActivityAt: optionalString(value.last_activity_at),
     lastHeartbeatAt: optionalString(value.last_heartbeat_at),
     createdAt: String(value.created_at),
