@@ -218,6 +218,8 @@ struct App {
     mouse_debug_last: Option<String>,
     pending_migration_resumes: Vec<MigratedAgent>,
     migration_resumes_attempted: bool,
+    rename_input: Option<String>,
+    rename_cursor: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +421,8 @@ impl App {
             mouse_debug_last: None,
             pending_migration_resumes,
             migration_resumes_attempted: false,
+            rename_input: None,
+            rename_cursor: 0,
         }
     }
 
@@ -438,6 +442,10 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.note_user_activity();
+        if self.rename_input.is_some() {
+            self.handle_rename_key(key);
+            return false;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
@@ -543,7 +551,8 @@ impl App {
                 self.focus = FocusPane::Task;
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
-            KeyCode::Char('r') => self.restart_selected_agent(),
+            KeyCode::Char('r') => self.start_rename_selected_agent(),
+            KeyCode::Char('R') => self.restart_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -567,7 +576,8 @@ impl App {
                 }
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
-            KeyCode::Char('r') => self.restart_selected_agent(),
+            KeyCode::Char('r') => self.start_rename_selected_agent(),
+            KeyCode::Char('R') => self.restart_selected_agent(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
             KeyCode::Char('d') => self.delete_selected_agent(),
@@ -1913,6 +1923,104 @@ impl App {
                 false
             }
         }
+    }
+
+    fn start_rename_selected_agent(&mut self) {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        let current = if run.task_summary.trim().is_empty() {
+            summarize_task(&run.task)
+        } else {
+            run.task_summary.clone()
+        };
+        self.rename_cursor = current.chars().count();
+        self.rename_input = Some(current);
+    }
+
+    fn cancel_rename(&mut self) {
+        self.rename_input = None;
+        self.rename_cursor = 0;
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(new_name) = self.rename_input.take() else {
+            return;
+        };
+        self.rename_cursor = 0;
+        let trimmed = new_name.trim();
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            return;
+        };
+        if trimmed.is_empty() {
+            return;
+        }
+        run.task_summary = trimmed.to_string();
+        let _ = save_native_run_record(&self.cwd, run);
+        self.notice = Some(format!("renamed to {trimmed}"));
+    }
+
+    fn handle_rename_key(&mut self, key: KeyEvent) -> bool {
+        let Some(mut input) = self.rename_input.take() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_rename();
+                return true;
+            }
+            KeyCode::Enter => {
+                self.rename_input = Some(input);
+                self.commit_rename();
+                return true;
+            }
+            KeyCode::Backspace => {
+                if self.rename_cursor > 0 {
+                    let chars: Vec<char> = input.chars().collect();
+                    let new_cursor = self.rename_cursor - 1;
+                    let mut next = String::new();
+                    for (i, c) in chars.into_iter().enumerate() {
+                        if i != new_cursor {
+                            next.push(c);
+                        }
+                    }
+                    input = next;
+                    self.rename_cursor = new_cursor;
+                }
+            }
+            KeyCode::Left => {
+                if self.rename_cursor > 0 {
+                    self.rename_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                let len = input.chars().count();
+                if self.rename_cursor < len {
+                    self.rename_cursor += 1;
+                }
+            }
+            KeyCode::Home => self.rename_cursor = 0,
+            KeyCode::End => self.rename_cursor = input.chars().count(),
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let chars: Vec<char> = input.chars().collect();
+                let mut next = String::new();
+                for (i, c) in chars.iter().enumerate() {
+                    if i == self.rename_cursor {
+                        next.push(ch);
+                    }
+                    next.push(*c);
+                }
+                if self.rename_cursor >= chars.len() {
+                    next.push(ch);
+                }
+                input = next;
+                self.rename_cursor += 1;
+            }
+            _ => {}
+        }
+        self.rename_input = Some(input);
+        true
     }
 
     fn restart_selected_agent(&mut self) {
@@ -4858,7 +4966,8 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for hint in [
         "j/k move",
         "Enter focus",
-        "r restart",
+        "r rename",
+        "R restart",
         "v review",
         "m merge",
         "dd delete",
@@ -4878,7 +4987,10 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             pane_text_style(focused)
         };
-        let task_label = if agent.task_summary.trim().is_empty() {
+        let task_label = if selected && app.rename_input.is_some() {
+            let buf = app.rename_input.clone().unwrap_or_default();
+            format!("✎ {buf}")
+        } else if agent.task_summary.trim().is_empty() {
             summarize_task(&agent.task)
         } else {
             agent.task_summary.clone()

@@ -2029,6 +2029,12 @@ async function reuseOrRestartWorkspace(
   // env with a freshly-signed snapshot URL and start it; the supervisor
   // skips re-staging because the marker file is still there. Much faster
   // than destroy+recreate.
+  console.log(
+    `workspace ${workspace.id} attach: state=${machine?.state ?? "absent"} `
+    + `storedFp=${workspace.snapshotFingerprint?.slice(0, 8) ?? "none"} `
+    + `incomingFp=${incomingFingerprint?.slice(0, 8) ?? "none"} `
+    + `match=${fingerprintMatches}`,
+  );
   if (
     machine
     && machine.id
@@ -2039,7 +2045,10 @@ async function reuseOrRestartWorkspace(
     const restarted = await warmRestartWorkspaceMachine({
       machineId: machine.id,
       snapshotKey: workspace.snapshotKey,
-    }).catch(() => null);
+    }).catch((error) => {
+      console.warn(`warm restart failed for ${workspace.id}: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
     if (restarted) {
       const now = new Date().toISOString();
       updateWorkspaceMachine.run({
@@ -2113,24 +2122,22 @@ async function warmRestartWorkspaceMachine(params: {
   snapshotKey: string;
 }): Promise<FlyMachine | null> {
   ensureFlyConfigured();
-  const snapshotUrl = await signedSnapshotUrl(params.snapshotKey);
-  // Pull current config, patch RUDDER_SNAPSHOT_URL, push back. Fly's PATCH
-  // semantics need a full config object so we round-trip.
-  const current = await flyRequest<FlyMachine>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}`,
-    { method: "GET" },
-  );
-  const config = (current?.config as JsonRecord | undefined) ?? {};
-  const env = ((config as JsonRecord).env as JsonRecord | undefined) ?? {};
-  const newConfig = { ...config, env: { ...env, RUDDER_SNAPSHOT_URL: snapshotUrl } } as JsonRecord;
-  await flyRequest<FlyMachine>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}`,
-    { method: "POST", body: { config: newConfig } },
-  );
-  return await flyRequest<FlyMachine>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}/start`,
-    { method: "POST", body: {} },
-  );
+  // Don't update env — Fly's machine update POST replaces the machine and
+  // breaks the start. Instead just start it; the supervisor's alreadyStaged()
+  // marker check inside /workspace lets it skip the snapshot download.
+  // (Workers can fetch a fresh snapshot URL on demand from the control plane
+  // if they ever need to re-stage.)
+  void params.snapshotKey;
+  console.log(`warm restart ${params.machineId}: starting (reusing staged /workspace)`);
+  try {
+    return await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}/start`,
+      { method: "POST", body: {} },
+    );
+  } catch (error) {
+    console.warn(`warm restart ${params.machineId}: start failed: ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  }
 }
 
 async function createFlyWorkspaceMachine(params: {
