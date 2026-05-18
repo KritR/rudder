@@ -350,6 +350,7 @@ function stageMigratedAgents(workdir) {
       task: agent.task || "",
       taskSummary: agent.taskSummary || "",
       backend: agent.backend || "claude",
+      freshPrompt: typeof agent.freshPrompt === "string" ? agent.freshPrompt : "",
     });
   }
 
@@ -388,6 +389,7 @@ function stageMigratedAgents(workdir) {
       pendingFresh: !entry.sessionId,
       sessionId: entry.sessionId || null,
       backend: entry.backend,
+      freshPrompt: entry.freshPrompt || null,
       migratedAt: new Date().toISOString(),
     };
     fs.writeFileSync(runJsonPath, JSON.stringify(record, null, 2));

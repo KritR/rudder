@@ -227,6 +227,7 @@ struct MigratedAgent {
     run_id: String,
     session_id: String,
     worktree_path: PathBuf,
+    fresh_prompt: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1799,6 +1800,7 @@ impl App {
                     run_id: run.id.clone(),
                     session_id,
                     worktree_path: run.worktree_path.clone().unwrap_or(run.cwd.clone()),
+                    fresh_prompt: None,
                 }))
             })
             .collect();
@@ -1890,11 +1892,19 @@ impl App {
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         } else {
             let session_id = mint_session_id_for(run.backend);
+            // If the local CLI built a context-rich handoff prompt for this
+            // migrated agent (because we couldn't resume the real session),
+            // use that as the agent's input so it has continuity instead of
+            // restarting from the bare task.
+            let prompt_for_agent = entry
+                .fresh_prompt
+                .clone()
+                .unwrap_or_else(|| run.task.clone());
             let cmd = agent_command(
                 run.backend,
                 &run.model,
                 run.effort,
-                &run.task,
+                &prompt_for_agent,
                 run.mode,
                 session_id.as_deref(),
             );
@@ -8098,6 +8108,11 @@ fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
             .unwrap_or_else(|| repo_root.to_path_buf());
+        let fresh_prompt = agent
+            .get("freshPrompt")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(ToOwned::to_owned);
         if run_id.is_empty() {
             continue;
         }
@@ -8105,6 +8120,7 @@ fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
             run_id,
             session_id,
             worktree_path,
+            fresh_prompt,
         });
     }
     out

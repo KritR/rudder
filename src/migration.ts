@@ -41,7 +41,38 @@ export type MigrationManifestEntry = {
   sessionJsonlSnapshotPath: string;
   worktreeBranch?: string;
   createdAt?: string;
+  /**
+   * Prompt-engineered handoff for fresh restarts (when no resumable session
+   * exists). Includes the original task and recent user steering so the new
+   * agent has context, not just the bare task.
+   */
+  freshPrompt?: string;
 };
+
+/**
+ * Build a compact "you're picking up from a paused session" prompt for a
+ * migrated agent whose conversation can't be replayed verbatim.
+ */
+export function buildFreshHandoffPrompt(candidate: MigrationCandidate, recentTurns: Array<{ prompt: string; source: string }>): string {
+  const lines: string[] = [];
+  lines.push("Resuming a paused agent session. Carry on the work below.");
+  lines.push("");
+  lines.push(`Original task: ${candidate.task || candidate.taskSummary || candidate.runId}`);
+  const userTurns = recentTurns.filter((t) => t.source === "user").slice(-3);
+  if (userTurns.length > 1) {
+    lines.push("");
+    lines.push("Recent user steering (most recent last):");
+    for (const turn of userTurns) {
+      const compact = turn.prompt.replace(/\s+/g, " ").trim().slice(0, 240);
+      if (compact) {
+        lines.push(`- ${compact}`);
+      }
+    }
+  }
+  lines.push("");
+  lines.push("The earlier conversation transcript is not available. Re-establish context from the repo state and continue.");
+  return lines.join("\n");
+}
 
 export type MigrationSnapshotManifest = {
   version: 1;

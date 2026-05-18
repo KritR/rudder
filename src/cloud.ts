@@ -11,6 +11,7 @@ import {
   type MigrationPlan,
   type MigrationSnapshotManifest,
   applyDefaultDecisions,
+  buildFreshHandoffPrompt,
   cloudWorktreeAbsolutePath,
   findMigrationCandidates,
   migrationSummary,
@@ -1278,6 +1279,15 @@ async function stageMigratedAgents(
       sessionJsonlSnapshotPath = path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`);
     }
     const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId);
+    // For fresh restarts, build a prompt-engineered handoff from the local
+    // run record so the new agent gets context instead of just the bare task.
+    let freshPrompt: string | undefined;
+    if (!hasSession) {
+      const runJsonPath = path.join(repoRoot, ".rudder", "runs", candidate.runId, "run.json");
+      const record = await readJson<{ turns?: Array<{ prompt: string; source: string }> }>(runJsonPath);
+      const turns = Array.isArray(record?.turns) ? record!.turns : [];
+      freshPrompt = buildFreshHandoffPrompt(candidate, turns);
+    }
     entries.push({
       runId: candidate.runId,
       task: candidate.task,
@@ -1288,6 +1298,7 @@ async function stageMigratedAgents(
       cloudWorktreeRelativePath: cloudWorktreeAbs,
       sessionJsonlSnapshotPath: sessionJsonlSnapshotPath ?? "",
       worktreeBranch: candidate.worktreeBranch,
+      freshPrompt,
     });
   }
   return entries;
