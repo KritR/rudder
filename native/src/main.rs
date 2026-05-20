@@ -49,6 +49,17 @@ const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
+const AGENT_PANE_HINTS: &[&str] = &[
+    "j/k move",
+    "Enter focus",
+    "r rename",
+    "v review",
+    "R review all",
+    "m merge",
+    "M merge all",
+    "dd delete",
+    "P model",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusPane {
@@ -1279,7 +1290,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  wheel scrolls worker  m/M merge  dd delete"
+                    "Tab focus  Enter start/focus  wheel scrolls worker  R review all  M merge all"
                         .to_string(),
                 );
             }
@@ -5891,6 +5902,12 @@ mod app_tests {
         assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
+    #[test]
+    fn agent_pane_hints_include_review_and_merge_all_shortcuts() {
+        assert!(AGENT_PANE_HINTS.contains(&"R review all"));
+        assert!(AGENT_PANE_HINTS.contains(&"M merge all"));
+    }
+
     fn test_agent_run(id: &str, task: &str) -> AgentRun {
         AgentRun {
             id: id.to_string(),
@@ -6772,17 +6789,9 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
     }
 
-    for hint in [
-        "j/k move",
-        "Enter focus",
-        "r rename",
-        "v review",
-        "m merge",
-        "dd delete",
-        "P model",
-    ] {
+    for hint in AGENT_PANE_HINTS {
         lines.push(ListItem::new(Line::from(Span::styled(
-            hint,
+            *hint,
             muted_style(focused),
         ))));
     }
