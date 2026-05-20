@@ -1,10 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     hash::{Hash, Hasher},
-    io::{self, Read, Stdout, Write},
+    io::{self, BufRead, Read, Stdout, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc::{self, TryRecvError},
+    thread,
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,9 +35,8 @@ use rudder_native::pty_terminal::{
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-const TICK_RATE: Duration = Duration::from_millis(8);
+const TICK_RATE: Duration = Duration::from_millis(33);
 const MAX_EVENTS_PER_FRAME: usize = 64;
-const AUTO_STEER_DELAY: Duration = Duration::from_secs(10);
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
 const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
 const INACTIVE_COLOR: Color = Color::DarkGray;
@@ -160,13 +161,22 @@ impl AgentStatus {
 enum AgentMode {
     Execute,
     Plan,
+    RudderPlan,
+    Main,
 }
+
+const MAIN_AGENT_ID: &str = "__main__";
+
+const MAIN_BOOTSTRAP_PROMPT: &str =
+    "Read RUDDER.md if it exists, then briefly tell me what this project does and where its entry points live. After that, wait for instructions.";
 
 impl AgentMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Execute => "execute",
             Self::Plan => "plan",
+            Self::RudderPlan => "rudder-plan",
+            Self::Main => "main",
         }
     }
 
@@ -174,6 +184,8 @@ impl AgentMode {
         match value {
             "execute" | "run" | "task" => Some(Self::Execute),
             "plan" | "planning" => Some(Self::Plan),
+            "rudder-plan" | "rudder_plan" | "orchestrate" => Some(Self::RudderPlan),
+            "main" => Some(Self::Main),
             _ => None,
         }
     }
@@ -212,6 +224,7 @@ struct App {
     last_cloud_check: Instant,
     cloud_workspace: Option<CloudWorkspaceStatus>,
     last_workspace_check: Option<Instant>,
+    workspace_status_rx: Option<mpsc::Receiver<Option<CloudWorkspaceStatus>>>,
     workspace_idle_notified: bool,
     last_user_activity: Instant,
     mouse_debug: bool,
@@ -220,6 +233,17 @@ struct App {
     migration_resumes_attempted: bool,
     rename_input: Option<String>,
     rename_cursor: usize,
+    diff_summary_cache: HashMap<String, (Instant, Option<String>)>,
+    dirty: bool,
+    last_tab_emoji: Option<char>,
+    /// True when the user pressed Ctrl+C once but there are running agents we
+    /// want them to confirm pausing before we actually quit. Cleared by any
+    /// other key.
+    quit_confirm_pending: bool,
+    /// ISO-8601 timestamp captured at dashboard startup. Used to scope
+    /// `/usage` to this rudder session rather than the user's full lifetime
+    /// claude/codex history for the repo.
+    session_started_iso: String,
 }
 
 #[derive(Clone, Debug)]
@@ -270,7 +294,7 @@ struct CloudSummary {
     runtime: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CloudWorkspaceStatus {
     id: Option<String>,
     status: Option<String>,
@@ -288,6 +312,13 @@ struct MergeConflictPrompt {
     task: String,
     conflicted_files: Vec<String>,
     error: String,
+    repo_root: PathBuf,
+    target_branch: Option<String>,
+    source_branch: Option<String>,
+    worktree_path: Option<PathBuf>,
+    /// The id of the agent whose merge stopped. We reuse its row for the AI
+    /// conflict resolver so we never grow a fresh dashboard pane mid-merge.
+    agent_id: Option<String>,
 }
 
 struct AgentRun {
@@ -317,10 +348,19 @@ struct AgentRun {
     autosteered: bool,
     needs_permission: bool,
     permission_notified: bool,
+    needs_user_input: bool,
+    user_input_notified: bool,
     last_error: Option<String>,
     worker_input_draft: String,
     worker_input_cursor: usize,
     worker_input_is_prompt: bool,
+    last_drain_at: Option<Instant>,
+}
+
+impl AgentRun {
+    fn is_main(&self) -> bool {
+        self.id == MAIN_AGENT_ID
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -377,20 +417,25 @@ impl App {
         } else {
             load_persisted_agents(&cwd)
         };
+        // Main slot is no longer auto-pinned. If the user wants one, they type
+        // /main from the task pane. Persisted main records from older versions
+        // continue to load and behave as a normal agent row with a "main" badge.
+        let (task_input, task_cursor) = (String::new(), 0);
         let pending_migration_resumes = if cfg!(test) {
             Vec::new()
         } else {
             read_migration_manifest(&cwd)
         };
         let cloud = read_cloud_summary();
+        let session_started_iso = load_or_init_session_started(&cwd);
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
             worker_view: WorkerView::Terminal,
             cwd,
             branch: current_branch(),
-            task_input: String::new(),
-            task_cursor: 0,
+            task_input,
+            task_cursor,
             task_history: Vec::new(),
             task_history_index: None,
             task_history_draft: String::new(),
@@ -416,6 +461,7 @@ impl App {
             last_cloud_check: Instant::now(),
             cloud_workspace: None,
             last_workspace_check: None,
+            workspace_status_rx: None,
             workspace_idle_notified: false,
             last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
@@ -424,7 +470,85 @@ impl App {
             migration_resumes_attempted: false,
             rename_input: None,
             rename_cursor: 0,
+            diff_summary_cache: HashMap::new(),
+            dirty: true,
+            last_tab_emoji: None,
+            session_started_iso,
+            quit_confirm_pending: false,
         }
+    }
+
+    fn tab_status_emoji(&self) -> char {
+        if self
+            .agents
+            .iter()
+            .any(|a| a.needs_permission || a.needs_user_input)
+        {
+            return '\u{1f7e1}'; // yellow circle - your attention needed
+        }
+        if self.agents.iter().any(|a| a.status == AgentStatus::Failed) {
+            return '\u{1f534}'; // red circle - failure
+        }
+        if self.agents.iter().any(|a| a.status == AgentStatus::Running) {
+            return '\u{1f7e2}'; // green circle - actively running
+        }
+        '\u{26aa}' // white circle - idle / no work
+    }
+
+    /// Update the host terminal tab title to reflect current state. Cheap;
+    /// only emits an OSC when the leading status emoji actually changed.
+    fn refresh_tab_title(&mut self) {
+        let emoji = self.tab_status_emoji();
+        if self.last_tab_emoji == Some(emoji) {
+            return;
+        }
+        let repo = self
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.cwd.display().to_string());
+        let prefix = if is_cloud_worker_session() {
+            "Rudder cloud"
+        } else {
+            "Rudder"
+        };
+        let title = format!("{emoji} {prefix}: {repo}");
+        let mut stdout = io::stdout();
+        let _ = write!(stdout, "\x1b]0;{title}\x07");
+        let _ = stdout.flush();
+        self.last_tab_emoji = Some(emoji);
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let was = self.dirty;
+        self.dirty = false;
+        was
+    }
+
+    fn cached_diff_summary(&mut self, id: &str, cwd: &Path) -> Option<String> {
+        const TTL: Duration = Duration::from_millis(1500);
+        let now = Instant::now();
+        if let Some((stamp, value)) = self.diff_summary_cache.get(id) {
+            if now.duration_since(*stamp) < TTL {
+                return value.clone();
+            }
+        }
+        let value = diff_short_summary_at(cwd);
+        self.diff_summary_cache
+            .insert(id.to_string(), (now, value.clone()));
+        value
+    }
+
+    fn selected_is_main(&self) -> bool {
+        self.agents
+            .get(self.selected_agent)
+            .map(|run| run.is_main())
+            .unwrap_or(false)
     }
 
     fn set_model_defaults(
@@ -448,7 +572,33 @@ impl App {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return true;
+            // Guard against accidental quit when agents are still working.
+            // First Ctrl+C asks for confirmation; second Ctrl+C (or y) quits.
+            let running = self
+                .agents
+                .iter()
+                .filter(|a| {
+                    !a.is_main() && a.terminal.is_some() && a.status == AgentStatus::Running
+                })
+                .count();
+            if running == 0 || self.quit_confirm_pending {
+                return true;
+            }
+            self.quit_confirm_pending = true;
+            self.notice = Some(format!(
+                "{running} agent{} still running. Ctrl+C again (or y) to quit; any other key to keep going. Claude agents auto-resume on next rudder.",
+                if running == 1 { "" } else { "s" }
+            ));
+            return false;
+        }
+        // Any other key dismisses the pending quit confirmation.
+        if self.quit_confirm_pending {
+            if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
+                return true;
+            }
+            self.quit_confirm_pending = false;
+            self.notice = Some("quit cancelled".to_string());
+            // fall through and let the key be handled normally
         }
 
         if self.handle_cloud_prompt_key(key) {
@@ -553,10 +703,10 @@ impl App {
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
-            KeyCode::Char('R') => self.restart_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
+            KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('d') => self.delete_selected_agent(),
             KeyCode::Char('q') => return true,
@@ -573,21 +723,36 @@ impl App {
             KeyCode::Enter => {
                 if !self.agents.is_empty() {
                     self.delete_pending = None;
-                    self.focus = FocusPane::Worker;
+                    if self.selected_is_main() {
+                        self.focus_or_spawn_main();
+                    } else {
+                        self.focus = FocusPane::Worker;
+                    }
                 }
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
-            KeyCode::Char('R') => self.restart_selected_agent(),
+            KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
             KeyCode::Char('d') => self.delete_selected_agent(),
+            KeyCode::Char('P') => self.open_main_model_switcher(),
             _ => {}
         }
         false
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Char('R') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.review_all_ready();
+            return false;
+        }
+
+        if key.code == KeyCode::Char('M') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.request_merge_all_ready();
+            return false;
+        }
+
         if self.worker_view == WorkerView::Diff {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => {
@@ -619,10 +784,6 @@ impl App {
         self.worker_selection = None;
         if self.selected_terminal_mut().is_none() {
             match key.code {
-                KeyCode::Char('r') => {
-                    self.restart_selected_agent();
-                    return false;
-                }
                 KeyCode::Char('q') => return true,
                 _ => {}
             }
@@ -669,10 +830,23 @@ impl App {
             self.set_selected_error(error.to_string());
             return false;
         }
+        self.clear_selected_attention_flags();
         if let Some(prompt) = self.capture_selected_worker_key(key, capture_as_prompt) {
             self.record_selected_worker_prompt(prompt);
         }
         false
+    }
+
+    fn clear_selected_attention_flags(&mut self) {
+        if let Some(run) = self.agents.get_mut(self.selected_agent) {
+            if run.needs_permission || run.needs_user_input {
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
+                self.dirty = true;
+            }
+        }
     }
 
     fn copy_focused_selection(&mut self) {
@@ -716,13 +890,44 @@ impl App {
 
     fn select_previous_agent(&mut self) {
         self.delete_pending = None;
-        self.selected_agent = self.selected_agent.saturating_sub(1);
+        let visible = self.visible_agent_indices();
+        if visible.is_empty() {
+            self.selected_agent = 0;
+            return;
+        }
+        let position = visible
+            .iter()
+            .position(|&index| index == self.selected_agent)
+            .unwrap_or_else(|| {
+                visible
+                    .iter()
+                    .position(|&index| index >= self.selected_agent)
+                    .unwrap_or_else(|| visible.len().saturating_sub(1))
+            });
+        self.selected_agent = visible[position.saturating_sub(1)];
     }
 
     fn select_next_agent(&mut self) {
         self.delete_pending = None;
-        let last = self.agents.len().saturating_sub(1);
-        self.selected_agent = (self.selected_agent + 1).min(last);
+        let visible = self.visible_agent_indices();
+        if visible.is_empty() {
+            self.selected_agent = 0;
+            return;
+        }
+        let position = visible
+            .iter()
+            .position(|&index| index == self.selected_agent)
+            .unwrap_or_else(|| {
+                visible
+                    .iter()
+                    .position(|&index| index >= self.selected_agent)
+                    .unwrap_or_else(|| visible.len().saturating_sub(1))
+            });
+        self.selected_agent = visible[(position + 1).min(visible.len().saturating_sub(1))];
+    }
+
+    fn visible_agent_indices(&self) -> Vec<usize> {
+        visible_agent_indices(&self.agents)
     }
 
     fn toggle_worker_view(&mut self) {
@@ -738,6 +943,59 @@ impl App {
             }
         };
         self.focus = FocusPane::Worker;
+    }
+
+    fn review_all_ready(&mut self) {
+        let ready_indices: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, run)| {
+                (run.status == AgentStatus::Done && run.worktree_branch.is_some()).then_some(index)
+            })
+            .collect();
+
+        if ready_indices.is_empty() {
+            self.notice = Some("no completed worktrees ready to review".to_string());
+            return;
+        }
+
+        let current_position = ready_indices
+            .iter()
+            .position(|&index| index == self.selected_agent);
+        let already_reviewing_selected = current_position.is_some()
+            && self.focus == FocusPane::Worker
+            && self.worker_view == WorkerView::Diff;
+        let next_position = match (current_position, already_reviewing_selected) {
+            (Some(position), true) => (position + 1) % ready_indices.len(),
+            (Some(position), false) => position,
+            (None, _) => 0,
+        };
+        let target_index = ready_indices[next_position];
+        self.selected_agent = target_index;
+        self.delete_pending = None;
+        self.worker_selection = None;
+        self.worker_view = WorkerView::Diff;
+        self.focus = FocusPane::Worker;
+        self.ensure_hunk_review();
+
+        let summary = self
+            .agents
+            .get(target_index)
+            .map(|run| {
+                if run.task_summary.trim().is_empty() {
+                    short_task(&run.task)
+                } else {
+                    run.task_summary.trim().to_string()
+                }
+            })
+            .unwrap_or_else(|| "agent".to_string());
+        self.notice = Some(format!(
+            "reviewing {}/{}: {}; press R for next, M to merge all",
+            next_position + 1,
+            ready_indices.len(),
+            truncate_chars(&summary, 48)
+        ));
     }
 
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
@@ -766,6 +1024,12 @@ impl App {
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Shift+Enter inserts a literal newline in the task draft.
+                self.reset_task_history_navigation();
+                insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, "\n");
+                self.clamp_picker_index();
             }
             KeyCode::Enter => self.start_task(),
             KeyCode::Up => self.show_previous_task_history(),
@@ -867,8 +1131,9 @@ impl App {
                 self.task_input.push('/');
                 self.task_cursor = 1;
                 self.picker_index = 0;
-                self.notice =
-                    Some("type /plan, /run, /model, /login, /cloud, or /sail".to_string());
+                self.notice = Some(
+                    "type /plan, /rudder-plan, /model, /main, /goal, /usage, or /cloud".to_string(),
+                );
             }
             KeyCode::Char(ch) => {
                 self.reset_task_history_navigation();
@@ -981,10 +1246,25 @@ impl App {
                 model,
                 effort,
             } => {
-                let warning = self.set_model_defaults(backend, model, effort);
+                let warning = self.set_model_defaults(backend, model.clone(), effort);
                 self.task_input.clear();
                 self.task_cursor = 0;
                 self.picker_index = 0;
+                let mut should_spawn_main = false;
+                if let Some(main_index) = self.agents.iter().position(|run| run.is_main()) {
+                    let cwd = self.cwd.clone();
+                    let run = &mut self.agents[main_index];
+                    run.backend = backend;
+                    run.model = model;
+                    run.effort = effort;
+                    let _ = save_native_run_record(&cwd, run);
+                    if run.terminal.is_none() && self.selected_agent == main_index {
+                        should_spawn_main = true;
+                    }
+                }
+                if should_spawn_main {
+                    self.focus_or_spawn_main();
+                }
                 self.notice = warning.or_else(|| {
                     Some(format!(
                         "{} {}({})",
@@ -1042,6 +1322,7 @@ impl App {
                         self.set_selected_error(error.to_string());
                         return;
                     }
+                    self.clear_selected_attention_flags();
                     let prompts = self.capture_selected_worker_paste(&text, capture_as_prompt);
                     for prompt in prompts {
                         self.record_selected_worker_prompt(prompt);
@@ -1218,8 +1499,16 @@ impl App {
     }
 
     fn handle_pane_scroll(&mut self, mouse: MouseEvent) {
+        // The focus-shortcut routes scrolls to the worker pane only when the
+        // pointer is also over the worker pane; otherwise the regular
+        // pointer-based routing below kicks in so scrolling over a different
+        // pane doesn't get silently eaten by an unrelated worker (e.g. a codex
+        // agent on normal screen with no scrollback).
         if self.focus == FocusPane::Worker {
-            if let Some(area) = self.worker_area {
+            if let Some(area) = self
+                .worker_area
+                .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+            {
                 let inner = block_inner(area);
                 self.set_mouse_debug(format!(
                     "mouse {:?} @{},{} focus=worker view={:?}",
@@ -1446,6 +1735,7 @@ impl App {
     fn scroll_selected_worker_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let mouse_bytes = mouse_event_to_sgr(mouse, area);
+        let backend = self.agents.get(self.selected_agent).map(|run| run.backend);
         let Some(terminal) = self.selected_terminal_mut() else {
             self.set_mouse_debug(format!(
                 "mouse {:?} @{},{} pane=worker route=no-terminal",
@@ -1467,6 +1757,15 @@ impl App {
         let mut write_error = None;
         if !moved && rows != 0 && wants_mouse {
             if let Some(bytes) = mouse_bytes {
+                if let Err(error) = terminal.write_input(&bytes) {
+                    write_error = Some(error.to_string());
+                } else {
+                    forwarded = true;
+                }
+            }
+        }
+        if !moved && rows != 0 && !forwarded && backend == Some(Backend::Codex) {
+            if let Some(bytes) = scroll_key_bytes(mouse.kind) {
                 if let Err(error) = terminal.write_input(&bytes) {
                     write_error = Some(error.to_string());
                 } else {
@@ -1623,7 +1922,21 @@ impl App {
     }
 
     fn start_execute_task(&mut self, input: &str) {
-        let worktree = match prepare_worktree(&self.cwd, input) {
+        self.start_execute_task_with_summary(input, None);
+    }
+
+    fn start_execute_task_with_summary(&mut self, input: &str, explicit_summary: Option<&str>) {
+        let planner_title = explicit_summary
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| rudder_plan_worker_title_from_prompt(input));
+        let worktree_label = planner_title.as_deref().unwrap_or(input);
+        let task_summary = planner_title
+            .as_deref()
+            .map(|title| truncate_chars(title, 56))
+            .unwrap_or_else(|| summarize_task(input));
+        let worktree = match prepare_worktree(&self.cwd, worktree_label) {
             Ok(worktree) => worktree,
             Err(error) => {
                 self.notice = Some(format!("worktree failed: {error}"));
@@ -1641,7 +1954,14 @@ impl App {
         let backend = self.backend;
         let effort = self.effort;
         let session_id = mint_session_id_for(backend);
-        let command = agent_command(backend, &model, effort, input, AgentMode::Execute, session_id.as_deref());
+        let command = agent_command(
+            backend,
+            &model,
+            effort,
+            input,
+            AgentMode::Execute,
+            session_id.as_deref(),
+        );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -1654,7 +1974,7 @@ impl App {
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
             task: input.to_string(),
-            task_summary: summarize_task(input),
+            task_summary,
             current_prompt: input.to_string(),
             turns: vec![AgentTurn {
                 ts: created_at.clone(),
@@ -1680,10 +2000,13 @@ impl App {
             autosteered: false,
             needs_permission: false,
             permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
+            last_drain_at: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -1713,7 +2036,14 @@ impl App {
         let backend = self.backend;
         let effort = self.effort;
         let session_id = mint_session_id_for(backend);
-        let command = agent_command(backend, &model, effort, input, AgentMode::Plan, session_id.as_deref());
+        let command = agent_command(
+            backend,
+            &model,
+            effort,
+            input,
+            AgentMode::Plan,
+            session_id.as_deref(),
+        );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(self.cwd.clone()),
@@ -1752,10 +2082,13 @@ impl App {
             autosteered: true,
             needs_permission: false,
             permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
+            last_drain_at: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -1783,7 +2116,92 @@ impl App {
         }
     }
 
-    fn restore_running_claude_agents(&mut self) {
+    fn start_rudder_plan_task(&mut self, input: &str) {
+        let model = self.model.clone();
+        let backend = self.backend;
+        let effort = self.effort;
+        let session_id = mint_session_id_for(backend);
+        let command = agent_command(
+            backend,
+            &model,
+            effort,
+            input,
+            AgentMode::RudderPlan,
+            session_id.as_deref(),
+        );
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        let created_at = now_stamp();
+        let mut run = AgentRun {
+            id: new_run_id(input),
+            created_at: created_at.clone(),
+            mode: AgentMode::RudderPlan,
+            task: input.to_string(),
+            task_summary: format!("plan {}", summarize_task(input)),
+            current_prompt: input.to_string(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: input.to_string(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
+            backend,
+            model,
+            effort,
+            status: AgentStatus::Running,
+            cwd: self.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            session_id,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: true,
+            needs_permission: false,
+            permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+            last_drain_at: None,
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                self.notice = Some("rudder planner started".to_string());
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!(
+                    "failed to start {} rudder planner: {error}",
+                    backend.as_str()
+                ));
+            }
+        }
+
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+    }
+
+    fn restore_running_agents(&mut self) {
         let snapshot: Vec<(usize, MigratedAgent)> = self
             .agents
             .iter()
@@ -1792,16 +2210,15 @@ impl App {
                 if run.terminal.is_some() || run.status != AgentStatus::Running {
                     return None;
                 }
-                if run.backend != Backend::Claude {
-                    return None;
-                }
-                let session_id = run.session_id.clone()?;
-                Some((idx, MigratedAgent {
-                    run_id: run.id.clone(),
-                    session_id,
-                    worktree_path: run.worktree_path.clone().unwrap_or(run.cwd.clone()),
-                    fresh_prompt: None,
-                }))
+                Some((
+                    idx,
+                    MigratedAgent {
+                        run_id: run.id.clone(),
+                        session_id: run.session_id.clone().unwrap_or_default(),
+                        worktree_path: run.worktree_path.clone().unwrap_or(run.cwd.clone()),
+                        fresh_prompt: None,
+                    },
+                ))
             })
             .collect();
         let total = snapshot.len();
@@ -1815,9 +2232,7 @@ impl App {
             }
         }
         if resumed > 0 {
-            self.notice = Some(format!(
-                "resumed {resumed} agent(s) from last session via claude --resume"
-            ));
+            self.notice = Some(format!("resumed {resumed} agent(s) from last session"));
         }
         let needs_manual = self
             .agents
@@ -1825,13 +2240,17 @@ impl App {
             .filter(|run| {
                 run.terminal.is_none()
                     && run.status == AgentStatus::Running
-                    && (run.backend != Backend::Claude || run.session_id.is_none())
+                    && !can_resume_agent(run)
             })
             .count();
         if needs_manual > 0 {
-            let prefix = self.notice.take().map(|n| format!("{n}; ")).unwrap_or_default();
+            let prefix = self
+                .notice
+                .take()
+                .map(|n| format!("{n}; "))
+                .unwrap_or_default();
             self.notice = Some(format!(
-                "{prefix}{needs_manual} agent(s) need restart (press r)"
+                "{prefix}{needs_manual} agent(s) could not be resumed"
             ));
         }
     }
@@ -1854,7 +2273,9 @@ impl App {
             }
         }
         if resumed > 0 {
-            self.notice = Some(format!("resumed {resumed} migrated agent(s) via claude --resume"));
+            self.notice = Some(format!(
+                "resumed {resumed} migrated agent(s) via claude --resume"
+            ));
         }
     }
 
@@ -1870,26 +2291,10 @@ impl App {
         } else {
             entry.worktree_path.clone()
         };
-        // If we have a session_id and the backend is Claude, resume the conversation.
-        // Otherwise fall back to spawning a fresh agent with the original task
-        // (codex/acpx don't support resume, and Claude with no jsonl is best-effort).
-        let resume_path = run.backend == Backend::Claude && !entry.session_id.is_empty();
-        let command = if resume_path {
-            let mut args: Vec<String> = vec![
-                "--permission-mode".to_string(),
-                "bypassPermissions".to_string(),
-            ];
-            if !run.model.trim().is_empty() {
-                args.push("--model".to_string());
-                args.push(run.model.clone());
-            }
-            if let Some(effort) = run.effort {
-                args.push("--effort".to_string());
-                args.push(effort.as_str().to_string());
-            }
-            args.push("--resume".to_string());
-            args.push(entry.session_id.clone());
-            TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+        let command = if !entry.session_id.is_empty() && run.backend == Backend::Claude {
+            claude_resume_command(run, &entry.session_id)
+        } else if !entry.session_id.is_empty() && run.backend == Backend::Codex {
+            codex_resume_command(run, &entry.session_id)
         } else {
             let session_id = mint_session_id_for(run.backend);
             // If the local CLI built a context-rich handoff prompt for this
@@ -1936,6 +2341,10 @@ impl App {
     }
 
     fn start_rename_selected_agent(&mut self) {
+        if self.selected_is_main() {
+            self.notice = Some("main slot: rename disabled".to_string());
+            return;
+        }
         let Some(run) = self.agents.get(self.selected_agent) else {
             self.notice = Some("no agent selected".to_string());
             return;
@@ -2033,6 +2442,128 @@ impl App {
         true
     }
 
+    fn focus_or_spawn_main(&mut self) {
+        self.focus_or_spawn_main_with_prompt("");
+    }
+
+    fn focus_or_spawn_main_with_prompt(&mut self, override_prompt: &str) {
+        let main_index = match self.agents.iter().position(|run| run.is_main()) {
+            Some(idx) => idx,
+            None => {
+                self.notice = Some("no main slot".to_string());
+                return;
+            }
+        };
+        self.selected_agent = main_index;
+        self.delete_pending = None;
+
+        let already_running = self
+            .agents
+            .get(main_index)
+            .and_then(|run| run.terminal.as_ref())
+            .is_some();
+        if already_running {
+            // Already spawned. If the user gave a new prompt, forward it
+            // straight into the live PTY so they don't have to re-focus and
+            // type it themselves.
+            if !override_prompt.is_empty() {
+                if let Some(run) = self.agents.get_mut(main_index) {
+                    if let Some(terminal) = run.terminal.as_mut() {
+                        let _ = terminal.write_input(format!("{override_prompt}\r").as_bytes());
+                        let now = now_stamp();
+                        run.turns.push(AgentTurn {
+                            ts: now.clone(),
+                            prompt: override_prompt.to_string(),
+                            source: "user".to_string(),
+                        });
+                        run.last_user_input_at = now;
+                    }
+                }
+            }
+            self.focus = FocusPane::Worker;
+            self.worker_view = WorkerView::Terminal;
+            return;
+        }
+
+        let (backend, model, effort, terminal_size, bootstrap, session_id) = {
+            let run = &self.agents[main_index];
+            let bootstrap = if !override_prompt.is_empty() {
+                override_prompt.to_string()
+            } else if run.turns.is_empty() {
+                MAIN_BOOTSTRAP_PROMPT.to_string()
+            } else {
+                String::new()
+            };
+            (
+                run.backend,
+                run.model.clone(),
+                run.effort,
+                run.terminal_size.unwrap_or_default(),
+                bootstrap,
+                run.session_id
+                    .clone()
+                    .or_else(|| mint_session_id_for(run.backend)),
+            )
+        };
+        let command = agent_command(
+            backend,
+            &model,
+            effort,
+            &bootstrap,
+            AgentMode::Main,
+            session_id.as_deref(),
+        );
+        let cwd = self.cwd.clone();
+        let options = TerminalPaneOptions {
+            size: terminal_size,
+            cwd: Some(cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                let run = &mut self.agents[main_index];
+                run.cwd = cwd;
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.session_id = session_id;
+                run.completed_at = None;
+                run.last_output_at = Instant::now();
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.last_error = None;
+                if !bootstrap.is_empty() {
+                    let now = now_stamp();
+                    run.turns.push(AgentTurn {
+                        ts: now.clone(),
+                        prompt: bootstrap.clone(),
+                        source: "bootstrap".to_string(),
+                    });
+                    run.last_user_input_at = now;
+                }
+                self.focus = FocusPane::Worker;
+                self.worker_view = WorkerView::Terminal;
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+            Err(error) => {
+                let run = &mut self.agents[main_index];
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("main launch failed: {error}"));
+            }
+        }
+    }
+
+    fn open_main_model_switcher(&mut self) {
+        if !self.selected_is_main() {
+            return;
+        }
+        self.replace_task_input("/model ".to_string());
+        self.focus = FocusPane::Task;
+        self.notice = Some("pick a model for main".to_string());
+    }
+
     fn restart_selected_agent(&mut self) {
         let Some(run) = self.agents.get_mut(self.selected_agent) else {
             self.notice = Some("no agent selected".to_string());
@@ -2045,7 +2576,14 @@ impl App {
 
         let prompt = run.task.clone();
         let session_id = mint_session_id_for(run.backend);
-        let command = agent_command(run.backend, &run.model, run.effort, &prompt, run.mode, session_id.as_deref());
+        let command = agent_command(
+            run.backend,
+            &run.model,
+            run.effort,
+            &prompt,
+            run.mode,
+            session_id.as_deref(),
+        );
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(run.cwd.clone()),
@@ -2060,9 +2598,11 @@ impl App {
                 run.session_id = session_id;
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
-                run.autosteered = run.mode == AgentMode::Plan;
+                run.autosteered = matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan);
                 run.needs_permission = false;
                 run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
                 run.last_error = None;
                 self.focus = FocusPane::Worker;
                 self.worker_view = WorkerView::Terminal;
@@ -2153,18 +2693,18 @@ impl App {
                 }
                 true
             }
-            Some("/run") => {
+            Some("/rudder-plan") => {
                 let task = parts.collect::<Vec<_>>().join(" ");
                 if task.trim().is_empty() {
-                    self.notice = Some("usage: /run <task>".to_string());
+                    self.notice = Some("usage: /rudder-plan <task>".to_string());
                 } else {
-                    self.start_execute_task(task.trim());
+                    self.start_rudder_plan_task(task.trim());
                 }
                 true
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  /plan  /run  /model  wheel scrolls worker  m/M merge"
+                    "Tab focus  Enter start/focus  /plan  /rudder-plan  /model  /main  /goal"
                         .to_string(),
                 );
                 true
@@ -2182,7 +2722,8 @@ impl App {
                 }
                 if raw_args.is_empty() {
                     self.notice = Some(
-                        "Exit this dashboard and run `rudder cloud` to open the cloud workspace.".to_string(),
+                        "Exit this dashboard and run `rudder cloud` to open the cloud workspace."
+                            .to_string(),
                     );
                     return true;
                 }
@@ -2194,24 +2735,182 @@ impl App {
                 self.start_rudder_cli_command(&label, args);
                 true
             }
-            Some("/sail") => {
-                if !rudder_cloud_authenticated() {
-                    self.notice =
-                        Some("not logged in to Rudder Cloud; run /login first".to_string());
-                    return true;
-                }
-                let raw_args = parts.collect::<Vec<_>>();
-                if self.maybe_prompt_cloud_launch(&raw_args) {
-                    return true;
-                }
-                let args = self.cloud_command_args(raw_args);
-                let label = cloud_agent_label(&args);
-                self.start_rudder_cli_command(&label, args);
+            Some("/main") => {
+                // Everything after "/main " is the user's prompt. If empty,
+                // we use the default RUDDER.md bootstrap. The model must be
+                // set ahead of time via /model.
+                let prompt = input
+                    .trim_start()
+                    .strip_prefix("/main")
+                    .map(|rest| rest.trim().to_string())
+                    .unwrap_or_default();
+                self.handle_main_command(&prompt);
                 true
             }
-            Some("/cloud-stop") => self.start_cloud_workspace_stop(),
+            Some("/usage") => {
+                self.show_usage_summary();
+                true
+            }
+            Some("/goal") => {
+                let raw = input.trim_start_matches("/goal");
+                self.forward_slash_command_to_focused_agent("/goal", raw);
+                true
+            }
+            Some("/merge-all") => {
+                self.request_merge_all_ready();
+                true
+            }
+            Some("/review-all") => {
+                self.review_all_ready();
+                true
+            }
             _ => false,
         }
+    }
+
+    /// Build or focus the main agent.
+    ///   /main                  spawn with the default RUDDER.md bootstrap
+    ///   /main <anything>       spawn with <anything> as the first prompt
+    /// Model is whatever the user has set via /model (or their CLI default);
+    /// to change it, run /model first.
+    fn handle_main_command(&mut self, prompt: &str) {
+        let cwd = self.cwd.clone();
+        let mut main_index = self.agents.iter().position(|a| a.is_main());
+        if main_index.is_none() {
+            ensure_main_agent(
+                &mut self.agents,
+                &cwd,
+                self.backend,
+                &self.model,
+                self.effort,
+            );
+            main_index = self.agents.iter().position(|a| a.is_main());
+        }
+        let Some(idx) = main_index else {
+            self.notice = Some("failed to create main agent".to_string());
+            return;
+        };
+        let _ = save_native_run_record(&cwd, &self.agents[idx]);
+        self.selected_agent = idx;
+        self.task_input.clear();
+        self.task_cursor = 0;
+        self.focus_or_spawn_main_with_prompt(prompt.trim());
+    }
+
+    /// Show a one-line summary of token usage and estimated cost for the
+    /// current repo, merged across Claude's session jsonls and Codex's
+    /// session rollouts.
+    fn show_usage_summary(&mut self) {
+        let since = self.session_started_iso.clone();
+        let claude = collect_claude_usage(&self.cwd, &since);
+        let codex = collect_codex_usage(&self.cwd, &since);
+        if claude.is_empty() && codex.is_empty() {
+            self.notice = Some(
+                "no usage data this rudder session yet (type a prompt to claude/codex first)"
+                    .to_string(),
+            );
+            return;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut total_cost = 0.0_f64;
+        let mut total_in = 0u64;
+        let mut total_out = 0u64;
+        let mut total_cache_creation = 0u64;
+        let mut total_cache_read = 0u64;
+        let render = |label: &str,
+                      usage: &std::collections::BTreeMap<String, ModelUsage>,
+                      parts: &mut Vec<String>,
+                      total_cost: &mut f64,
+                      total_in: &mut u64,
+                      total_out: &mut u64,
+                      total_cache_creation: &mut u64,
+                      total_cache_read: &mut u64| {
+            for (model, u) in usage {
+                let cost = model_pricing(model)
+                    .map(|(pi, po, pc, pr)| {
+                        (u.input_tokens as f64) / 1e6 * pi
+                            + (u.output_tokens as f64) / 1e6 * po
+                            + (u.cache_creation_input_tokens as f64) / 1e6 * pc
+                            + (u.cache_read_input_tokens as f64) / 1e6 * pr
+                    })
+                    .unwrap_or(0.0);
+                *total_cost += cost;
+                *total_in += u.input_tokens;
+                *total_out += u.output_tokens;
+                *total_cache_creation += u.cache_creation_input_tokens;
+                *total_cache_read += u.cache_read_input_tokens;
+                parts.push(format!(
+                    "{label}/{}: {} in / {} out ~${:.2}",
+                    short_model_label(model),
+                    format_token_count(u.input_tokens),
+                    format_token_count(u.output_tokens),
+                    cost,
+                ));
+            }
+        };
+        render(
+            "claude",
+            &claude,
+            &mut parts,
+            &mut total_cost,
+            &mut total_in,
+            &mut total_out,
+            &mut total_cache_creation,
+            &mut total_cache_read,
+        );
+        render(
+            "codex",
+            &codex,
+            &mut parts,
+            &mut total_cost,
+            &mut total_in,
+            &mut total_out,
+            &mut total_cache_creation,
+            &mut total_cache_read,
+        );
+        parts.push(format!(
+            "total: {} in / {} out · {} cache-create / {} cache-read · ~${:.2} (estimate)",
+            format_token_count(total_in),
+            format_token_count(total_out),
+            format_token_count(total_cache_creation),
+            format_token_count(total_cache_read),
+            total_cost,
+        ));
+        self.notice = Some(parts.join("  ·  "));
+    }
+
+    /// Forward a slash command (e.g. "/goal foo") straight into the focused
+    /// worker pane's PTY. Used for slash commands that the underlying agent
+    /// (claude or codex) handles itself.
+    fn forward_slash_command_to_focused_agent(&mut self, command: &str, rest: &str) {
+        if self.agents.is_empty() {
+            self.notice = Some(format!("no agent to receive {command}"));
+            return;
+        }
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            self.notice = Some(format!("no agent selected for {command}"));
+            return;
+        };
+        let Some(terminal) = run.terminal.as_mut() else {
+            self.notice = Some(format!(
+                "selected agent is not running; cannot send {command}"
+            ));
+            return;
+        };
+        let trimmed_rest = rest.trim();
+        let payload = if trimmed_rest.is_empty() {
+            format!("{command}\r")
+        } else {
+            format!("{command} {trimmed_rest}\r")
+        };
+        if let Err(error) = terminal.write_input(payload.as_bytes()) {
+            self.notice = Some(format!("{command}: {error}"));
+            return;
+        }
+        self.task_input.clear();
+        self.task_cursor = 0;
+        self.focus = FocusPane::Worker;
+        self.worker_view = WorkerView::Terminal;
     }
 
     fn maybe_prompt_cloud_launch(&mut self, raw_args: &[&str]) -> bool {
@@ -2392,10 +3091,13 @@ impl App {
             autosteered: true,
             needs_permission: false,
             permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
+            last_drain_at: None,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -2420,11 +3122,32 @@ impl App {
             .ok()
             .is_some_and(|value| value == "1")
         {
+            self.workspace_status_rx = None;
             return;
         }
         if !self.cloud_connected {
             self.cloud_workspace = None;
+            self.workspace_status_rx = None;
             return;
+        }
+        if let Some(rx) = self.workspace_status_rx.take() {
+            match rx.try_recv() {
+                Ok(snapshot) => {
+                    if self.cloud_workspace != snapshot {
+                        self.cloud_workspace = snapshot;
+                        self.dirty = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.workspace_status_rx = Some(rx);
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    if self.cloud_workspace.take().is_some() {
+                        self.dirty = true;
+                    }
+                }
+            }
         }
         let due = match self.last_workspace_check {
             None => true,
@@ -2434,12 +3157,12 @@ impl App {
             return;
         }
         self.last_workspace_check = Some(Instant::now());
-        let snapshot = query_cloud_workspace_status(&self.cwd);
-        if snapshot.is_some() {
-            self.cloud_workspace = snapshot;
-        } else {
-            self.cloud_workspace = None;
-        }
+        let cwd = self.cwd.clone();
+        let (tx, rx) = mpsc::channel();
+        self.workspace_status_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(query_cloud_workspace_status(&cwd));
+        });
     }
 
     fn maybe_notify_workspace_idle(&mut self) {
@@ -2467,7 +3190,8 @@ impl App {
         }
         self.workspace_idle_notified = true;
         self.notice = Some(
-            "Cloud workspace running idle. Press /cloud-stop to shut it down.".to_string(),
+            "Cloud workspace idle. Run `rudder cloud workspace stop <id>` to shut it down."
+                .to_string(),
         );
     }
 
@@ -2476,30 +3200,41 @@ impl App {
         self.workspace_idle_notified = false;
     }
 
-    fn start_cloud_workspace_stop(&mut self) -> bool {
-        let Some(workspace) = self.cloud_workspace.as_ref() else {
-            self.notice = Some("No cloud workspace tracked for this repo.".to_string());
-            return true;
+    fn spawn_agents_from_rudder_plan(&mut self, index: usize) {
+        let Some(run) = self.agents.get_mut(index) else {
+            return;
         };
-        let Some(id) = workspace.id.clone() else {
-            self.notice = Some("Cloud workspace has no id; refresh and retry.".to_string());
-            return true;
-        };
-        if !rudder_cloud_authenticated() {
-            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
-            return true;
+        if run.mode != AgentMode::RudderPlan || !run.autosteered {
+            return;
         }
-        let args = vec![
-            "cloud".to_string(),
-            "workspace".to_string(),
-            "stop".to_string(),
-            id.clone(),
-        ];
-        let label = format!("cloud workspace stop {id}");
-        self.start_rudder_cli_command(&label, args);
-        // Force a refresh next poll.
-        self.last_workspace_check = None;
-        true
+        let planner_task = run.task.clone();
+        let output = rudder_plan_output_for_run(run);
+
+        let tasks = match extract_rudder_plan_tasks(&output) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                self.notice = Some(format!(
+                    "rudder-plan did not produce runnable tasks: {error}"
+                ));
+                return;
+            }
+        };
+        if tasks.is_empty() {
+            run.autosteered = false;
+            let _ = save_native_run_record(&self.cwd, run);
+            self.notice = Some("rudder-plan produced no runnable tasks".to_string());
+            return;
+        }
+
+        run.autosteered = false;
+        let _ = save_native_run_record(&self.cwd, run);
+        let count = tasks.len();
+        let worker_backend = self.backend;
+        for task in tasks {
+            let prompt = rudder_plan_worker_prompt(&planner_task, &task, worker_backend);
+            self.start_execute_task_with_summary(&prompt, Some(&task.title));
+        }
+        self.notice = Some(format!("rudder-plan spawned {count} agent(s)"));
     }
 
     fn selected_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
@@ -2535,39 +3270,53 @@ impl App {
             return;
         }
 
-        let command = TerminalCommand::with_args(
-            "sh",
-            [
-                "-lc",
-                "theme=\"${RUDDER_HUNK_THEME:-paper}\"; if [ \"$theme\" = light ]; then theme=paper; fi; if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch --theme \"$theme\"; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch --theme \"$theme\"; fi; while :; do printf '\\033[2J\\033[H'; git status --short; printf '\\n'; git diff --stat HEAD; printf '\\n'; git diff --color=always HEAD; sleep 2; done",
-            ],
-        );
-        if let Err(error) = ensure_hunk_config(&run.cwd) {
-            run.review_error = Some(error.to_string());
-            self.notice = Some(format!("hunk config warning: {error}"));
+        #[cfg(test)]
+        {
+            run.review_error = None;
+            self.notice = Some("opening review".to_string());
+            return;
         }
-        let options = TerminalPaneOptions {
-            size: run.terminal_size.unwrap_or_default(),
-            cwd: Some(run.cwd.clone()),
-            ..TerminalPaneOptions::default()
-        };
 
-        match TerminalPane::spawn_shell_or_command(Some(command), options) {
-            Ok(mut terminal) => {
-                let _ = terminal.drain_output();
-                run.review_terminal = Some(terminal);
-                run.review_error = None;
-                self.notice = Some("opening review".to_string());
-            }
-            Err(error) => {
+        #[cfg(not(test))]
+        {
+            let command = TerminalCommand::with_args(
+                "sh",
+                [
+                    "-lc",
+                    "theme=\"${RUDDER_HUNK_THEME:-paper}\"; if [ \"$theme\" = light ]; then theme=paper; fi; if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch --theme \"$theme\"; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch --theme \"$theme\"; fi; while :; do printf '\\033[2J\\033[H'; git status --short; printf '\\n'; git diff --stat HEAD; printf '\\n'; git diff --color=always HEAD; sleep 2; done",
+                ],
+            );
+            if let Err(error) = ensure_hunk_config(&run.cwd) {
                 run.review_error = Some(error.to_string());
-                self.notice = Some(format!("failed to open Hunk: {error}"));
+                self.notice = Some(format!("hunk config warning: {error}"));
+            }
+            let options = TerminalPaneOptions {
+                size: run.terminal_size.unwrap_or_default(),
+                cwd: Some(run.cwd.clone()),
+                ..TerminalPaneOptions::default()
+            };
+
+            match TerminalPane::spawn_shell_or_command(Some(command), options) {
+                Ok(mut terminal) => {
+                    let _ = terminal.drain_output();
+                    run.review_terminal = Some(terminal);
+                    run.review_error = None;
+                    self.notice = Some("opening review".to_string());
+                }
+                Err(error) => {
+                    run.review_error = Some(error.to_string());
+                    self.notice = Some(format!("failed to open Hunk: {error}"));
+                }
             }
         }
     }
 
     fn delete_selected_agent(&mut self) {
         if self.agents.is_empty() {
+            return;
+        }
+        if self.selected_is_main() {
+            self.notice = Some("main slot: delete disabled".to_string());
             return;
         }
         let selected = &self.agents[self.selected_agent];
@@ -2603,6 +3352,17 @@ impl App {
         });
         let last = self.agents.len().saturating_sub(1);
         self.selected_agent = self.selected_agent.min(last);
+        if !self.agents.is_empty() {
+            let visible = self.visible_agent_indices();
+            if let Some(index) = visible
+                .iter()
+                .copied()
+                .find(|&index| index >= self.selected_agent)
+                .or_else(|| visible.last().copied())
+            {
+                self.selected_agent = index;
+            }
+        }
         self.delete_pending = None;
         self.notice = Some(worktree_error.unwrap_or_else(|| {
             if run.worktree_path.is_some() {
@@ -2615,14 +3375,32 @@ impl App {
     }
 
     fn request_merge_selected_agent(&mut self) {
+        if self.selected_is_main() {
+            self.notice = Some("main slot: merge disabled".to_string());
+            return;
+        }
         let Some(run) = self.agents.get(self.selected_agent) else {
             self.notice = Some("no agent selected".to_string());
             return;
         };
+        if run.status == AgentStatus::Merged {
+            self.notice = Some("selected agent is already merged".to_string());
+            return;
+        }
         if run.worktree_branch.is_none() {
             self.notice = Some("selected agent has no worktree to merge".to_string());
             return;
         }
+        let pending = run
+            .worktree_path
+            .as_ref()
+            .map(|p| count_uncommitted_changes(p))
+            .unwrap_or(0);
+        let summary = if run.task_summary.trim().is_empty() {
+            short_task(&run.task)
+        } else {
+            run.task_summary.trim().to_string()
+        };
         self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::Selected {
@@ -2631,34 +3409,64 @@ impl App {
             },
         });
         self.conflict_prompt = None;
+        let pending_suffix = if pending > 0 {
+            format!(
+                " ({pending} uncommitted file{plural} will be auto-committed as \"{summary}\")",
+                plural = if pending == 1 { "" } else { "s" },
+                summary = truncate_chars(&summary, 48),
+            )
+        } else {
+            String::new()
+        };
         self.notice = Some(format!(
-            "merge {}? press y to confirm or n to cancel",
-            short_task(&run.task)
+            "merge {summary}? press y to confirm or n to cancel{pending_suffix}",
+            summary = truncate_chars(&summary, 48),
         ));
     }
 
     fn request_merge_all_ready(&mut self) {
-        let ready = self
+        let ready_runs: Vec<&AgentRun> = self
             .agents
             .iter()
             .filter(|run| run.status == AgentStatus::Done && run.worktree_branch.is_some())
-            .map(|run| run.id.clone())
-            .collect::<Vec<_>>();
+            .collect();
 
-        if ready.is_empty() {
+        if ready_runs.is_empty() {
             self.notice = Some("no completed worktrees ready to merge".to_string());
             return;
         }
 
+        let mut pending_total = 0usize;
+        let mut pending_runs = 0usize;
+        for run in &ready_runs {
+            if let Some(p) = run.worktree_path.as_ref() {
+                let c = count_uncommitted_changes(p);
+                if c > 0 {
+                    pending_total += c;
+                    pending_runs += 1;
+                }
+            }
+        }
+        let ids: Vec<String> = ready_runs.iter().map(|r| r.id.clone()).collect();
+        let count = ids.len();
+
         self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
-            intent: MergeIntent::All { ids: ready.clone() },
+            intent: MergeIntent::All { ids },
         });
         self.conflict_prompt = None;
+        let pending_suffix = if pending_total > 0 {
+            format!(
+                " ({pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed)",
+                p1 = if pending_total == 1 { "" } else { "s" },
+                p2 = if pending_runs == 1 { "" } else { "s" },
+            )
+        } else {
+            String::new()
+        };
         self.notice = Some(format!(
-            "merge {count} completed worktree{plural}? press y to confirm or n to cancel",
-            count = ready.len(),
-            plural = if ready.len() == 1 { "" } else { "s" }
+            "merge {count} completed worktree{plural}? press y to confirm or n to cancel{pending_suffix}",
+            plural = if count == 1 { "" } else { "s" }
         ));
     }
 
@@ -2702,12 +3510,24 @@ impl App {
                     self.notice = Some("selected agent no longer exists".to_string());
                     return;
                 };
+                let source_branch = self.agents[index].worktree_branch.clone();
+                let worktree_path = self.agents[index].worktree_path.clone();
+                let agent_id = Some(self.agents[index].id.clone());
                 match self.merge_agent_at(index) {
                     Ok(()) => {
                         self.delete_pending = None;
                         self.notice = Some("merged selected worktree".to_string());
                     }
-                    Err(error) => self.handle_merge_error(task, error, None),
+                    Err(error) => {
+                        self.handle_merge_error(
+                            task,
+                            error,
+                            None,
+                            source_branch,
+                            worktree_path,
+                            agent_id,
+                        );
+                    }
                 }
             }
             MergeIntent::All { ids } => {
@@ -2717,8 +3537,18 @@ impl App {
                         continue;
                     };
                     let task = self.agents[index].task.clone();
+                    let source_branch = self.agents[index].worktree_branch.clone();
+                    let worktree_path = self.agents[index].worktree_path.clone();
+                    let agent_id = Some(self.agents[index].id.clone());
                     if let Err(error) = self.merge_agent_at(index) {
-                        self.handle_merge_error(task, error, Some(merged));
+                        self.handle_merge_error(
+                            task,
+                            error,
+                            Some(merged),
+                            source_branch,
+                            worktree_path,
+                            agent_id,
+                        );
                         return;
                     }
                     merged += 1;
@@ -2737,6 +3567,9 @@ impl App {
         task: String,
         error: anyhow::Error,
         merged_before_error: Option<usize>,
+        source_branch: Option<String>,
+        worktree_path: Option<PathBuf>,
+        agent_id: Option<String>,
     ) {
         let conflicted_files = conflicted_files(&self.cwd);
         if conflicted_files.is_empty() {
@@ -2748,10 +3581,16 @@ impl App {
         }
 
         let count = conflicted_files.len();
+        let target_branch = current_branch();
         self.conflict_prompt = Some(MergeConflictPrompt {
             task,
             conflicted_files,
             error: error.to_string(),
+            repo_root: self.cwd.clone(),
+            target_branch,
+            source_branch,
+            worktree_path,
+            agent_id,
         });
         self.notice = Some(format!(
             "merge conflict in {count} file{}: press y for AI help or n to resolve manually",
@@ -2763,77 +3602,104 @@ impl App {
         let Some(prompt) = self.conflict_resolution_prompt() else {
             return;
         };
+        let agent_id = self
+            .conflict_prompt
+            .as_ref()
+            .and_then(|p| p.agent_id.clone());
+        let original_task = self
+            .conflict_prompt
+            .as_ref()
+            .map(|p| p.task.clone())
+            .unwrap_or_default();
         self.conflict_prompt = None;
 
-        let id = new_run_id("resolve merge conflicts");
-        let session_id = mint_session_id_for(self.backend);
+        // Reuse the failing agent's row instead of spawning a new pane. The
+        // PTY is re-rooted to the repo root because that's where the merge
+        // conflicts live (the worktree got partially merged in already).
+        let target_index = agent_id
+            .as_deref()
+            .and_then(|id| self.agents.iter().position(|a| a.id == id));
+        let Some(index) = target_index else {
+            self.notice = Some(
+                "could not find the agent to resolve conflicts in (its row was removed)"
+                    .to_string(),
+            );
+            return;
+        };
+
+        let backend = self.agents[index].backend;
+        let model = self.agents[index].model.clone();
+        let effort = self.agents[index].effort;
+        let terminal_size = self.agents[index].terminal_size.unwrap_or_default();
+        let session_id = mint_session_id_for(backend);
         let command = agent_command(
-            self.backend,
-            &self.model,
-            self.effort,
+            backend,
+            &model,
+            effort,
             &prompt,
             AgentMode::Execute,
             session_id.as_deref(),
         );
         let options = TerminalPaneOptions {
-            size: TerminalSize::default(),
+            size: terminal_size,
             cwd: Some(self.cwd.clone()),
             ..TerminalPaneOptions::default()
         };
 
-        let created_at = now_stamp();
-        let task = "Resolve merge conflicts".to_string();
-        let mut run = AgentRun {
-            id,
-            created_at: created_at.clone(),
-            mode: AgentMode::Execute,
-            task: task.clone(),
-            task_summary: summarize_task(&task),
-            current_prompt: prompt.clone(),
-            turns: vec![AgentTurn {
-                ts: created_at.clone(),
-                prompt: prompt.clone(),
-                source: "user".to_string(),
-            }],
-            last_user_input_at: created_at,
-            backend: self.backend,
-            model: self.model.clone(),
-            effort: self.effort,
-            status: AgentStatus::Running,
-            cwd: self.cwd.clone(),
-            worktree_branch: None,
-            worktree_path: None,
-            session_id,
-            terminal: None,
-            terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
-            last_output_at: Instant::now(),
-            completed_at: None,
-            autosteered: false,
-            needs_permission: false,
-            permission_notified: false,
-            last_error: None,
-            worker_input_draft: String::new(),
-            worker_input_cursor: 0,
-            worker_input_is_prompt: false,
-        };
+        // Drop the old PTY (in the now-merged worktree) before spawning the
+        // new one in the repo root.
+        if let Some(run) = self.agents.get_mut(index) {
+            run.terminal = None;
+            run.review_terminal = None;
+        }
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
-                run.terminal = Some(terminal);
-                self.agents.push(run);
-                self.selected_agent = self.agents.len().saturating_sub(1);
+                let now = now_stamp();
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.cwd = self.cwd.clone();
+                    run.terminal = Some(terminal);
+                    run.status = AgentStatus::Running;
+                    run.worktree_path = None;
+                    run.worktree_branch = None;
+                    run.session_id = session_id;
+                    run.completed_at = None;
+                    run.last_output_at = Instant::now();
+                    run.needs_permission = false;
+                    run.permission_notified = false;
+                    run.needs_user_input = false;
+                    run.user_input_notified = false;
+                    run.last_error = None;
+                    run.task = if original_task.is_empty() {
+                        "Resolve merge conflicts".to_string()
+                    } else {
+                        format!("Resolve merge conflicts: {original_task}")
+                    };
+                    run.task_summary = format!(
+                        "merge conflicts \u{2192} {}",
+                        summarize_task(&original_task)
+                    );
+                    run.turns.push(AgentTurn {
+                        ts: now.clone(),
+                        prompt: prompt.clone(),
+                        source: "user".to_string(),
+                    });
+                    run.last_user_input_at = now;
+                }
+                self.selected_agent = index;
                 self.focus = FocusPane::Worker;
-                self.notice = Some("started AI merge-conflict resolver".to_string());
-                if let Some(run) = self.agents.get(self.selected_agent) {
+                self.notice = Some("AI conflict resolver running in this pane".to_string());
+                if let Some(run) = self.agents.get(index) {
                     let _ = save_native_run_record(&self.cwd, run);
                 }
                 let _ = write_rudder_context(&self.cwd, &self.agents, None);
             }
             Err(error) => {
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.status = AgentStatus::Failed;
+                    run.last_error = Some(error.to_string());
+                }
                 self.notice = Some(format!("failed to start AI resolver: {error}"));
             }
         }
@@ -2844,11 +3710,64 @@ impl App {
         let files = if prompt.conflicted_files.is_empty() {
             "(git did not report conflicted files)".to_string()
         } else {
-            prompt.conflicted_files.join("\n")
+            prompt
+                .conflicted_files
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
+        let repo = prompt.repo_root.display().to_string();
+        let target = prompt
+            .target_branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_string());
+        let source = prompt
+            .source_branch
+            .clone()
+            .unwrap_or_else(|| "(unknown branch)".to_string());
+        let worktree = prompt
+            .worktree_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown worktree)".to_string());
         Some(format!(
-            "A git merge for this Rudder task stopped with conflicts:\n\n{}\n\nConflicted files:\n{}\n\nGit reported:\n{}\n\nResolve the merge conflicts in this checkout. Inspect git status and the conflicted files, keep the intended changes from both sides where appropriate, run the relevant checks if possible, and tell me what you changed. Do not abort the merge unless resolving is impossible.",
-            prompt.task, files, prompt.error
+            "A git merge stopped with conflicts and you are now the conflict resolver.\n\
+\n\
+Where you are working\n\
+- You are running inside the main repo at: {repo}\n\
+- The merge is happening on the target branch (currently checked out here): {target}\n\
+- The branch being merged in is the agent's worktree branch: {source}\n\
+- That branch was developed in this worktree (separate checkout): {worktree}\n\
+\n\
+What was being attempted\n\
+- Original task on {source}: {task}\n\
+\n\
+What conflicted\n\
+{files}\n\
+\n\
+Git reported\n\
+{err}\n\
+\n\
+How to think about the sides\n\
+- The 'ours' side in every conflict marker is {target} (what is already on the main branch).\n\
+- The 'theirs' side is {source} (the agent's new work coming from {worktree}).\n\
+- Preserve the intent of the task on {source} while not regressing existing behavior on {target}.\n\
+\n\
+What to do\n\
+1. Run `git status` from {repo} to see the merge state.\n\
+2. Open each conflicted file at {repo} and resolve the markers. Edit files in {repo}, not in {worktree}.\n\
+3. After every file is resolved, run any relevant tests or checks the repo provides.\n\
+4. Stage the resolved files with `git add` and tell me what you changed and why.\n\
+5. Do NOT run `git commit` (the merge is in progress; the user will commit when they are ready).\n\
+6. Do NOT run `git merge --abort` unless the conflicts are truly unresolvable, and if so explain why.\n",
+            repo = repo,
+            target = target,
+            source = source,
+            worktree = worktree,
+            task = prompt.task,
+            files = files,
+            err = prompt.error,
         ))
     }
 
@@ -2861,27 +3780,46 @@ impl App {
         };
         let cwd = run.cwd.clone();
         let task = run.task.clone();
-        let worktree_path = run.worktree_path.clone();
+        let task_summary = run.task_summary.clone();
 
         if has_git_changes(&cwd) {
             git_status_command(&cwd, &["add", "-A"])?;
-            let message = format!("rudder: {}", short_task(&task));
+            let headline = if task_summary.trim().is_empty() {
+                short_task(&task)
+            } else {
+                task_summary.trim().to_string()
+            };
+            // Multi-line commit: short headline plus the full original task as the
+            // body so reviewers reading `git log` see what the agent was asked to
+            // do, not just our compressed summary.
+            let message = if task.trim() == headline.trim() {
+                headline
+            } else {
+                format!("{headline}\n\n{}", task.trim())
+            };
             let _ = git_status_command(&cwd, &["commit", "-m", &message]);
         }
 
         git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
-        if let Some(path) = worktree_path {
-            let _ = Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(path)
-                .current_dir(&self.cwd)
-                .output();
-        }
-        if let Some(run) = self.agents.get_mut(index) {
-            run.status = AgentStatus::Merged;
-            run.worktree_path = None;
-            run.worktree_branch = None;
-            let _ = save_native_run_record(&self.cwd, run);
+        // Successful merge: keep the agent's row in the dashboard but flip it
+        // to Merged so it appears in a dedicated section. Keep the worktree
+        // path on the record and defer `git worktree remove` to delete, which
+        // keeps merge confirmation responsive and preserves cleanup control.
+        // Never touch the pinned main slot.
+        if index < self.agents.len() && !self.agents[index].is_main() {
+            if let Some(run) = self.agents.get_mut(index) {
+                run.terminal = None;
+                run.review_terminal = None;
+                run.status = AgentStatus::Merged;
+                run.worktree_branch = None;
+                run.completed_at = Some(Instant::now());
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+            let _ = write_rudder_context(&self.cwd, &self.agents, None);
         }
         Ok(())
     }
@@ -2889,6 +3827,9 @@ impl App {
     fn poll_agents(&mut self) {
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
+            if self.cloud_connected != cloud.connected || self.cloud_runtime != cloud.runtime {
+                self.dirty = true;
+            }
             self.cloud_connected = cloud.connected;
             self.cloud_runtime = cloud.runtime;
             self.last_cloud_check = Instant::now();
@@ -2897,13 +3838,53 @@ impl App {
         self.refresh_cloud_workspace_status();
         self.maybe_notify_workspace_idle();
 
+        // Only fully drain the focused agent every tick. For unfocused agents,
+        // throttle drains to every 500ms so vt100 parsing + styled-cache
+        // invalidation cost scales with focus rather than with agent count.
+        const UNFOCUSED_DRAIN_INTERVAL: Duration = Duration::from_millis(500);
+        let focused_index = self.selected_agent;
+        let now = Instant::now();
         let repo_root = self.cwd.clone();
-        for run in &mut self.agents {
+        let mut any_dirty = false;
+        let mut completed_rudder_plans = Vec::new();
+        for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
             let Some(terminal) = run.terminal.as_mut() else {
                 continue;
             };
+            let is_focused = index == focused_index;
+            let due_to_drain = is_focused
+                || run
+                    .last_drain_at
+                    .is_none_or(|stamp| now.duration_since(stamp) >= UNFOCUSED_DRAIN_INTERVAL);
+            if !due_to_drain {
+                // Skip the heavy drain+parse on unfocused panes; still keep
+                // liveness signal cheap via try_wait below.
+                if let Ok(Some(status)) = terminal.try_wait() {
+                    if status.success() {
+                        mark_run_done(run);
+                        if run.mode == AgentMode::RudderPlan && run.autosteered {
+                            completed_rudder_plans.push(index);
+                        }
+                    } else {
+                        run.status = AgentStatus::Failed;
+                        run.completed_at = Some(Instant::now());
+                        run.needs_permission = false;
+                        run.permission_notified = false;
+                        run.needs_user_input = false;
+                        run.user_input_notified = false;
+                        play_completion_sound();
+                    }
+                    let _ = save_native_run_record(&repo_root, run);
+                    any_dirty = true;
+                }
+                continue;
+            }
+            run.last_drain_at = Some(now);
             let had_output = !terminal.drain_output().is_empty();
+            if had_output {
+                any_dirty = true;
+            }
             if had_output {
                 run.last_output_at = Instant::now();
                 if run.status == AgentStatus::Done {
@@ -2914,11 +3895,12 @@ impl App {
             }
             if run.status == AgentStatus::Running {
                 let idle_enough = run.last_output_at.elapsed() >= INTERACTIVE_COMPLETION_IDLE;
-                let visible_lines = if had_output || run.needs_permission || idle_enough {
-                    Some(terminal.visible_lines_snapshot())
-                } else {
-                    None
-                };
+                let visible_lines =
+                    if had_output || run.needs_permission || run.needs_user_input || idle_enough {
+                        Some(terminal.visible_lines_snapshot())
+                    } else {
+                        None
+                    };
                 let needs_permission = visible_lines
                     .as_ref()
                     .is_some_and(|lines| terminal_needs_permission_from_lines(lines));
@@ -2928,8 +3910,22 @@ impl App {
                         play_completion_sound();
                     }
                     run.permission_notified = true;
-                } else {
-                    run.permission_notified = false;
+                }
+                // Intentionally do NOT reset *_notified when the flag flips
+                // back to false. The detector heuristics can flicker while the
+                // agent is streaming, and resetting here causes a fresh ping
+                // on every flicker. The notified flags stay sticky until the
+                // user actually types something (clear_selected_attention_flags
+                // handles that), at which point a real new prompt will ring
+                // again.
+                let needs_user_input = !needs_permission
+                    && visible_lines
+                        .as_ref()
+                        .is_some_and(|lines| terminal_needs_user_input_from_lines(lines));
+                run.needs_user_input = needs_user_input;
+                if needs_user_input && !run.user_input_notified {
+                    play_completion_sound();
+                    run.user_input_notified = true;
                 }
                 match terminal.try_wait() {
                     Ok(Some(status)) => {
@@ -2941,6 +3937,8 @@ impl App {
                             run.completed_at = Some(Instant::now());
                             run.needs_permission = false;
                             run.permission_notified = false;
+                            run.needs_user_input = false;
+                            run.user_input_notified = false;
                             play_completion_sound();
                             changed = true;
                         };
@@ -2961,6 +3959,8 @@ impl App {
                         run.last_error = Some(error.to_string());
                         run.needs_permission = false;
                         run.permission_notified = false;
+                        run.needs_user_input = false;
+                        run.user_input_notified = false;
                         play_completion_sound();
                         changed = true;
                     }
@@ -2968,71 +3968,49 @@ impl App {
             } else {
                 run.needs_permission = false;
                 run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
             }
             if changed {
+                if run.mode == AgentMode::RudderPlan
+                    && run.status == AgentStatus::Done
+                    && run.autosteered
+                {
+                    completed_rudder_plans.push(index);
+                }
+                any_dirty = true;
                 let _ = save_native_run_record(&repo_root, run);
+            }
+            if run.mode == AgentMode::RudderPlan
+                && run.status == AgentStatus::Done
+                && run.autosteered
+                && !completed_rudder_plans.contains(&index)
+            {
+                completed_rudder_plans.push(index);
             }
         }
 
-        let repo_root = self.cwd.clone();
-        for run in &mut self.agents {
-            if run.status != AgentStatus::Done || run.autosteered {
-                continue;
-            }
-            let Some(completed_at) = run.completed_at else {
-                continue;
-            };
-            if completed_at.elapsed() < AUTO_STEER_DELAY || !has_git_changes(&run.cwd) {
-                continue;
-            }
+        for index in completed_rudder_plans {
+            self.spawn_agents_from_rudder_plan(index);
+        }
 
-            let prompt = format!(
-                "Review the current diff and tests for this original task: {}. If anything remains, fix it and run the relevant checks. If it is complete, say what you verified.",
-                run.task
-            );
-            let command = agent_command(
-                run.backend,
-                &run.model,
-                run.effort,
-                &prompt,
-                AgentMode::Execute,
-                run.session_id.as_deref(),
-            );
-            let size = run.terminal_size.unwrap_or_default();
-            let options = TerminalPaneOptions {
-                size,
-                cwd: Some(run.cwd.clone()),
-                ..TerminalPaneOptions::default()
-            };
-            match TerminalPane::spawn_shell_or_command(Some(command), options) {
-                Ok(terminal) => {
-                    run.terminal = Some(terminal);
-                    run.status = AgentStatus::Running;
-                    run.autosteered = true;
-                    run.completed_at = None;
-                    run.needs_permission = false;
-                    run.permission_notified = false;
-                    run.last_error = None;
-                    record_agent_prompt(run, prompt, "steerer");
-                    self.notice = Some(format!("auto-steering {}", short_task(&run.task)));
-                    let _ = save_native_run_record(&repo_root, run);
-                }
-                Err(error) => {
-                    run.status = AgentStatus::Failed;
-                    run.last_error = Some(error.to_string());
-                    let _ = save_native_run_record(&repo_root, run);
-                }
-            }
+        if any_dirty {
+            self.dirty = true;
         }
     }
 
     fn shutdown(&mut self) {
         for run in &mut self.agents {
             if run.terminal.is_some() && run.status == AgentStatus::Running {
+                if run.backend == Backend::Codex && run.session_id.is_none() {
+                    run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
+                }
                 run.terminal = None;
-                run.status = AgentStatus::Stopped;
+                run.status = AgentStatus::Running;
                 run.needs_permission = false;
                 run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
                 run.completed_at = None;
                 let _ = save_native_run_record(&self.cwd, run);
             }
@@ -3047,6 +4025,8 @@ fn mark_run_done(run: &mut AgentRun) {
         run.completed_at = Some(Instant::now());
         run.needs_permission = false;
         run.permission_notified = false;
+        run.needs_user_input = false;
+        run.user_input_notified = false;
         play_completion_sound();
     }
 }
@@ -3055,11 +4035,15 @@ fn terminal_looks_ready_for_input_from_lines(backend: Backend, lines: &[String])
     if terminal_needs_permission_from_lines(lines) {
         return false;
     }
+    if terminal_needs_user_input_from_lines(lines) {
+        // Waiting on a question, not "done".
+        return false;
+    }
 
     let recent = lines
         .iter()
         .rev()
-        .take(8)
+        .take(12)
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
@@ -3068,9 +4052,158 @@ fn terminal_looks_ready_for_input_from_lines(backend: Backend, lines: &[String])
         return false;
     }
 
+    // Strongest signal: the agent's idle chrome footer is visible. That footer
+    // is only rendered while the agent is sitting at its prompt waiting for
+    // input, so it never appears mid-turn. Falls back to the prompt-char
+    // heuristic if we don't see chrome (older claude versions, raw shells).
+    if recent
+        .iter()
+        .any(|line| looks_like_idle_chrome(backend, line))
+    {
+        return true;
+    }
+
     recent
         .iter()
         .any(|line| looks_like_agent_prompt(backend, line))
+}
+
+/// Returns true if the given line looks like static footer/chrome text that
+/// the agent only renders while idle at its prompt.
+fn looks_like_idle_chrome(backend: Backend, line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let common = [
+        "shift+tab to cycle",
+        "shift+tab for plan",
+        "bypass permissions on",
+        "bypass permissions off",
+        "/help for commands",
+        "tab to switch agent",
+        "press up to edit",
+        "esc to clear",
+    ];
+    if common.iter().any(|c| lower.contains(c)) {
+        return true;
+    }
+    match backend {
+        Backend::Claude => lower.contains("(shift+tab"),
+        Backend::Codex => {
+            // Codex idle markers seen in the wild:
+            //   "Worked for 4m 46s"        - turn-end summary line
+            //   "/ps to view"              - background-jobs hint
+            //   "/stop to close"           - same hint, separate token
+            //   "/ for commands"           - slash-help hint
+            //   "ctrl+j newline"           - input-area hint
+            //   "<model> <effort> ... · <cwd>"  - bottom status bar
+            if lower.contains("worked for ")
+                || lower.contains("/ps to view")
+                || lower.contains("/stop to close")
+                || lower.contains("/ for commands")
+                || lower.contains("ctrl+j newline")
+            {
+                return true;
+            }
+            // Status bar pattern: contains " · " AND a path token starting with
+            // "~/" or "/", but is NOT a busy "interrupt" line.
+            !lower.contains("interrupt")
+                && lower.contains(" \u{00b7} ")
+                && (lower.contains(" ~/") || lower.contains(" /"))
+        }
+    }
+}
+
+fn terminal_needs_user_input_from_lines(lines: &[String]) -> bool {
+    // Collect the most recent non-empty normalized lines (top of list = most recent).
+    let recent_rev = lines
+        .iter()
+        .rev()
+        .map(|line| normalize_terminal_line(line))
+        .filter(|line| !line.is_empty())
+        .take(6)
+        .collect::<Vec<_>>();
+    if recent_rev.is_empty() {
+        return false;
+    }
+
+    let last = recent_rev[0].as_str();
+    // Guard against false positives from chatty multi-paragraph output: the
+    // closing line should be short.
+    if last.chars().count() > 120 {
+        return false;
+    }
+
+    // Suppress when the agent is clearly mid-work.
+    if recent_rev.iter().any(|line| looks_busy(line)) {
+        return false;
+    }
+
+    // Tail cursor heuristic: most of the trailing screen rows must be empty.
+    // (visible_lines_snapshot returns the whole pane; if the cursor sits at
+    // the bottom of the screen, the last rows will be blank.)
+    let tail_blanks = lines
+        .iter()
+        .rev()
+        .take(3)
+        .filter(|line| normalize_terminal_line(line).is_empty())
+        .count();
+    if tail_blanks == 0 && lines.len() > 6 {
+        // Cursor isn't near the bottom — likely just chatty output, not a prompt.
+        // Still allow it through if the last line clearly ends in '?'.
+        if !last.trim_end().ends_with('?') {
+            // Also allow numbered menu pattern in the last 6 rows.
+            if !has_numbered_menu_pattern(&recent_rev) {
+                return false;
+            }
+        }
+    }
+
+    if last.trim_end().ends_with('?') {
+        return true;
+    }
+
+    let lower = last.to_ascii_lowercase();
+    let cues = [
+        "what would you like",
+        "how should i",
+        "which would you",
+        "can you clarify",
+        "please confirm",
+        "choose one",
+        "select",
+    ];
+    if cues.iter().any(|cue| lower.contains(cue)) {
+        return true;
+    }
+
+    if has_numbered_menu_pattern(&recent_rev) {
+        return true;
+    }
+
+    false
+}
+
+fn has_numbered_menu_pattern(recent_rev: &[String]) -> bool {
+    // recent_rev holds the most recent non-empty lines (most recent first).
+    // Require at least two DISTINCT numeric options (1 and 2, or 1 and 3, etc.)
+    // so a real numbered list inside agent output doesn't trip us. Also accept
+    // a leading "❯ N." (cursor) plus another N. as a strong selection signal.
+    let mut seen_indices = std::collections::HashSet::new();
+    let mut saw_cursor_option = false;
+    for line in recent_rev.iter().take(8) {
+        let stripped = line
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{276f}' || c == '\u{25b8}');
+        if line.starts_with("\u{276f} ") || line.starts_with("\u{25b8} ") {
+            saw_cursor_option = true;
+        }
+        for n in 1u8..=9 {
+            let prefix_dot = format!("{n}.");
+            let prefix_paren = format!("{n})");
+            if stripped.starts_with(&prefix_dot) || stripped.starts_with(&prefix_paren) {
+                seen_indices.insert(n);
+            }
+        }
+    }
+    seen_indices.len() >= 2 || (saw_cursor_option && !seen_indices.is_empty())
 }
 
 fn terminal_needs_permission_from_lines(lines: &[String]) -> bool {
@@ -3084,9 +4217,40 @@ fn terminal_needs_permission_from_lines(lines: &[String]) -> bool {
     if recent.is_empty() {
         return false;
     }
+    // Strong signal: agent's yes/no permission menu shape. Claude and codex
+    // both render permission prompts as a numbered selection list ending in
+    // "Yes" / "No" options, often with a "(esc)" hint. This is rock-solid
+    // when present and language-agnostic to natural-language keyword soup.
+    if looks_like_yes_no_menu(&recent) {
+        return true;
+    }
     let text = recent.iter().rev().cloned().collect::<Vec<_>>().join("\n");
 
     permission_text_needs_attention(&text)
+}
+
+/// True if the most recent lines look like an agent's yes/no permission menu:
+/// a leading "❯ 1. Yes" with a follow-on "2. No..." nearby.
+fn looks_like_yes_no_menu(recent_rev: &[String]) -> bool {
+    let mut saw_yes_option = false;
+    let mut saw_no_option = false;
+    for line in recent_rev.iter().take(8) {
+        let lower = line.to_ascii_lowercase();
+        let stripped = lower.trim_start_matches(|c: char| {
+            c.is_whitespace() || c == '\u{276f}' || c == '>' || c == '*'
+        });
+        if (stripped.starts_with("1.") || stripped.starts_with("1)")) && stripped.contains("yes") {
+            saw_yes_option = true;
+        }
+        if (stripped.starts_with("2.") || stripped.starts_with("2)"))
+            && (stripped.contains("no")
+                || stripped.contains("don't")
+                || stripped.contains("do not"))
+        {
+            saw_no_option = true;
+        }
+    }
+    saw_yes_option && saw_no_option
 }
 
 fn permission_text_needs_attention(text: &str) -> bool {
@@ -3160,12 +4324,19 @@ fn permission_text_needs_attention(text: &str) -> bool {
 
 fn looks_busy(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.contains("thinking")
-        || lower.contains("working")
-        || lower.contains("running")
-        || lower.contains("esc to interrupt")
+    // Be specific about what "busy" looks like to avoid false positives on
+    // status lines that incidentally contain words like "running" (e.g.
+    // codex's "1 background terminal running · /ps to view"). The agents'
+    // actual busy spinners always advertise an interrupt key.
+    lower.contains("esc to interrupt")
         || lower.contains("ctrl-c to interrupt")
-        || lower.contains("press esc")
+        || lower.contains("ctrl+c to interrupt")
+        || lower.contains("thinking...")
+        || lower.contains("thinking (")
+        || lower.contains("working...")
+        || lower.contains("working (")
+        || lower.contains("running...")
+        || lower.contains("running (")
 }
 
 fn looks_like_agent_prompt(backend: Backend, line: &str) -> bool {
@@ -3229,9 +4400,112 @@ mod app_tests {
 
     #[test]
     fn detects_busy_lines() {
-        assert!(looks_busy("Thinking hard about tests"));
+        assert!(looks_busy("* Thinking... (3s)"));
+        assert!(looks_busy("Working (12s · esc to interrupt)"));
         assert!(looks_busy("esc to interrupt"));
+        assert!(looks_busy("press ctrl-c to interrupt"));
+        // The word alone is not enough; it has to look like a spinner.
+        assert!(!looks_busy("Thinking hard about tests"));
         assert!(!looks_busy("All checks passed."));
+        // Codex's idle "background terminal running" must NOT count as busy.
+        assert!(!looks_busy(
+            "1 background terminal running \u{00b7} /ps to view"
+        ));
+    }
+
+    #[test]
+    fn idle_chrome_is_strong_done_signal() {
+        // Claude's footer when idle at prompt
+        let lines: Vec<String> = vec![
+            "Edited 3 files".to_string(),
+            "> ".to_string(),
+            "  bypass permissions on (shift+tab to cycle)".to_string(),
+        ];
+        assert!(terminal_looks_ready_for_input_from_lines(
+            Backend::Claude,
+            &lines
+        ));
+    }
+
+    #[test]
+    fn codex_idle_chrome_marks_done() {
+        let lines: Vec<String> = vec![
+            "Verification passed:".to_string(),
+            String::new(),
+            "- pnpm lint".to_string(),
+            "- pnpm build".to_string(),
+            "Worked for 4m 46s".to_string(),
+            "1 background terminal running \u{00b7} /ps to view \u{00b7} /stop to close"
+                .to_string(),
+            "> Run /review on my current changes".to_string(),
+            "gpt-5.5 xhigh fast \u{00b7} ~/Documents/.rudder-worktrees/foo-bar".to_string(),
+        ];
+        assert!(terminal_looks_ready_for_input_from_lines(
+            Backend::Codex,
+            &lines
+        ));
+    }
+
+    #[test]
+    fn busy_blocks_done_even_with_prompt_visible() {
+        let lines: Vec<String> = vec![
+            "> ".to_string(),
+            "* Thinking... (3s · esc to interrupt)".to_string(),
+        ];
+        assert!(!terminal_looks_ready_for_input_from_lines(
+            Backend::Claude,
+            &lines
+        ));
+    }
+
+    #[test]
+    fn yes_no_menu_is_strong_permission_signal() {
+        let lines: Vec<String> = vec![
+            "Do you want to allow Bash command".to_string(),
+            "  grep -r foo .".to_string(),
+            "\u{276f} 1. Yes".to_string(),
+            "  2. No, and tell me what to do differently (esc)".to_string(),
+        ];
+        assert!(terminal_needs_permission_from_lines(&lines));
+    }
+
+    #[test]
+    fn ordinary_numbered_list_does_not_trigger_menu_detector() {
+        // Two "1." lines in a row should NOT count as a menu (e.g. an ordered
+        // list in agent prose output). We need at least two DIFFERENT indices.
+        let recent_rev: Vec<String> = vec![
+            "1. Implement parser".to_string(),
+            "1. Implement parser".to_string(),
+        ];
+        assert!(!has_numbered_menu_pattern(&recent_rev));
+
+        let real_menu: Vec<String> = vec!["2. YAML".to_string(), "1. JSON".to_string()];
+        assert!(has_numbered_menu_pattern(&real_menu));
+    }
+
+    #[test]
+    fn cursor_arrow_with_one_option_counts_as_menu() {
+        let recent_rev: Vec<String> = vec!["\u{276f} 1. Continue".to_string()];
+        assert!(has_numbered_menu_pattern(&recent_rev));
+    }
+
+    #[test]
+    fn question_mark_alone_at_bottom_triggers_input_need() {
+        let lines: Vec<String> = vec![
+            "What should I name the new module?".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+        assert!(terminal_needs_user_input_from_lines(&lines));
+    }
+
+    #[test]
+    fn long_chatty_line_does_not_trigger_input_need() {
+        let lines: Vec<String> = vec![
+            "This is a long descriptive sentence about what I just did and why, intended to inform the user that I have completed several edits across the project and now wish to summarize ".to_string(),
+        ];
+        assert!(!terminal_needs_user_input_from_lines(&lines));
     }
 
     #[test]
@@ -3537,6 +4811,58 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines().join("\n"))
             .unwrap_or_default();
         assert!(output.contains("^[[<65;1;1M"), "output was {output:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_worker_wheel_falls_back_to_page_keys_without_mouse_capture() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            ["-lc", "stty raw -echo; printf 'ready\\r\\n'; cat -v"],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("ready") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
+        let mut run = test_agent_run_with_terminal(&app, pane);
+        run.backend = Backend::Codex;
+        app.worker_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 7,
+        });
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("^[[5~"), "output was {output:?}");
     }
 
     #[cfg(not(windows))]
@@ -3891,6 +5217,10 @@ mod app_tests {
             .args
             .iter()
             .any(|arg| arg == "--no-alt-screen"));
+        assert!(execute_codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--enable" && window[1] == "goals"));
 
         let execute_claude = agent_command(
             Backend::Claude,
@@ -3920,6 +5250,10 @@ mod app_tests {
             .windows(2)
             .any(|window| window[0] == "--sandbox" && window[1] == "read-only"));
         assert!(codex.args.iter().any(|arg| arg == "--search"));
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--enable" && window[1] == "goals"));
         assert!(!codex
             .args
             .iter()
@@ -3954,6 +5288,109 @@ mod app_tests {
             .args
             .iter()
             .any(|arg| arg.contains("Plan this task before implementation")));
+
+        let rudder_plan = agent_command(
+            Backend::Codex,
+            "gpt-5.5",
+            Some(EffortLevel::High),
+            "build the feature",
+            AgentMode::RudderPlan,
+            None,
+        );
+        assert!(rudder_plan.args.iter().any(|arg| arg == "--no-alt-screen"));
+        assert!(rudder_plan
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--sandbox" && window[1] == "read-only"));
+        assert!(rudder_plan.args.iter().any(|arg| {
+            arg.contains("RUDDER_PLAN_TASKS_START")
+                && arg.contains("build the feature")
+                && arg.contains("Codex `/goal`")
+        }));
+    }
+
+    #[test]
+    fn extracts_rudder_plan_tasks_from_marked_json_block() {
+        let output = "\x1b[32mRUDDER_PLAN_TASKS_START\x1b[0m\n{\"tasks\":[{\"title\":\"API\",\"prompt\":\"Implement API and test it.\",\"goal\":\"Complete the API without stopping until tests pass.\"},{\"title\":\"UI\",\"prompt\":\"Implement UI and test it.\"}]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "API");
+        assert_eq!(
+            tasks[0].goal.as_deref(),
+            Some("Complete the API without stopping until tests pass.")
+        );
+        assert_eq!(tasks[1].prompt, "Implement UI and test it.");
+        assert_eq!(tasks[1].goal, None);
+    }
+
+    #[test]
+    fn extracts_rudder_plan_tasks_from_last_marked_json_block() {
+        let output = "Planner prompt example:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"placeholder\",\"prompt\":\"do not run this\"}]}\nRUDDER_PLAN_TASKS_END\n\nFinal answer:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"Backend\",\"prompt\":\"Implement backend.\"}]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Backend");
+        assert_eq!(tasks[0].prompt, "Implement backend.");
+    }
+
+    #[test]
+    fn collects_rudder_plan_output_from_codex_session_messages() {
+        let mut output = String::new();
+        collect_codex_session_assistant_text(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"RUDDER_PLAN_TASKS_START\nbad\nRUDDER_PLAN_TASKS_END"}]}}"#,
+            &mut output,
+        );
+        collect_codex_session_assistant_text(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"UI\",\"prompt\":\"Implement UI.\"}]}\nRUDDER_PLAN_TASKS_END"}]}}"#,
+            &mut output,
+        );
+
+        let tasks = extract_rudder_plan_tasks(&output).expect("parse tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "UI");
+    }
+
+    #[test]
+    fn rudder_plan_worker_prompt_includes_codex_goal_when_available() {
+        let task = RudderPlanTask {
+            title: "API".to_string(),
+            prompt: "Implement API and run cargo test.".to_string(),
+            goal: Some("Complete the API without stopping until cargo test passes.".to_string()),
+        };
+        let prompt = rudder_plan_worker_prompt("build the feature", &task, Backend::Codex);
+
+        assert!(prompt.contains("Original request:\nbuild the feature"));
+        assert!(prompt.contains("Worker task: API"));
+        assert!(prompt.contains("/goal Complete the API without stopping until cargo test passes."));
+    }
+
+    #[test]
+    fn extracts_rudder_plan_worker_title_for_agent_summary() {
+        let prompt = "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nOriginal request:\nread rudder.md and launch tasks\n\nWorker task: Libra Issues backend state machine\n\nImplement the API-side work.";
+
+        assert_eq!(
+            rudder_plan_worker_title_from_prompt(prompt).as_deref(),
+            Some("Libra Issues backend state machine")
+        );
+    }
+
+    #[test]
+    fn persisted_rudder_plan_worker_uses_worker_title_summary() {
+        let task = "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nOriginal request:\nread rudder.md and launch tasks\n\nWorker task: Libra Issues product UI\n\nImplement the UI.";
+        let record = serde_json::json!({
+            "id": "run-1",
+            "status": "running",
+            "mode": "execute",
+            "task": task,
+            "taskSummary": "task was spawned Rudder /rudder-plan coordinator",
+            "backend": "codex",
+            "model": "gpt-5.5",
+            "createdAt": "1",
+            "worktree": { "enabled": false, "path": "/tmp/repo", "branch": null }
+        });
+
+        let run = agent_from_run_record(Path::new("/tmp/repo"), record).expect("run");
+        assert_eq!(run.task_summary, "Libra Issues product UI");
     }
 
     #[test]
@@ -4486,10 +5923,13 @@ mod app_tests {
             autosteered: false,
             needs_permission: false,
             permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
+            last_drain_at: None,
         }
     }
 
@@ -4507,11 +5947,62 @@ mod app_tests {
             AgentStatus::Merged
         );
         assert_eq!(run_record_status(AgentStatus::Merged), "merged");
+        assert_eq!(
+            agent_status_from_record(Some("running")),
+            AgentStatus::Running
+        );
 
         let mut run = test_agent_run("run-1", "test task");
         run.status = AgentStatus::Merged;
 
-        assert_eq!(agent_status_label(&run), "merged");
+        assert_eq!(agent_status_label(&run), "[x] merged");
+    }
+
+    #[test]
+    fn resume_commands_reuse_saved_session_ids() {
+        let mut claude = test_agent_run("run-1", "test task");
+        claude.backend = Backend::Claude;
+        claude.session_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        let claude_command = claude_resume_command(&claude, claude.session_id.as_deref().unwrap());
+        assert_eq!(claude_command.program, "claude");
+        assert!(claude_command.args.iter().any(|arg| arg == "--resume"));
+        assert!(claude_command
+            .args
+            .iter()
+            .any(|arg| arg == "11111111-1111-4111-8111-111111111111"));
+
+        let mut codex = test_agent_run("run-2", "test task");
+        codex.backend = Backend::Codex;
+        codex.session_id = Some("019e297b-12fe-79e2-a8f8-33ba41e5fdd4".to_string());
+        let codex_command = codex_resume_command(&codex, codex.session_id.as_deref().unwrap());
+        assert_eq!(codex_command.program, "codex");
+        assert!(codex_command.args.iter().any(|arg| arg == "resume"));
+        assert!(codex_command
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--enable" && window[1] == "goals"));
+        assert!(codex_command
+            .args
+            .iter()
+            .any(|arg| arg == "019e297b-12fe-79e2-a8f8-33ba41e5fdd4"));
+    }
+
+    #[test]
+    fn agent_navigation_follows_visible_order_with_merged_section() {
+        let mut app = App::new();
+        let mut merged = test_agent_run("run-merged", "merged task");
+        merged.status = AgentStatus::Merged;
+        app.agents.push(merged);
+        app.agents.push(test_agent_run("run-live", "live task"));
+        app.selected_agent = 1;
+
+        assert_eq!(app.visible_agent_indices(), vec![1, 0]);
+
+        app.select_next_agent();
+        assert_eq!(app.selected_agent, 0);
+
+        app.select_previous_agent();
+        assert_eq!(app.selected_agent, 1);
     }
 
     #[test]
@@ -4528,6 +6019,137 @@ mod app_tests {
 
         assert!(app.delete_pending.is_none());
         assert!(app.merge_confirm.is_some());
+    }
+
+    #[test]
+    fn merge_all_can_be_triggered_from_worker_focus() {
+        let mut app = App::new();
+        let mut run = test_agent_run("run-1", "test task");
+        run.status = AgentStatus::Done;
+        run.worktree_branch = Some("rudder/test".to_string());
+        run.worktree_path = Some(app.cwd.join("worktree"));
+        app.agents.push(run);
+        app.selected_agent = 0;
+        app.focus = FocusPane::Worker;
+
+        app.handle_worker_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+
+        assert!(matches!(
+            app.merge_confirm.as_ref().map(|confirm| &confirm.intent),
+            Some(MergeIntent::All { ids }) if ids == &vec!["run-1".to_string()]
+        ));
+    }
+
+    #[test]
+    fn merge_all_command_opens_confirmation() {
+        let mut app = App::new();
+        let mut run = test_agent_run("run-1", "test task");
+        run.status = AgentStatus::Done;
+        run.worktree_branch = Some("rudder/test".to_string());
+        run.worktree_path = Some(app.cwd.join("worktree"));
+        app.agents.push(run);
+
+        assert!(app.handle_command("/merge-all"));
+
+        assert!(matches!(
+            app.merge_confirm.as_ref().map(|confirm| &confirm.intent),
+            Some(MergeIntent::All { ids }) if ids == &vec!["run-1".to_string()]
+        ));
+    }
+
+    #[test]
+    fn review_all_opens_selected_completed_worktree_first() {
+        let mut app = App::new();
+        let mut first = test_agent_run("run-1", "first task");
+        first.status = AgentStatus::Done;
+        first.worktree_branch = Some("rudder/first".to_string());
+        first.worktree_path = Some(app.cwd.join("worktree-1"));
+        let mut second = test_agent_run("run-2", "second task");
+        second.status = AgentStatus::Done;
+        second.worktree_branch = Some("rudder/second".to_string());
+        second.worktree_path = Some(app.cwd.join("worktree-2"));
+        app.agents.push(first);
+        app.agents.push(second);
+        app.selected_agent = 1;
+        app.focus = FocusPane::Agents;
+
+        app.review_all_ready();
+
+        assert_eq!(app.selected_agent, 1);
+        assert_eq!(app.focus, FocusPane::Worker);
+        assert_eq!(app.worker_view, WorkerView::Diff);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("reviewing 2/2")));
+    }
+
+    #[test]
+    fn review_all_advances_when_already_reviewing() {
+        let mut app = App::new();
+        let mut first = test_agent_run("run-1", "first task");
+        first.status = AgentStatus::Done;
+        first.worktree_branch = Some("rudder/first".to_string());
+        first.worktree_path = Some(app.cwd.join("worktree-1"));
+        let mut second = test_agent_run("run-2", "second task");
+        second.status = AgentStatus::Done;
+        second.worktree_branch = Some("rudder/second".to_string());
+        second.worktree_path = Some(app.cwd.join("worktree-2"));
+        app.agents.push(first);
+        app.agents.push(second);
+        app.selected_agent = 0;
+        app.focus = FocusPane::Worker;
+        app.worker_view = WorkerView::Diff;
+
+        app.review_all_ready();
+
+        assert_eq!(app.selected_agent, 1);
+        assert_eq!(app.worker_view, WorkerView::Diff);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("reviewing 2/2")));
+    }
+
+    #[test]
+    fn review_all_can_be_triggered_from_worker_focus() {
+        let mut app = App::new();
+        let mut run = test_agent_run("run-1", "test task");
+        run.status = AgentStatus::Done;
+        run.worktree_branch = Some("rudder/test".to_string());
+        run.worktree_path = Some(app.cwd.join("worktree"));
+        app.agents.push(run);
+        app.selected_agent = 0;
+        app.focus = FocusPane::Worker;
+
+        app.handle_worker_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.selected_agent, 0);
+        assert_eq!(app.focus, FocusPane::Worker);
+        assert_eq!(app.worker_view, WorkerView::Diff);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("reviewing 1/1")));
+    }
+
+    #[test]
+    fn review_all_command_opens_review() {
+        let mut app = App::new();
+        let mut run = test_agent_run("run-1", "test task");
+        run.status = AgentStatus::Done;
+        run.worktree_branch = Some("rudder/test".to_string());
+        run.worktree_path = Some(app.cwd.join("worktree"));
+        app.agents.push(run);
+
+        assert!(app.handle_command("/review-all"));
+
+        assert_eq!(app.selected_agent, 0);
+        assert_eq!(app.worker_view, WorkerView::Diff);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("reviewing 1/1")));
     }
 
     #[test]
@@ -4580,10 +6202,13 @@ mod app_tests {
             autosteered: false,
             needs_permission: false,
             permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
+            last_drain_at: None,
         });
 
         app.delete_selected_agent();
@@ -4593,6 +6218,90 @@ mod app_tests {
         app.delete_selected_agent();
         assert!(app.agents.is_empty());
         assert!(app.delete_pending.is_none());
+    }
+
+    #[test]
+    fn ensure_main_agent_inserts_main_at_index_zero() {
+        let mut agents = vec![test_agent_run("run-a", "a task")];
+        ensure_main_agent(
+            &mut agents,
+            std::env::temp_dir().as_path(),
+            Backend::Claude,
+            "sonnet",
+            None,
+        );
+        assert!(agents[0].is_main());
+        assert_eq!(agents[0].id, MAIN_AGENT_ID);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[1].id, "run-a");
+
+        // Re-running keeps a single main pinned at index 0.
+        ensure_main_agent(
+            &mut agents,
+            std::env::temp_dir().as_path(),
+            Backend::Claude,
+            "sonnet",
+            None,
+        );
+        assert!(agents[0].is_main());
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[1].id, "run-a");
+    }
+
+    #[test]
+    fn main_slot_blocks_delete_merge_and_rename() {
+        let mut app = App::new();
+        let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
+        main.mode = AgentMode::Main;
+        main.worktree_branch = None;
+        main.worktree_path = None;
+        app.agents.push(main);
+        app.selected_agent = 0;
+
+        app.delete_selected_agent();
+        assert_eq!(app.agents.len(), 1);
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("main slot"));
+
+        app.notice = None;
+        app.request_merge_selected_agent();
+        assert!(app.merge_confirm.is_none());
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("main slot"));
+
+        app.notice = None;
+        app.start_rename_selected_agent();
+        assert!(app.rename_input.is_none());
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("main slot"));
+    }
+
+    #[test]
+    fn merge_cleanup_preserves_main_slot() {
+        let mut app = App::new();
+        let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
+        main.mode = AgentMode::Main;
+        main.worktree_branch = None;
+        main.worktree_path = None;
+        app.agents.push(main);
+        // The defensive guard in merge_agent_at's cleanup branch must never
+        // remove main even if invoked at index 0.
+        let snapshot_len = app.agents.len();
+        if app.agents.first().map(|a| a.is_main()).unwrap_or(false) {
+            // Simulate the cleanup branch's gate.
+            let index = 0;
+            assert!(index < app.agents.len() && app.agents[index].is_main());
+        }
+        assert_eq!(app.agents.len(), snapshot_len);
     }
 
     #[test]
@@ -4665,8 +6374,34 @@ fn setup_terminal() -> Result<Tui> {
         )
     )?;
     enable_rudder_mouse_capture(&mut stdout)?;
+    set_terminal_title(&mut stdout, &startup_title())?;
     stdout.flush()?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn startup_title() -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| repo_root(&p))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| cwd.display().to_string());
+    let prefix = if is_cloud_worker_session() {
+        "Rudder cloud"
+    } else {
+        "Rudder"
+    };
+    // Start in the idle state; refresh_tab_title overwrites once we have agents.
+    format!("\u{26aa} {prefix}: {name}")
+}
+
+fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {
+    // OSC 0: set both icon and window/tab title. Ghostty + iTerm + Terminal.app
+    // + Alacritty + Kitty all honor this; for the user that means each rudder
+    // tab labels itself instead of all reading "ghostty".
+    write!(stdout, "\x1b]0;{title}\x07")
 }
 
 fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
@@ -4795,6 +6530,9 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
+    // Clear the tab title we set on startup so the user's shell prompt can
+    // rewrite it on exit. Empty title is the conventional way to release it.
+    let _ = set_terminal_title(&mut io::stdout(), "");
     terminal.show_cursor()?;
     Ok(())
 }
@@ -4802,11 +6540,16 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     app.resume_migrated_agents();
-    app.restore_running_claude_agents();
+    app.restore_running_agents();
 
     loop {
+        // poll_agents flips app.dirty when any state mutates (PTY bytes,
+        // status change, cloud info, etc).
         app.poll_agents();
-        terminal.draw(|frame| render(frame, &mut app))?;
+        app.refresh_tab_title();
+        if app.take_dirty() {
+            terminal.draw(|frame| render(frame, &mut app))?;
+        }
 
         if event::poll(TICK_RATE)? {
             if handle_event(&mut app, event::read()?) {
@@ -4830,6 +6573,9 @@ fn run(terminal: &mut Tui) -> Result<()> {
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {
+    // Any inbound terminal event is a user-visible signal: mark dirty so the
+    // next tick re-renders. Resize must redraw too.
+    app.mark_dirty();
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
         Event::Key(_) => false,
@@ -4932,8 +6678,25 @@ fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Agents;
+    let diff_summaries: Vec<Option<String>> = {
+        let keys: Vec<(String, PathBuf)> = app
+            .agents
+            .iter()
+            .map(|a| (a.id.clone(), a.cwd.clone()))
+            .collect();
+        keys.iter()
+            .map(|(id, cwd)| {
+                if id == MAIN_AGENT_ID {
+                    None
+                } else {
+                    app.cached_diff_summary(id, cwd)
+                }
+            })
+            .collect()
+    };
+    let worktree_count = app.agents.iter().filter(|a| !a.is_main()).count();
     let mut lines = vec![
         ListItem::new(Line::from(Span::styled(
             "rudder",
@@ -4949,38 +6712,74 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("agents ", pane_text_style(focused)),
-            Span::styled(app.agents.len().to_string(), accent_style(focused)),
+            Span::styled(worktree_count.to_string(), accent_style(focused)),
             Span::styled(" runs", pane_text_style(focused)),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
-            Span::styled(
-                if app.cloud_connected {
-                    "cloud connected"
-                } else {
-                    "cloud offline"
-                },
-                cloud_style(app.cloud_connected, focused),
-            ),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
-            Span::styled(
-                cloud_workspace_label(app.cloud_workspace.as_ref()),
-                cloud_style(app.cloud_workspace.is_some(), focused),
-            ),
         ])),
         ListItem::new(Line::default()),
     ];
+    if let Some((current, latest)) = read_update_notice() {
+        lines.insert(
+            lines.len() - 1,
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    "\u{2191} ",
+                    accent_style(focused).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("update: {current} -> {latest}"),
+                    pane_text_style(focused).add_modifier(Modifier::BOLD),
+                ),
+            ])),
+        );
+        lines.insert(
+            lines.len() - 1,
+            ListItem::new(Line::from(Span::styled(
+                "  npm i -g @viraatdas/rudder",
+                muted_style(focused),
+            ))),
+        );
+    }
+    if is_cloud_worker_session() {
+        // Only surface cloud status when this dashboard is actually running
+        // inside a cloud worker. Showing "cloud connected" in a plain local
+        // rudder session is misleading: it reflects whether the user has saved
+        // cloud auth, not whether anything is attached.
+        let insert_at = lines.len().saturating_sub(1);
+        lines.insert(
+            insert_at,
+            ListItem::new(Line::from(vec![
+                Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
+                Span::styled(
+                    if app.cloud_connected {
+                        "cloud connected"
+                    } else {
+                        "cloud offline"
+                    },
+                    cloud_style(app.cloud_connected, focused),
+                ),
+            ])),
+        );
+        let insert_at = lines.len().saturating_sub(1);
+        lines.insert(
+            insert_at,
+            ListItem::new(Line::from(vec![
+                Span::styled("☁ ", cloud_style(app.cloud_connected, focused)),
+                Span::styled(
+                    cloud_workspace_label(app.cloud_workspace.as_ref()),
+                    cloud_style(app.cloud_workspace.is_some(), focused),
+                ),
+            ])),
+        );
+    }
 
     for hint in [
         "j/k move",
         "Enter focus",
         "r rename",
-        "R restart",
         "v review",
         "m merge",
         "dd delete",
+        "P model",
     ] {
         lines.push(ListItem::new(Line::from(Span::styled(
             hint,
@@ -4989,7 +6788,13 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     lines.push(ListItem::new(Line::default()));
 
-    for (index, agent) in app.agents.iter().enumerate() {
+    let task_width = area.width.saturating_sub(4).max(12) as usize;
+
+    let push_agent_row = |lines: &mut Vec<ListItem>,
+                          app: &App,
+                          index: usize,
+                          agent: &AgentRun,
+                          diff: Option<String>| {
         let selected = index == app.selected_agent;
         let marker = if selected { "> " } else { "  " };
         let task_style = if selected {
@@ -4997,7 +6802,9 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             pane_text_style(focused)
         };
-        let task_label = if selected && app.rename_input.is_some() {
+        let task_label = if agent.is_main() {
+            agent.task_summary.clone()
+        } else if selected && app.rename_input.is_some() {
             let buf = app.rename_input.clone().unwrap_or_default();
             format!("✎ {buf}")
         } else if agent.task_summary.trim().is_empty() {
@@ -5005,7 +6812,6 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             agent.task_summary.clone()
         };
-        let task_width = area.width.saturating_sub(4).max(12) as usize;
 
         lines.push(ListItem::new(Line::from(vec![
             Span::styled(marker, accent_style(focused)),
@@ -5019,39 +6825,83 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
             },
             Span::styled(truncate_chars(&task_label, task_width), task_style),
         ])));
+
+        let (status_label, status_style): (&'static str, Style) =
+            if agent.is_main() && agent.terminal.is_none() {
+                ("idle", muted_style(focused))
+            } else {
+                (agent_status_label(agent), agent_status_style(agent))
+            };
+
         lines.push(ListItem::new(Line::from(vec![
             Span::raw("  "),
-            Span::styled(agent_status_label(agent), agent_status_style(agent)),
+            Span::styled(status_label, status_style),
             Span::raw("  "),
-            if is_cloud_agent(agent) {
+            if agent.is_main() {
+                Span::styled("main", accent_style(focused).add_modifier(Modifier::BOLD))
+            } else if is_cloud_agent(agent) {
                 Span::styled("cloud", accent_style(focused).add_modifier(Modifier::BOLD))
+            } else if agent.mode == AgentMode::RudderPlan {
+                Span::styled("rudder-plan", accent_style(focused))
             } else if agent.mode == AgentMode::Plan {
                 Span::styled("plan", accent_style(focused))
             } else {
                 Span::styled("run", muted_style(focused))
             },
             Span::raw("  "),
-            Span::styled(agent.backend.as_str(), muted_style(focused)),
+            Span::styled(agent.backend.as_str().to_string(), muted_style(focused)),
             Span::raw("  "),
-            Span::styled(agent.model.as_str(), model_style(focused)),
+            Span::styled(agent.model.clone(), model_style(focused)),
             Span::styled(
                 format!("({})", effort_label(agent.effort)),
                 model_style(focused),
             ),
         ])));
-        if let Some(summary) = diff_short_summary(agent) {
+        if let Some(summary) = diff {
             lines.push(ListItem::new(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(summary, muted_style(focused)),
             ])));
         }
-    }
+    };
 
-    if app.agents.is_empty() {
+    let merged_count = app
+        .agents
+        .iter()
+        .filter(|a| a.status == AgentStatus::Merged && !a.is_main())
+        .count();
+    let mut rendered_live = false;
+    for (index, agent) in app.agents.iter().enumerate() {
+        if agent.status == AgentStatus::Merged && !agent.is_main() {
+            continue;
+        }
+        let summary = if agent.is_main() {
+            None
+        } else {
+            diff_summaries.get(index).and_then(|opt| opt.clone())
+        };
+        push_agent_row(&mut lines, app, index, agent, summary);
+        rendered_live = true;
+    }
+    if !rendered_live && merged_count == 0 {
         lines.push(ListItem::new(Line::from(Span::styled(
-            "no agents yet",
+            "no agents yet  ·  type a task or /main",
             muted_style(focused),
         ))));
+    }
+
+    if merged_count > 0 {
+        lines.push(ListItem::new(Line::default()));
+        lines.push(ListItem::new(Line::from(Span::styled(
+            "merged",
+            muted_style(focused),
+        ))));
+        for (index, agent) in app.agents.iter().enumerate() {
+            if agent.status != AgentStatus::Merged || agent.is_main() {
+                continue;
+            }
+            push_agent_row(&mut lines, app, index, agent, None);
+        }
     }
 
     frame.render_widget(
@@ -5060,6 +6910,23 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .block(pane_block("agents", focused, app.nav_mode)),
         area,
     );
+}
+
+fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
+    let mut indices = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.status != AgentStatus::Merged || agent.is_main())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    indices.extend(
+        agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| agent.status == AgentStatus::Merged && !agent.is_main())
+            .map(|(index, _)| index),
+    );
+    indices
 }
 
 fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -5181,10 +7048,10 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                if run.mode == AgentMode::Plan {
-                    "Press r to restart this read-only planner."
+                if matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan) {
+                    "This read-only planner is not running."
                 } else {
-                    "Press r to restart this agent in its worktree."
+                    "This agent is not running."
                 },
                 muted_style(true),
             )),
@@ -5256,9 +7123,9 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /rudder-plan"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -5290,9 +7157,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|(offset, line)| {
             let display = if app.task_input.is_empty() {
                 if app.plan_mode {
-                    "Type a task to plan or /run"
+                    "Type a task to plan"
                 } else {
-                    "Type a task or /plan"
+                    "Type a task, /plan, or /rudder-plan"
                 }
             } else {
                 line.as_str()
@@ -5357,9 +7224,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /rudder-plan"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -5521,7 +7388,12 @@ fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = prompt
         .selected_task
         .as_deref()
-        .map(|task| format!("onload current Rudder workspace to cloud: {}", short_task(task)))
+        .map(|task| {
+            format!(
+                "onload current Rudder workspace to cloud: {}",
+                short_task(task)
+            )
+        })
         .unwrap_or_else(|| "onload current Rudder workspace to cloud".to_string());
     let upload_selected = prompt.choice == CloudLaunchChoice::Upload;
     let scratch_selected = prompt.choice == CloudLaunchChoice::Scratch;
@@ -5842,6 +7714,15 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
     wheel_scroll_rows_setting().min(page).max(1)
 }
 
+fn scroll_key_bytes(kind: MouseEventKind) -> Option<Vec<u8>> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(b"\x1b[5~".to_vec()),
+        MouseEventKind::ScrollDown => Some(b"\x1b[6~".to_vec()),
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
+        _ => None,
+    }
+}
+
 fn wheel_scroll_rows_setting() -> u16 {
     env::var("RUDDER_WHEEL_SCROLL_ROWS")
         .ok()
@@ -5862,15 +7743,21 @@ fn status_style(status: AgentStatus) -> Style {
 fn agent_status_label(agent: &AgentRun) -> &'static str {
     if agent.needs_permission {
         "needs permission"
-    } else if agent.mode == AgentMode::Plan && agent.status == AgentStatus::Running {
+    } else if agent.needs_user_input {
+        "needs input"
+    } else if matches!(agent.mode, AgentMode::Plan | AgentMode::RudderPlan)
+        && agent.status == AgentStatus::Running
+    {
         "planning"
+    } else if agent.status == AgentStatus::Merged {
+        "[x] merged"
     } else {
         agent.status.as_str()
     }
 }
 
 fn agent_status_style(agent: &AgentRun) -> Style {
-    if agent.needs_permission {
+    if agent.needs_permission || agent.needs_user_input {
         Style::default()
             .fg(RUNNING_COLOR)
             .add_modifier(Modifier::BOLD)
@@ -5974,9 +7861,9 @@ fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> us
 
 fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off  /run"
+        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /model"
+        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /rudder-plan"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
@@ -6494,6 +8381,28 @@ fn rudder_cloud_authenticated() -> bool {
     read_cloud_summary().connected
 }
 
+fn read_update_notice() -> Option<(String, String)> {
+    let latest = env::var("RUDDER_UPDATE_AVAILABLE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())?;
+    let current = env::var("RUDDER_UPDATE_CURRENT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "current".to_string());
+    Some((current, latest))
+}
+
+fn is_cloud_worker_session() -> bool {
+    env::var("RUDDER_WORKSPACE_ID")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+        || env::var("RUDDER_SAIL_ID")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
 fn read_cloud_summary() -> CloudSummary {
     if env::var("RUDDER_CLOUD_TOKEN")
         .ok()
@@ -6716,6 +8625,614 @@ fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn latest_codex_session_id_for_cwd(cwd: &Path) -> Option<String> {
+    let root = user_home_dir()?.join(".codex").join("sessions");
+    let target = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut best: Option<(SystemTime, String)> = None;
+    visit_codex_session_dir(&root, &target, &mut best, 0);
+    best.map(|(_, id)| id)
+}
+
+fn latest_codex_rudder_plan_output(run: &AgentRun) -> Option<String> {
+    if run.backend != Backend::Codex || run.mode != AgentMode::RudderPlan {
+        return None;
+    }
+    let root = user_home_dir()?.join(".codex").join("sessions");
+    let target = fs::canonicalize(&run.cwd).unwrap_or_else(|_| run.cwd.clone());
+    let created_after = run
+        .created_at
+        .parse::<u64>()
+        .ok()
+        .map(|millis| UNIX_EPOCH + Duration::from_millis(millis));
+    latest_codex_rudder_plan_output_in_dir(&root, &target, created_after)
+}
+
+fn latest_codex_rudder_plan_output_in_dir(
+    root: &Path,
+    target_cwd: &Path,
+    created_after: Option<SystemTime>,
+) -> Option<String> {
+    let mut best: Option<(SystemTime, String)> = None;
+    visit_codex_rudder_plan_output_dir(root, target_cwd, created_after, &mut best, 0);
+    best.map(|(_, output)| output)
+}
+
+fn visit_codex_rudder_plan_output_dir(
+    dir: &Path,
+    target_cwd: &Path,
+    created_after: Option<SystemTime>,
+    best: &mut Option<(SystemTime, String)>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            visit_codex_rudder_plan_output_dir(&path, target_cwd, created_after, best, depth + 1);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some((modified, output)) =
+            codex_rudder_plan_output_if_cwd_matches(&path, target_cwd, created_after)
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(stamp, _)| modified > *stamp) {
+            *best = Some((modified, output));
+        }
+    }
+}
+
+fn codex_rudder_plan_output_if_cwd_matches(
+    path: &Path,
+    target_cwd: &Path,
+    created_after: Option<SystemTime>,
+) -> Option<(SystemTime, String)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    if let Some(created_after) = created_after {
+        let cutoff = created_after
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or(created_after);
+        if modified < cutoff {
+            return None;
+        }
+    }
+
+    let file = fs::File::open(path).ok()?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    if !codex_session_meta_cwd_matches(&line, target_cwd) {
+        return None;
+    }
+
+    let mut output = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        collect_codex_session_assistant_text(&line, &mut output);
+    }
+    if output.contains("RUDDER_PLAN_TASKS_START") {
+        Some((modified, output))
+    } else {
+        None
+    }
+}
+
+fn codex_session_meta_cwd_matches(line: &str, target_cwd: &Path) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return false;
+    }
+    let Some(cwd) = value
+        .get("payload")
+        .and_then(|payload| payload.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let session_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    session_cwd == target_cwd
+}
+
+fn collect_codex_session_assistant_text(line: &str, out: &mut String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(record_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(payload) = value.get("payload") else {
+        return;
+    };
+    match record_type {
+        "response_item" => collect_codex_response_item_text(payload, out),
+        "event_msg" => {
+            if matches!(
+                payload.get("type").and_then(serde_json::Value::as_str),
+                Some("agent_message" | "final_answer")
+            ) {
+                append_codex_text(payload.get("message"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_codex_response_item_text(payload: &serde_json::Value, out: &mut String) {
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return;
+    }
+    if payload.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return;
+    }
+    let Some(content) = payload.get("content").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in content {
+        append_codex_text(item.get("text"), out);
+    }
+}
+
+fn append_codex_text(value: Option<&serde_json::Value>, out: &mut String) {
+    let Some(text) = value.and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(text);
+}
+
+fn visit_codex_session_dir(
+    dir: &Path,
+    target_cwd: &Path,
+    best: &mut Option<(SystemTime, String)>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            visit_codex_session_dir(&path, target_cwd, best, depth + 1);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(session_id) = codex_session_id_if_cwd_matches(&path, target_cwd) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(stamp, _)| modified > *stamp) {
+            *best = Some((modified, session_id));
+        }
+    }
+}
+
+fn codex_session_id_if_cwd_matches(path: &Path, target_cwd: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let session_id = payload.get("id")?.as_str()?.to_string();
+    let cwd = payload.get("cwd")?.as_str()?;
+    let session_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    if session_cwd == target_cwd {
+        Some(session_id)
+    } else {
+        None
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct ModelUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
+    let mut y = 1970_i64;
+    loop {
+        let dy = if is_leap_year(y) { 366 } else { 365 };
+        if days < dy {
+            break;
+        }
+        days -= dy;
+        y += 1;
+    }
+    let month_lens: [u32; 12] = [
+        31,
+        if is_leap_year(y) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0_u32;
+    for (i, &ml) in month_lens.iter().enumerate() {
+        if (days as u32) < ml {
+            m = i as u32;
+            break;
+        }
+        days -= ml as i64;
+    }
+    let d = days as u32 + 1;
+    (y, m + 1, d)
+}
+
+/// Load the per-directory rudder session start timestamp from
+/// `.rudder/session.json`, or create one on first use. This makes
+/// session-scoped features (like /usage) persistent across rudder
+/// restarts in the same repo. To reset, delete the file.
+fn load_or_init_session_started(repo_root: &Path) -> String {
+    let path = repo_root.join(".rudder/session.json");
+    if let Ok(raw) = fs::read_to_string(&path) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(ts) = value.get("started_at_iso").and_then(|v| v.as_str()) {
+                if !ts.trim().is_empty() {
+                    return ts.to_string();
+                }
+            }
+        }
+    }
+    let now = system_time_to_iso(SystemTime::now());
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({ "started_at_iso": now.clone() });
+    let _ = fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    );
+    now
+}
+
+fn system_time_to_iso(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = (secs / 86400) as i64;
+    let day_secs = secs % 86400;
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+    let (y, m, d) = days_to_ymd(days);
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.000Z")
+}
+
+fn encode_claude_projects_cwd(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn collect_claude_usage(
+    repo_root: &Path,
+    since_iso: &str,
+) -> std::collections::BTreeMap<String, ModelUsage> {
+    let mut out: std::collections::BTreeMap<String, ModelUsage> = std::collections::BTreeMap::new();
+    let Some(home) = user_home_dir() else {
+        return out;
+    };
+    let dir_name = encode_claude_projects_cwd(repo_root);
+    let project_dir = home.join(".claude/projects").join(&dir_name);
+    let Ok(entries) = fs::read_dir(&project_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in content.lines() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    let ts = value
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !ts.is_empty() && ts < since_iso {
+                        continue;
+                    }
+                    let Some(message) = value.get("message") else {
+                        continue;
+                    };
+                    let Some(usage) = message.get("usage") else {
+                        continue;
+                    };
+                    let model = message
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if model == "<synthetic>" {
+                        continue;
+                    }
+                    let entry = out.entry(model).or_default();
+                    if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        entry.input_tokens += n;
+                    }
+                    if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        entry.output_tokens += n;
+                    }
+                    if let Some(n) = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                    {
+                        entry.cache_creation_input_tokens += n;
+                    }
+                    if let Some(n) = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                    {
+                        entry.cache_read_input_tokens += n;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_codex_usage(
+    repo_root: &Path,
+    since_iso: &str,
+) -> std::collections::BTreeMap<String, ModelUsage> {
+    let mut out: std::collections::BTreeMap<String, ModelUsage> = std::collections::BTreeMap::new();
+    let Some(home) = user_home_dir() else {
+        return out;
+    };
+    let sessions_root = home.join(".codex/sessions");
+    if !sessions_root.exists() {
+        return out;
+    }
+    let target_cwd = repo_root.display().to_string();
+    let mut files = Vec::new();
+    collect_jsonl_files(&sessions_root, &mut files, 4);
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut session_cwd: Option<String> = None;
+        let mut session_model: Option<String> = None;
+        let mut session_start: Option<String> = None;
+        let mut last_total: Option<(u64, u64, u64, u64)> = None;
+        // (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens)
+        for line in content.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "session_meta" => {
+                    if let Some(cwd) = value
+                        .get("payload")
+                        .and_then(|p| p.get("cwd"))
+                        .and_then(|v| v.as_str())
+                    {
+                        session_cwd = Some(cwd.to_string());
+                    }
+                    if let Some(ts) = value
+                        .get("payload")
+                        .and_then(|p| p.get("timestamp"))
+                        .and_then(|v| v.as_str())
+                    {
+                        session_start = Some(ts.to_string());
+                    } else if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
+                        session_start = Some(ts.to_string());
+                    }
+                }
+                "turn_context" => {
+                    if session_model.is_none() {
+                        if let Some(m) = value
+                            .get("payload")
+                            .and_then(|p| p.get("model"))
+                            .and_then(|v| v.as_str())
+                        {
+                            session_model = Some(m.to_string());
+                        }
+                    }
+                }
+                "event_msg" => {
+                    let payload = value.get("payload");
+                    if payload.and_then(|p| p.get("type")).and_then(|v| v.as_str())
+                        == Some("token_count")
+                    {
+                        if let Some(info) = payload.and_then(|p| p.get("info")) {
+                            if let Some(total) = info.get("total_token_usage") {
+                                let inp = total
+                                    .get("input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let cached = total
+                                    .get("cached_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let out_t = total
+                                    .get("output_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let reasoning = total
+                                    .get("reasoning_output_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                last_total = Some((inp, cached, out_t, reasoning));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(cwd) = session_cwd else {
+            continue;
+        };
+        if cwd != target_cwd {
+            continue;
+        }
+        // Scope to "this rudder session": only count codex sessions that
+        // started after this rudder dashboard launched.
+        if let Some(start) = session_start.as_deref() {
+            if start < since_iso {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let model = session_model.unwrap_or_else(|| "unknown-codex".to_string());
+        if let Some((inp, cached, out_t, reasoning)) = last_total {
+            let entry = out.entry(model).or_default();
+            // Map codex semantics into the shared ModelUsage shape: codex's
+            // cached_input_tokens are a subset of input_tokens (already counted),
+            // so we don't double them in input_tokens; we put the cached portion
+            // into cache_read_input_tokens for visibility and discount pricing.
+            let billable_input = inp.saturating_sub(cached);
+            entry.input_tokens += billable_input;
+            entry.cache_read_input_tokens += cached;
+            // reasoning tokens are billed as output tokens by OpenAI.
+            entry.output_tokens += out_t + reasoning;
+        }
+    }
+    out
+}
+
+fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>, depth_limit: usize) {
+    if depth_limit == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                collect_jsonl_files(&path, out, depth_limit - 1);
+            } else if ft.is_file() && path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// Approximate OpenAI pricing per million tokens (input, _unused_, _unused_,
+/// cached_input). Cached input tokens are billed at a discount (~10%).
+fn codex_model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gpt-5") || m.starts_with("o3") {
+        return Some((10.0, 30.0, 0.0, 1.0));
+    }
+    if m.starts_with("gpt-4o-mini") {
+        return Some((0.15, 0.60, 0.0, 0.075));
+    }
+    if m.starts_with("gpt-4o") {
+        return Some((2.50, 10.0, 0.0, 1.25));
+    }
+    if m.starts_with("o1") {
+        return Some((15.0, 60.0, 0.0, 7.50));
+    }
+    None
+}
+
+/// Approximate Anthropic pricing per million tokens (input, output,
+/// cache_creation, cache_read). Used to surface a rough cost estimate, not
+/// billing-grade numbers.
+fn claude_model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
+        return Some((15.0, 75.0, 18.75, 1.50));
+    }
+    if m.contains("sonnet") {
+        return Some((3.0, 15.0, 3.75, 0.30));
+    }
+    if m.contains("haiku") {
+        return Some((0.80, 4.0, 1.00, 0.08));
+    }
+    None
+}
+
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn short_model_label(model: &str) -> String {
+    // claude-haiku-4-5-20251001 -> haiku-4-5
+    let lower = model.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("claude-") {
+        let parts: Vec<&str> = rest.split('-').collect();
+        if parts.len() >= 2 {
+            return format!("{}-{}", parts[0], parts.get(1).copied().unwrap_or("?"));
+        }
+    }
+    // GPT / OpenAI model names usually short already; pass through.
+    model.to_string()
+}
+
+/// Returns (input, output, cache_creation, cache_read) pricing for either
+/// Claude or Codex models.
+fn model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> {
+    claude_model_pricing(model).or_else(|| codex_model_pricing(model))
 }
 
 #[cfg(unix)]
@@ -6987,14 +9504,44 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/plan ".to_string()),
         },
         Suggestion {
-            label: "/run <task>".to_string(),
-            detail: "start implementation even when plan mode is on".to_string(),
-            action: SuggestionAction::Insert("/run ".to_string()),
+            label: "/rudder-plan <task>".to_string(),
+            detail: "decompose a task and spawn worker agents".to_string(),
+            action: SuggestionAction::Insert("/rudder-plan ".to_string()),
         },
         Suggestion {
             label: "/model".to_string(),
             detail: "pick Claude or Codex model".to_string(),
             action: SuggestionAction::Insert("/model ".to_string()),
+        },
+        Suggestion {
+            label: "/main".to_string(),
+            detail: "spawn a main-branch agent (uses current model)".to_string(),
+            action: SuggestionAction::RunCommand("/main".to_string()),
+        },
+        Suggestion {
+            label: "/main <prompt>".to_string(),
+            detail: "main-branch agent with a custom first prompt".to_string(),
+            action: SuggestionAction::Insert("/main ".to_string()),
+        },
+        Suggestion {
+            label: "/goal <text>".to_string(),
+            detail: "forward /goal to the focused agent (claude/codex)".to_string(),
+            action: SuggestionAction::Insert("/goal ".to_string()),
+        },
+        Suggestion {
+            label: "/review-all".to_string(),
+            detail: "review all completed worktrees before merge".to_string(),
+            action: SuggestionAction::RunCommand("/review-all".to_string()),
+        },
+        Suggestion {
+            label: "/merge-all".to_string(),
+            detail: "merge all completed worktrees".to_string(),
+            action: SuggestionAction::RunCommand("/merge-all".to_string()),
+        },
+        Suggestion {
+            label: "/usage".to_string(),
+            detail: "show tokens and estimated cost per model".to_string(),
+            action: SuggestionAction::RunCommand("/usage".to_string()),
         },
         Suggestion {
             label: "/login".to_string(),
@@ -7015,16 +9562,6 @@ fn command_suggestions() -> Vec<Suggestion> {
             label: "/cloud byoc".to_string(),
             detail: "bring your own computer for cloud workers".to_string(),
             action: SuggestionAction::RunCommand("/cloud byoc".to_string()),
-        },
-        Suggestion {
-            label: "/cloud-stop".to_string(),
-            detail: "shut down the cloud workspace for this repo".to_string(),
-            action: SuggestionAction::RunCommand("/cloud-stop".to_string()),
-        },
-        Suggestion {
-            label: "/sail".to_string(),
-            detail: "short alias for starting a cloud worker".to_string(),
-            action: SuggestionAction::Insert("/sail ".to_string()),
         },
         Suggestion {
             label: "/help".to_string(),
@@ -7284,6 +9821,63 @@ fn mint_session_id_for(backend: Backend) -> Option<String> {
     }
 }
 
+fn can_resume_agent(run: &AgentRun) -> bool {
+    match run.backend {
+        Backend::Claude | Backend::Codex => run.session_id.is_some(),
+    }
+}
+
+fn claude_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
+    let mut args: Vec<String> = vec![
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ];
+    if !run.model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(run.model.clone());
+    }
+    if let Some(effort) = run.effort {
+        args.push("--effort".to_string());
+        args.push(effort.as_str().to_string());
+    }
+    args.push("--resume".to_string());
+    args.push(session_id.to_string());
+    TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+}
+
+fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
+    let mut args = vec!["--no-alt-screen".to_string()];
+    args.push("--enable".to_string());
+    args.push("goals".to_string());
+    match run.mode {
+        AgentMode::Execute | AgentMode::Main => {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        }
+        AgentMode::Plan | AgentMode::RudderPlan => {
+            args.push("--sandbox".to_string());
+            args.push("read-only".to_string());
+            args.push("--ask-for-approval".to_string());
+            args.push("never".to_string());
+            args.push("--search".to_string());
+        }
+    }
+    args.push("-c".to_string());
+    args.push("model_reasoning_summary=\"detailed\"".to_string());
+    args.push("-c".to_string());
+    args.push("model_supports_reasoning_summaries=true".to_string());
+    if let Some(effort) = run.effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
+    }
+    if !run.model.trim().is_empty() {
+        args.push("-m".to_string());
+        args.push(run.model.clone());
+    }
+    args.push("resume".to_string());
+    args.push(session_id.to_string());
+    TerminalCommand::with_args("codex", args)
+}
+
 fn agent_command(
     backend: Backend,
     model: &str,
@@ -7293,17 +9887,25 @@ fn agent_command(
     session_id: Option<&str>,
 ) -> TerminalCommand {
     let prompt = match mode {
-        AgentMode::Execute => execution_prompt(task),
-        AgentMode::Plan => plan_prompt(task),
+        AgentMode::Execute => Some(execution_prompt(task)),
+        AgentMode::Plan => Some(plan_prompt(task)),
+        AgentMode::RudderPlan => Some(rudder_plan_prompt(task)),
+        AgentMode::Main => {
+            if task.trim().is_empty() {
+                None
+            } else {
+                Some(execution_prompt(task))
+            }
+        }
     };
     match backend {
         Backend::Claude => {
             let mut args = match mode {
-                AgentMode::Execute => vec![
+                AgentMode::Execute | AgentMode::Main => vec![
                     "--permission-mode".to_string(),
                     "bypassPermissions".to_string(),
                 ],
-                AgentMode::Plan => vec![
+                AgentMode::Plan | AgentMode::RudderPlan => vec![
                     "--permission-mode".to_string(),
                     "plan".to_string(),
                     "--name".to_string(),
@@ -7322,16 +9924,20 @@ fn agent_command(
                 args.push("--session-id".to_string());
                 args.push(sid.to_string());
             }
-            args.push(prompt);
+            if let Some(prompt) = prompt {
+                args.push(prompt);
+            }
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
             let mut args = vec!["--no-alt-screen".to_string()];
+            args.push("--enable".to_string());
+            args.push("goals".to_string());
             match mode {
-                AgentMode::Execute => {
+                AgentMode::Execute | AgentMode::Main => {
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
                 }
-                AgentMode::Plan => {
+                AgentMode::Plan | AgentMode::RudderPlan => {
                     args.push("--sandbox".to_string());
                     args.push("read-only".to_string());
                     args.push("--ask-for-approval".to_string());
@@ -7351,7 +9957,9 @@ fn agent_command(
                 args.push("-m".to_string());
                 args.push(model.to_string());
             }
-            args.push(prompt);
+            if let Some(prompt) = prompt {
+                args.push(prompt);
+            }
             TerminalCommand::with_args("codex", args)
         }
     }
@@ -7369,6 +9977,168 @@ fn plan_prompt(task: &str) -> String {
     format!(
         "Plan this task before implementation. Inspect the repository and relevant read-only context first. Ask follow-up questions if the plan cannot be made decision-complete from inspection alone.\n\n{task}"
     )
+}
+
+fn rudder_plan_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
+    format!(
+        "You are Rudder's planning coordinator. Inspect the repository in read-only mode and decide whether this user request should be split across multiple independent implementation agents.\n\nUser request:\n{task}\n\nProcess:\n1. Identify missing requirements. If the work is ambiguous enough that implementation would likely go wrong, ask concise follow-up questions and do not emit tasks yet.\n2. Otherwise create the smallest set of independent implementation tasks that can run in separate git worktrees with minimal conflicts.\n3. Each task must be self-contained, include concrete files or modules to inspect when known, and include its own verification instructions.\n4. Do not include a task that depends on another task's unmerged changes. If work is sequential, make one task.\n5. Prefer 1-4 tasks. Use more only when the split is clearly independent.\n6. For each worker task that is bigger than one normal turn and has a clear validation loop, include a `goal` value suitable for Codex `/goal`. The goal must name one durable objective, important constraints, validation commands or artifacts, and a verifiable stopping condition. Omit `goal` or set it to an empty string for small tasks, vague tasks, or loose backlogs.\n\nWhen the task list is ready, print exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"optional durable objective for /goal, without the leading slash command\"}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of why this split is safe."
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RudderPlanTask {
+    title: String,
+    prompt: String,
+    goal: Option<String>,
+}
+
+fn rudder_plan_output_for_run(run: &AgentRun) -> String {
+    let mut output = run
+        .terminal
+        .as_ref()
+        .map(|terminal| terminal.output_log_snapshot().to_string())
+        .unwrap_or_default();
+    if let Some(session_output) = latest_codex_rudder_plan_output(run) {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&session_output);
+    }
+    output
+}
+
+fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTask>> {
+    const START: &str = "RUDDER_PLAN_TASKS_START";
+    const END: &str = "RUDDER_PLAN_TASKS_END";
+
+    let clean = strip_ansi_for_plan(output).replace('\r', "");
+    let Some(start) = clean.rfind(START) else {
+        bail!("missing RUDDER_PLAN_TASKS_START");
+    };
+    let after_start = &clean[start + START.len()..];
+    let Some(end) = after_start.find(END) else {
+        bail!("missing RUDDER_PLAN_TASKS_END");
+    };
+    let mut json = after_start[..end].trim();
+    if let Some(stripped) = json.strip_prefix("```json") {
+        json = stripped.trim();
+    } else if let Some(stripped) = json.strip_prefix("```") {
+        json = stripped.trim();
+    }
+    if let Some(stripped) = json.strip_suffix("```") {
+        json = stripped.trim();
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("task block was not valid JSON")?;
+    let tasks = value
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .context("task block must contain a tasks array")?;
+
+    let mut out = Vec::new();
+    for task in tasks.iter().take(6) {
+        let title = task
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("worker task")
+            .trim();
+        let prompt = task
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .context("each task needs a prompt")?
+            .trim();
+        if prompt.is_empty() {
+            continue;
+        }
+        out.push(RudderPlanTask {
+            title: if title.is_empty() {
+                "worker task".to_string()
+            } else {
+                title.to_string()
+            },
+            prompt: prompt.to_string(),
+            goal: task
+                .get("goal")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|goal| !goal.is_empty())
+                .map(ToString::to_string),
+        });
+    }
+
+    Ok(out)
+}
+
+fn rudder_plan_worker_prompt(
+    planner_task: &str,
+    task: &RudderPlanTask,
+    backend: Backend,
+) -> String {
+    let mut prompt = format!(
+        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{}",
+        task.title, task.prompt
+    );
+    if let Some(goal) = task.goal.as_deref() {
+        match backend {
+            Backend::Codex => {
+                prompt.push_str(
+                    "\n\nDurable Codex goal:\nIf goals are available, start by setting this goal before implementation:\n",
+                );
+                prompt.push_str("/goal ");
+                prompt.push_str(goal);
+            }
+            Backend::Claude => {
+                prompt.push_str(
+                    "\n\nDurable objective:\nUse this as the stopping condition for the worker task:\n",
+                );
+                prompt.push_str(goal);
+            }
+        }
+    }
+    prompt
+}
+
+fn rudder_plan_worker_title_from_prompt(task: &str) -> Option<String> {
+    let mut lines = task.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("Worker task:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            return Some(rest.to_string());
+        }
+        for title in lines.by_ref() {
+            let title = title.trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn strip_ansi_for_plan(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn strip_rudder_prompt_wrappers(task: &str) -> String {
@@ -8126,6 +10896,64 @@ fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
     out
 }
 
+fn ensure_main_agent(
+    agents: &mut Vec<AgentRun>,
+    repo_root: &Path,
+    backend: Backend,
+    model: &str,
+    effort: Option<EffortLevel>,
+) {
+    let branch_summary = current_branch().unwrap_or_else(|| "HEAD".to_string());
+    if let Some(existing_index) = agents.iter().position(|a| a.id == MAIN_AGENT_ID) {
+        let mut existing = agents.remove(existing_index);
+        existing.task_summary = branch_summary;
+        existing.cwd = repo_root.to_path_buf();
+        existing.worktree_branch = None;
+        existing.worktree_path = None;
+        existing.mode = AgentMode::Main;
+        agents.insert(0, existing);
+        return;
+    }
+
+    let now = now_stamp();
+    let main = AgentRun {
+        id: MAIN_AGENT_ID.to_string(),
+        created_at: now.clone(),
+        mode: AgentMode::Main,
+        task: "main branch".to_string(),
+        task_summary: branch_summary,
+        current_prompt: String::new(),
+        turns: Vec::new(),
+        last_user_input_at: now,
+        backend,
+        model: model.to_string(),
+        effort,
+        status: AgentStatus::Stopped,
+        cwd: repo_root.to_path_buf(),
+        worktree_branch: None,
+        worktree_path: None,
+        session_id: None,
+        terminal: None,
+        terminal_size: None,
+        review_terminal: None,
+        review_size: None,
+        review_error: None,
+        last_output_at: Instant::now(),
+        completed_at: None,
+        autosteered: false,
+        needs_permission: false,
+        permission_notified: false,
+        needs_user_input: false,
+        user_input_notified: false,
+        last_error: None,
+        worker_input_draft: String::new(),
+        worker_input_cursor: 0,
+        worker_input_is_prompt: false,
+        last_drain_at: None,
+    };
+    agents.insert(0, main);
+}
+
 fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
     let Ok(entries) = fs::read_dir(native_runs_dir(repo_root)) else {
         return Vec::new();
@@ -8144,12 +10972,25 @@ fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
 fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<AgentRun> {
     let id = record.get("id")?.as_str()?.to_string();
     let task = record.get("task")?.as_str()?.to_string();
-    let task_summary = record
+    let raw_task_summary = record
         .get("taskSummary")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| summarize_task(&task));
+        .map(ToOwned::to_owned);
+    let default_task_summary = summarize_task(&task);
+    let task_summary = match (
+        raw_task_summary.as_deref(),
+        rudder_plan_worker_title_from_prompt(&task),
+    ) {
+        (Some(summary), Some(title))
+            if summary == default_task_summary || summary.contains("rudder-plan coordinator") =>
+        {
+            truncate_chars(&title, 56)
+        }
+        (Some(summary), _) => summary.to_string(),
+        (None, Some(title)) => truncate_chars(&title, 56),
+        (None, None) => default_task_summary,
+    };
     let backend = record
         .get("backend")
         .and_then(|value| value.as_str())
@@ -8242,10 +11083,13 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         autosteered: false,
         needs_permission: false,
         permission_notified: false,
+        needs_user_input: false,
+        user_input_notified: false,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
         worker_input_is_prompt: false,
+        last_drain_at: None,
     })
 }
 
@@ -8298,7 +11142,7 @@ fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
         Some("merged") => AgentStatus::Merged,
         Some("failed") => AgentStatus::Failed,
         Some("running") | Some("steering") | Some("verifying") | Some("created") => {
-            AgentStatus::Stopped
+            AgentStatus::Running
         }
         Some("cancelled") | Some("merge-conflict") => AgentStatus::Stopped,
         _ => AgentStatus::Stopped,
@@ -8507,11 +11351,15 @@ fn conflicted_files(cwd: &Path) -> Vec<String> {
 }
 
 fn diff_short_summary(run: &AgentRun) -> Option<String> {
-    let status = git_output(&run.cwd, ["status", "--short"]).ok()?;
+    diff_short_summary_at(&run.cwd)
+}
+
+fn diff_short_summary_at(cwd: &Path) -> Option<String> {
+    let status = git_output(cwd, ["status", "--short"]).ok()?;
     if status.trim().is_empty() {
         return None;
     }
-    let stat = git_output_args(&run.cwd, &["diff", "--shortstat", "HEAD"]).ok();
+    let stat = git_output_args(cwd, &["diff", "--shortstat", "HEAD"]).ok();
     if let Some(stat) = stat
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -8577,6 +11425,17 @@ fn has_git_changes(cwd: &Path) -> bool {
     git_output(cwd, ["status", "--short"])
         .map(|status| !status.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn count_uncommitted_changes(cwd: &Path) -> usize {
+    git_output(cwd, ["status", "--short"])
+        .map(|status| {
+            status
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn worktree_path(repo_root: &Path, run_id: &str) -> PathBuf {

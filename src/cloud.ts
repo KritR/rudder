@@ -1753,11 +1753,15 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
     process.stderr.write(`Resolving cloud workspace for ${repoName}...\n`);
   }
 
+  // Kick off the non-interactive work in parallel. planAgentMigration can
+  // call promptConfirm for a TTY prompt, so we serialize it AFTER the
+  // parallel work resolves to avoid garbled stdout during the prompt.
+  const [region, fingerprint] = await Promise.all([
+    detectFlyRegion(client.baseUrl).catch(() => undefined),
+    computeSnapshotFingerprint(repoRoot, options.homePaths ?? []),
+  ]);
   const migrationPlan = await planAgentMigration(repoRoot, options);
   const mustUploadSnapshot = Boolean(migrationPlan && migrationPlan.migrated.length > 0);
-
-  const region = await detectFlyRegion(client.baseUrl).catch(() => undefined);
-  const fingerprint = await computeSnapshotFingerprint(repoRoot, options.homePaths ?? []);
   const baseBody: Record<string, JsonValue> = {
     workspaceKey,
     repoName,
@@ -1867,14 +1871,7 @@ async function attachToWorkspaceResult(result: JsonValue, options: CloudCommandO
   if (process.env.RUDDER_CLOUD_NO_ATTACH === "1") {
     return;
   }
-  await waitForWorkspaceWorker(workspaceId);
   await runAttach({ kind: "workspace", id: workspaceId, label: `workspace ${workspaceId}` }, { ...options, quietBanner: false });
-}
-
-async function waitForWorkspaceWorker(workspaceId: string): Promise<void> {
-  // Give the Fly machine a moment to boot before the WS attach so users see the dashboard, not a wait-for-worker banner.
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  void workspaceId;
 }
 
 async function workspaceAttachById(workspaceId: string, options: CloudCommandOptions): Promise<void> {
@@ -2138,8 +2135,32 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       process.off("SIGINT", onSigint);
       splash?.dispose();
       if (isInteractive && stdin.isTTY) {
+        // Disable local mouse capture before leaving raw mode so the user's
+        // shell prompt does not get spammed with mouse SGR bytes.
+        try {
+          stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+        } catch {
+          // ignore
+        }
+        // Release the tab title so the user's shell prompt can rewrite it.
+        try {
+          stdout.write("\x1b]0;\x07");
+        } catch {
+          // ignore
+        }
         try {
           stdin.setRawMode(false);
+        } catch {
+          // ignore
+        }
+      }
+      if (splashAllowed) {
+        // We held the local terminal in the alt-screen buffer for the entire
+        // attach session (see AttachSplash.handoff). Restore the main buffer
+        // and cursor now so the user is dropped back to their shell prompt
+        // instead of a blank alt-screen with the dashboard frozen on it.
+        try {
+          stdout.write("\x1b[?1049l\x1b[?25h");
         } catch {
           // ignore
         }
@@ -2163,6 +2184,22 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
 
     socket.on("open", () => {
       opened = true;
+      // Disable Nagle on the underlying TCP socket so single keystrokes don't
+      // sit in the send buffer waiting for piggyback ACKs (~40ms savings per
+      // keypress on the WAN).
+      try {
+        const underlying = (socket as unknown as { _socket?: { setNoDelay?: (v: boolean) => void } })._socket;
+        underlying?.setNoDelay?.(true);
+      } catch {
+        // ignore
+      }
+      // Label this terminal tab so the user can find the right rudder cloud
+      // session at a glance instead of squinting at a row of "ghostty" tabs.
+      try {
+        stdout.write(`\x1b]0;Rudder cloud: ${target.label}\x07`);
+      } catch {
+        // ignore
+      }
       if (splash) {
         splash.start();
         splash.setStatus(`Booting cloud workspace · ${target.label}`);
@@ -2174,6 +2211,16 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       if (isInteractive) {
         try {
           stdin.setRawMode(true);
+        } catch {
+          // ignore
+        }
+        // Enable mouse tracking on the LOCAL terminal so scroll/click events
+        // get forwarded into stdin. The remote rudder TUI also emits these
+        // enable sequences, but they arrive as PTY output bytes and the local
+        // terminal does not interpret output bytes as mode toggles. We have
+        // to enable mouse capture locally too.
+        try {
+          stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
         } catch {
           // ignore
         }
@@ -2263,7 +2310,15 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
           if (message.state === "worker-waiting") {
             splash.setStatus(`Waiting for cloud worker · ${target.label}`);
           } else if (message.state === "worker-connected") {
-            splash.setStatus(`Cloud worker connected · loading dashboard`);
+            // Hand off the splash as soon as the server reports the worker
+            // is connected. Waiting for the first BINARY PTY frame can add
+            // 3-6s on warm restart because the worker may not flush until
+            // after its first render. The binary-frame path below still
+            // calls handoff() as a safety net if we never see this status.
+            firstFrameRendered = true;
+            splash.handoff();
+            sendResize();
+            setTimeout(sendResize, 150);
           }
         } else if (!options.json && !options.quietBanner) {
           if (message.state === "worker-disconnected") {
@@ -2339,7 +2394,13 @@ class AttachSplash {
       return;
     }
     this.stop();
-    this.stdout.write("\x1b[?1049l\x1b[?25h");
+    // Stay in the alt-screen buffer for the rest of the attach session. The
+    // remote dashboard will render into this same buffer, and runAttach's
+    // cleanup() will exit the alt screen on shutdown. Wipe the splash content
+    // first so the remote's partial frames don't render on top of leftover
+    // spinner text (and so any tiny window before the remote's first frame
+    // is a clean buffer, not main-buffer scrollback).
+    this.stdout.write("\x1b[2J\x1b[H\x1b[?25h");
   }
 
   dispose(): void {
@@ -2347,7 +2408,10 @@ class AttachSplash {
       return;
     }
     this.stop();
-    this.stdout.write("\x1b[?25h");
+    // dispose() is the abort path (worker died, user cancelled before any
+    // remote frame). Leave the alt screen so the user is dropped back to their
+    // shell prompt instead of staring at a frozen spinner buffer.
+    this.stdout.write("\x1b[?1049l\x1b[?25h");
   }
 
   private stop(): void {

@@ -82,7 +82,7 @@ export async function writeJson(filePath, value, options) {
     }
 }
 export function commandExists(command) {
-    const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], {
+    const result = spawnSync("sh", ["-c", `command -v ${shellQuote(command)}`], {
         encoding: "utf8",
         env: commandEnv(),
     });

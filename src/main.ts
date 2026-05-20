@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import { runCloudCommand } from "./cloud.js";
 import { findRepoRoot } from "./git.js";
+import { backfillLlmTaskSummaries } from "./state.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
 import {
@@ -24,6 +25,7 @@ import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-das
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
 import { commandExists, isTty, runCommand } from "./util.js";
+import { getUpdateAvailable } from "./version-check.js";
 import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 
 type Parsed = {
@@ -59,7 +61,15 @@ type Parsed = {
 export async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.flags.version || parsed.command === "version") {
-    console.log(await packageVersion());
+    const current = await packageVersion();
+    console.log(current);
+    const update = await getUpdateAvailable().catch(() => null);
+    if (update && update.latest !== current) {
+      console.log(
+        `update available: ${update.latest} (current ${current})`,
+      );
+      console.log("  npm i -g @viraatdas/rudder");
+    }
     return;
   }
   if (parsed.flags.cwd) {
@@ -555,11 +565,29 @@ async function runNativeDashboard(): Promise<boolean> {
   if (!nativeBinary) {
     return false;
   }
+  const update = await getUpdateAvailable().catch(() => null);
+  const env = { ...process.env };
+  if (update) {
+    env.RUDDER_UPDATE_AVAILABLE = update.latest;
+    env.RUDDER_UPDATE_CURRENT = update.current;
+  }
+  // Kick off background LLM task-summary backfill for run records in this repo.
+  // Native dashboard reads run.json directly so this is how we get nicer titles
+  // for new agents - the upgrades show up on the next launch. Fire-and-forget;
+  // never blocks startup.
+  try {
+    const repoRoot = findRepoRoot();
+    if (repoRoot) {
+      void backfillLlmTaskSummaries(repoRoot);
+    }
+  } catch {
+    // ignore
+  }
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
       const child = spawn(nativeBinary, process.argv.slice(2), {
         stdio: "inherit",
-        env: process.env,
+        env,
       });
       child.on("error", reject);
       child.on("exit", (exitCode) => resolve(exitCode));
@@ -660,7 +688,6 @@ Usage:
   rudder cloud logs <id>
   rudder cloud bootstrap <id>
   rudder sail [name or task]
-
 Run management:
   rudder watch [run]              Attach to live output
   rudder logs [run] [--follow]    Print saved output

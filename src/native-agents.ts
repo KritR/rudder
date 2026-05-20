@@ -113,6 +113,8 @@ function codexPlanArgs(run: RunRecord, prompt: string): string[] {
     "read-only",
     "--ask-for-approval",
     "never",
+    "--enable",
+    "goals",
     "--search",
     effort ? "-c" : undefined,
     effort ? `model_reasoning_effort="${effort}"` : undefined,

@@ -1,14 +1,16 @@
 {
   "name": "@viraatdas/rudder",
-  "version": "0.8.13",
+  "version": "1.0.40",
   "description": "A Claude Code-style terminal app for running coding agents with worktree-isolated runs.",
+  "license": "MIT",
   "homepage": "https://rudder.viraat.dev",
   "type": "module",
   "bin": {
     "rudder": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run copy-native",
+    "build": "tsc -p tsconfig.json && npm run build-native && npm run copy-native",
+    "build-native": "cargo build --release --manifest-path native/Cargo.toml",
     "check": "tsc -p tsconfig.json --noEmit",
     "copy-native": "node -e \"const fs=require('fs');const path=require('path');const sources=[path.join('target','release','rudder-native'),path.join('native','target','release','rudder-native')];const src=sources.find((candidate)=>fs.existsSync(candidate));const dest=path.join('dist','native','rudder-native');if(src){fs.mkdirSync(path.dirname(dest),{recursive:true});fs.copyFileSync(src,dest);fs.chmodSync(dest,0o755);}else if(fs.existsSync(dest)){fs.unlinkSync(dest);}\"",
     "prepack": "npm run build",

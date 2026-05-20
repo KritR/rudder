@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import { runCloudCommand } from "./cloud.js";
 import { findRepoRoot } from "./git.js";
+import { backfillLlmTaskSummaries } from "./state.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
 import { cleanupRuns, deleteRun, listProjectRuns, mergeRun, printLogs, startRun, statusRuns, stopRun, watchRun, workerRun, } from "./run-manager.js";
@@ -13,11 +13,18 @@ import { runInteractiveShell } from "./repl.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
 import { commandExists, isTty, runCommand } from "./util.js";
+import { getUpdateAvailable } from "./version-check.js";
 import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 export async function main() {
     const parsed = parseArgs(process.argv.slice(2));
     if (parsed.flags.version || parsed.command === "version") {
-        console.log(await packageVersion());
+        const current = await packageVersion();
+        console.log(current);
+        const update = await getUpdateAvailable().catch(() => null);
+        if (update && update.latest !== current) {
+            console.log(`update available: ${update.latest} (current ${current})`);
+            console.log("  npm i -g @viraatdas/rudder");
+        }
         return;
     }
     if (parsed.flags.cwd) {
@@ -502,14 +509,26 @@ async function runNativeDashboard() {
     if (!nativeBinary) {
         return false;
     }
+    const update = await getUpdateAvailable().catch(() => null);
+    const env = { ...process.env };
+    if (update) {
+        env.RUDDER_UPDATE_AVAILABLE = update.latest;
+        env.RUDDER_UPDATE_CURRENT = update.current;
+    }
+    // Kick off background LLM task-summary backfill for run records in this repo.
+    // Native dashboard reads run.json directly so this is how we get nicer titles
+    // for new agents - the upgrades show up on the next launch. Fire-and-forget;
+    // never blocks startup.
     try {
-        let handoffPath = process.env.RUDDER_HANDOFF_PATH;
-        let handoffPathOwned = false;
-        if (!handoffPath) {
-            handoffPath = path.join(os.tmpdir(), `rudder-handoff-${process.pid}-${Date.now()}.json`);
-            handoffPathOwned = true;
+        const repoRoot = findRepoRoot();
+        if (repoRoot) {
+            void backfillLlmTaskSummaries(repoRoot);
         }
-        const env = { ...process.env, RUDDER_HANDOFF_PATH: handoffPath };
+    }
+    catch {
+        // ignore
+    }
+    try {
         const code = await new Promise((resolve, reject) => {
             const child = spawn(nativeBinary, process.argv.slice(2), {
                 stdio: "inherit",
@@ -518,29 +537,11 @@ async function runNativeDashboard() {
             child.on("error", reject);
             child.on("exit", (exitCode) => resolve(exitCode));
         });
-        const handoff = handoffPathOwned ? await readHandoff(handoffPath) : null;
-        if (handoffPathOwned) {
-            await fsp.unlink(handoffPath).catch(() => undefined);
-        }
-        if (handoff?.kind === "cloud-workspace-attach") {
-            await runCloudCommand("cloud", ["workspace"], {});
-            process.exitCode = process.exitCode ?? 0;
-            return true;
-        }
         process.exitCode = code ?? 1;
         return true;
     }
     catch {
         return false;
-    }
-}
-async function readHandoff(handoffPath) {
-    try {
-        const raw = await fsp.readFile(handoffPath, "utf8");
-        return JSON.parse(raw);
-    }
-    catch {
-        return null;
     }
 }
 async function runNativeCommand(args) {
@@ -629,7 +630,6 @@ Usage:
   rudder cloud logs <id>
   rudder cloud bootstrap <id>
   rudder sail [name or task]
-
 Run management:
   rudder watch [run]              Attach to live output
   rudder logs [run] [--follow]    Print saved output

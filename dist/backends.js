@@ -182,7 +182,7 @@ function acpxCodexModel(model, effort) {
     const selectedEffort = normalizeEffortForBackend("codex", effort) || "xhigh";
     return `${selectedModel}/${selectedEffort}`;
 }
-async function backendEnv(provider) {
+export async function backendEnv(provider) {
     const store = await loadAuthStore();
     const env = { ...process.env };
     if (provider === "anthropic") {

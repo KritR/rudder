@@ -191,7 +191,7 @@ function acpxCodexModel(model: string | undefined, effort: EffortLevel | undefin
   return `${selectedModel}/${selectedEffort}`;
 }
 
-async function backendEnv(provider: "anthropic" | "openai"): Promise<NodeJS.ProcessEnv> {
+export async function backendEnv(provider: "anthropic" | "openai"): Promise<NodeJS.ProcessEnv> {
   const store = await loadAuthStore();
   const env = { ...process.env };
   if (provider === "anthropic") {

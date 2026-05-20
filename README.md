@@ -374,6 +374,7 @@ or another full-screen app can scroll its own view.
 | `Esc` | Leave the review view when it is focused |
 | `r` | Restart the selected stopped agent in its worktree |
 | `m` | Merge the selected completed worktree |
+| `R` | Review each completed worktree before merging |
 | `M` | Merge all completed worktrees |
 | `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
 | `q` | Quit when the worker is not consuming input |
@@ -388,7 +389,10 @@ through suggestions and `Enter` to choose one.
 | `/model` | Open the provider-first model picker: choose Claude or Codex, then model, then effort when supported |
 | `/plan` | Toggle Rudder's read-only plan mode for task pane submissions |
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
+| `/rudder-plan <task>` | Start a planning coordinator that decomposes the task and spawns worker agents |
 | `/run <task>` | Start an implementation run even when plan mode is on |
+| `/review-all` | Review each completed worktree before merging |
+| `/merge-all` | Merge all completed worktrees |
 | `/login` | Open browser login for Rudder Cloud |
 | `/cloud` | Ask whether to onload the current Rudder workspace or start a fresh Fly worker |
 | `/cloud <name>` | Ask the same question, using the name for the fresh Fly worker |
@@ -470,9 +474,17 @@ the backend's native planning/read-only controls:
 
 - The planner runs in the current checkout instead of creating a worktree.
 - Codex planners launch with `--sandbox read-only`, `--ask-for-approval never`,
-  and `--search`, so filesystem writes are blocked and the native Responses
-  `web_search` tool is available.
+  `--enable goals`, and `--search`, so filesystem writes are blocked, Codex
+  goals are available, and the native Responses `web_search` tool is available.
 - Claude planners launch with Claude Code's native `--permission-mode plan`.
+
+`/rudder-plan <task>` uses the same read-only planner controls, but asks the
+planner to emit a structured `RUDDER_PLAN_TASKS` block. When Rudder sees that
+block, it starts each listed task as a normal isolated worktree agent. For
+larger tasks with a clear validation loop, the planner can attach a durable
+Codex `/goal` objective; Rudder passes that into the worker prompt so Codex can
+set the goal before implementation. If the planner asks follow-up questions
+instead of emitting the block, Rudder does not spawn workers.
 - Rudder only prefixes the task with a short planning request; it no longer
   injects a custom planner contract.
 - Normal implementation runs are unchanged: they still create worktrees and use
@@ -484,7 +496,7 @@ Every dashboard task runs in its own git worktree under
 `~/.rudder-worktrees/...`, so parallel agents do not edit the same checkout.
 Run records are saved under `.rudder/runs/`. If you exit Rudder, live worker
 processes stop, but the agents remain listed next time you open Rudder in the
-same repo. Select one and press `r` to restart it manually in the same worktree.
+same repo.
 
 Press `m` to merge the selected completed agent back into the original branch.
 Press `M` to merge all completed agents. Rudder asks for confirmation before
@@ -521,6 +533,11 @@ watch mode, inline agent notes, and untracked-file handling. Rudder forwards
 keyboard input into Hunk while the review pane is focused and keeps wheel or
 trackpad scrolling on Rudder's review scrollback. Press `v` or `Esc` to return
 to the live Claude Code or Codex worker.
+
+Press `R` to review completed worktrees one at a time before merging. Rudder
+opens the selected completed worktree if it is ready, then each subsequent
+`R` advances to the next completed worktree. After reviewing, press `M` to
+merge all completed worktrees into the main checkout.
 
 Rudder writes a per-worktree `.hunk/config.toml` in Hunk's light mode and
 ignores that config through git's local info exclude, so it does not get merged.
@@ -578,3 +595,7 @@ cargo test --manifest-path native/Cargo.toml
 npm run check
 npm run build
 ```
+
+## License
+
+MIT

@@ -117,6 +117,8 @@ pub struct TerminalPane {
     last_alternate_snapshot: Vec<String>,
     alternate_history_limit: usize,
     styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
+    output_log: String,
+    output_log_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,14 +213,40 @@ impl TerminalPane {
             last_alternate_snapshot: Vec::new(),
             alternate_history_limit: options.scrollback_lines.max(DEFAULT_ROWS as usize),
             styled_lines_cache: None,
+            output_log: String::new(),
+            output_log_limit: 200_000,
         })
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer
+        let write_result = self
+            .writer
             .write_all(bytes)
-            .context("failed to write input to PTY")?;
-        self.writer.flush().context("failed to flush PTY input")
+            .and_then(|()| self.writer.flush());
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if let Some(reason) = self.child_exit_summary() {
+                    Err(anyhow!("agent process exited ({reason})"))
+                } else {
+                    Err(anyhow::Error::new(err).context("failed to write input to PTY"))
+                }
+            }
+        }
+    }
+
+    fn child_exit_summary(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.exit_code();
+                if status.success() {
+                    Some("exit 0".to_string())
+                } else {
+                    Some(format!("exit {code}"))
+                }
+            }
+            _ => None,
+        }
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -248,6 +276,7 @@ impl TerminalPane {
         let mut drained = Vec::new();
         while let Ok(chunk) = self.output_rx.try_recv() {
             self.parser.process(&chunk);
+            self.append_output_log(&chunk);
             drained.extend_from_slice(&chunk);
         }
         if !drained.is_empty() {
@@ -274,6 +303,10 @@ impl TerminalPane {
         }
 
         self.current_visible_lines_snapshot()
+    }
+
+    pub fn output_log_snapshot(&self) -> &str {
+        &self.output_log
     }
 
     fn current_visible_lines_snapshot(&self) -> Vec<String> {
@@ -476,6 +509,20 @@ impl TerminalPane {
 
     fn invalidate_render_cache(&mut self) {
         self.styled_lines_cache = None;
+    }
+
+    fn append_output_log(&mut self, chunk: &[u8]) {
+        self.output_log.push_str(&String::from_utf8_lossy(chunk));
+        if self.output_log.len() > self.output_log_limit {
+            let overflow = self.output_log.len() - self.output_log_limit;
+            let drain_to = self
+                .output_log
+                .char_indices()
+                .map(|(index, _)| index)
+                .find(|index| *index >= overflow)
+                .unwrap_or(overflow);
+            self.output_log.drain(..drain_to);
+        }
     }
 }
 

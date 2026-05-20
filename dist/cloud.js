@@ -5,14 +5,16 @@ import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
 import { currentBranch, currentCommit, findRepoRoot } from "./git.js";
+import { applyDefaultDecisions, buildFreshHandoffPrompt, cloudWorktreeAbsolutePath, findMigrationCandidates, migrationSummary, summaryAsJson, } from "./migration.js";
 import { cloudAuthPath } from "./state.js";
-import { ensureDir, commandExists, expandHome, newRunId, nowIso, pathExists, promptText, promptSelect, promptSecret, readJson, runCommand, shortenHome, shellQuote, writeJson, } from "./util.js";
+import { ensureDir, commandExists, expandHome, isTty, newRunId, nowIso, pathExists, promptConfirm, promptText, promptSelect, promptSecret, readJson, runCommand, shortenHome, shellQuote, writeJson, } from "./util.js";
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_CLOUD_URL = "https://rudder-cloud-control.fly.dev";
 const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
 const DEFAULT_HOME_PATHS = [
+    // Agent CLIs
     "~/.claude/.credentials.json",
     "~/.claude/settings.json",
     "~/.claude/CLAUDE.md",
@@ -22,19 +24,46 @@ const DEFAULT_HOME_PATHS = [
     "~/.codex/AGENTS.md",
     "~/.codex/hooks.json",
     "~/.codex/rules",
-    "~/.config/gh",
+    // Git + GitHub
     "~/.gitconfig",
+    "~/.config/gh",
+    // Shell rc so PATH/aliases/env exports come along
+    "~/.zshrc",
+    "~/.zprofile",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.profile",
+    "~/.envrc",
+    // Package managers
     "~/.npmrc",
+    "~/.yarnrc",
+    "~/.yarnrc.yml",
+    "~/.cargo/config",
+    "~/.cargo/config.toml",
+    // Cloud provider CLIs
     "~/.vercel",
     "~/.config/vercel",
+    "~/.aws/config",
+    "~/.aws/credentials",
+    "~/.config/gcloud/configurations",
+    "~/.config/gcloud/active_config",
+    "~/.config/gcloud/credentials.db",
+    "~/.config/gcloud/access_tokens.db",
+    "~/.config/gcloud/application_default_credentials.json",
+    "~/.kube/config",
+    // Netrc for tools that auth via netrc
+    "~/.netrc",
+    // Rudder + Hunk
     "~/.config/hunk",
 ];
+// Paths or path components that should never be uploaded under any
+// circumstance — even if a user's DEFAULT_HOME_PATHS entry references them.
+// Specifically leaving out .aws/.kube/.docker so the corresponding configs
+// can ship; .ssh/.gnupg/keychains stay blocked because they contain
+// private key material that isn't recoverable if leaked.
 const SECRET_PATH_PARTS = new Set([
-    ".aws",
     ".ssh",
     ".gnupg",
-    ".kube",
-    ".docker",
     "keychains",
 ]);
 const BULKY_HOME_PATH_PARTS = new Set([
@@ -61,7 +90,6 @@ const SECRET_BASENAMES = new Set([
     ".env.development",
     "id_rsa",
     "id_ed25519",
-    "credentials",
     "known_hosts",
 ]);
 const BULKY_HOME_BASENAME_PATTERNS = [
@@ -77,6 +105,13 @@ export async function runCloudCommand(command, args, options = {}) {
     const rest = args.slice(1);
     if (command === "cloud" && subcommand === "help") {
         printCloudHelp();
+        return;
+    }
+    // `rudder cloud` with no further args means "open the cloud workspace for
+    // this repo". Explicit subcommands (sail, launch, etc.) keep their old
+    // behavior. `rudder sail` and `rudder cloud sail` still launch a sail.
+    if (command === "cloud" && subcommand === "") {
+        await workspaceCommand([], options);
         return;
     }
     switch (subcommand) {
@@ -900,6 +935,31 @@ async function createSnapshot(repoRoot, requestedHomePaths, options = {}) {
             includedHomePaths.push(shortenHome(homePath));
         }
     }
+    // On macOS, Claude Code stores its OAuth token in the Keychain rather than
+    // ~/.claude/.credentials.json, so the home-paths copy above doesn't pick it
+    // up. Extract it from the Keychain and stage it as a credentials file so
+    // the cloud worker boots already logged in.
+    if (await stageClaudeKeychainCredentials(homeStage)) {
+        includedHomePaths.push("~/.claude/.credentials.json (keychain)");
+    }
+    const capturedEnv = captureCloudEnv();
+    let capturedEnvCount = 0;
+    if (Object.keys(capturedEnv).length > 0) {
+        await ensureDir(path.join(stageDir, "env"));
+        await writeJson(path.join(stageDir, "env", "cloud-env.json"), capturedEnv);
+        capturedEnvCount = Object.keys(capturedEnv).length;
+    }
+    let migratedAgentsCount = 0;
+    if (options.migration && options.migration.plan.migrated.length > 0) {
+        const entries = await stageMigratedAgents(stageDir, repoRoot, options.migration.repoName, options.migration.plan.migrated);
+        const migrationManifest = {
+            version: 1,
+            createdAt: nowIso(),
+            agents: entries,
+        };
+        await writeJson(path.join(stageDir, "migration.json"), migrationManifest);
+        migratedAgentsCount = entries.length;
+    }
     const manifest = {
         version: 1,
         createdAt: nowIso(),
@@ -910,11 +970,172 @@ async function createSnapshot(repoRoot, requestedHomePaths, options = {}) {
         },
         homePaths: includedHomePaths,
         ...(rudderState ? { rudderState } : {}),
+        ...(migratedAgentsCount > 0 ? { migratedAgents: migratedAgentsCount } : {}),
+        ...(capturedEnvCount > 0 ? { capturedEnvVars: capturedEnvCount } : {}),
     };
     await writeJson(path.join(stageDir, "manifest.json"), manifest);
     const archivePath = path.join(tempDir, `${newRunId("cloud-snapshot")}.tgz`);
     await runCommand("tar", ["-czf", archivePath, "-C", stageDir, "."], { cwd: stageDir });
     return { tempDir, archivePath, manifest };
+}
+const CLOUD_ENV_DEFAULT_NAMES = new Set([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "VERCEL_TOKEN",
+    "VERCEL_ORG_ID",
+    "VERCEL_PROJECT_ID",
+    "NETLIFY_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    "CARGO_REGISTRY_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "POSTGRES_URL",
+    "STRIPE_API_KEY",
+    "STRIPE_SECRET_KEY",
+    "SLACK_BOT_TOKEN",
+    "DISCORD_TOKEN",
+]);
+const CLOUD_ENV_SUFFIX_PATTERNS = [/_API_KEY$/, /_AUTH_TOKEN$/, /_ACCESS_TOKEN$/, /_TOKEN$/, /_SECRET$/, /_SECRET_KEY$/];
+const CLOUD_ENV_BLOCKLIST = new Set([
+    // Things we explicitly do not want shipping
+    "PATH",
+    "HOME",
+    "USER",
+    "PWD",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "LOGNAME",
+    "SHLVL",
+    "OLDPWD",
+    "DISPLAY",
+    "EDITOR",
+    "PAGER",
+    "LANG",
+    "LC_ALL",
+    // Rudder-internal vars that are set by the worker itself
+    "RUDDER_WORKSPACE_ID",
+    "RUDDER_SAIL_ID",
+    "RUDDER_WORKER_TOKEN",
+    "RUDDER_CLOUD_URL",
+    "RUDDER_SNAPSHOT_URL",
+    "RUDDER_CLOUD_TOKEN",
+    "RUDDER_TASK",
+    "RUDDER_REPO_NAME",
+    "RUDDER_ACCOUNT_ID",
+    "RUDDER_HANDOFF_PATH",
+]);
+function captureCloudEnv() {
+    const extra = (process.env.RUDDER_CLOUD_ENV_VARS || "")
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean);
+    const blockExtra = (process.env.RUDDER_CLOUD_ENV_BLOCKLIST || "")
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean);
+    const blocked = new Set([...CLOUD_ENV_BLOCKLIST, ...blockExtra]);
+    const out = {};
+    for (const [name, value] of Object.entries(process.env)) {
+        if (!name || typeof value !== "string" || !value) {
+            continue;
+        }
+        if (blocked.has(name)) {
+            continue;
+        }
+        const matches = CLOUD_ENV_DEFAULT_NAMES.has(name)
+            || CLOUD_ENV_SUFFIX_PATTERNS.some((pattern) => pattern.test(name))
+            || extra.includes(name);
+        if (!matches) {
+            continue;
+        }
+        out[name] = value;
+    }
+    return out;
+}
+async function stageMigratedAgents(stageDir, repoRoot, repoName, migrated) {
+    const worktreesStage = path.join(stageDir, "migrated-worktrees");
+    const sessionsStage = path.join(stageDir, "migrated-sessions");
+    const entries = [];
+    for (const candidate of migrated) {
+        if (!(await pathExists(candidate.worktreePath))) {
+            continue;
+        }
+        const hasSession = Boolean(candidate.sessionId
+            && candidate.sessionJsonlPath
+            && (await pathExists(candidate.sessionJsonlPath)));
+        const worktreeDest = path.join(worktreesStage, candidate.runId);
+        await ensureDir(worktreeDest);
+        await copyWorktreeFiles(candidate.worktreePath, worktreeDest, repoRoot);
+        let sessionJsonlSnapshotPath;
+        if (hasSession) {
+            const jsonlDest = path.join(sessionsStage, `${candidate.runId}.jsonl`);
+            await ensureDir(path.dirname(jsonlDest));
+            await fsp.cp(candidate.sessionJsonlPath, jsonlDest, { force: true });
+            sessionJsonlSnapshotPath = path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`);
+        }
+        const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId);
+        // For fresh restarts, build a prompt-engineered handoff from the local
+        // run record so the new agent gets context instead of just the bare task.
+        let freshPrompt;
+        if (!hasSession) {
+            const runJsonPath = path.join(repoRoot, ".rudder", "runs", candidate.runId, "run.json");
+            const record = await readJson(runJsonPath);
+            const turns = Array.isArray(record?.turns) ? record.turns : [];
+            freshPrompt = buildFreshHandoffPrompt(candidate, turns);
+        }
+        entries.push({
+            runId: candidate.runId,
+            task: candidate.task,
+            taskSummary: candidate.taskSummary,
+            backend: candidate.backend,
+            sessionId: candidate.sessionId ?? "",
+            localWorktreePath: candidate.worktreePath,
+            cloudWorktreeRelativePath: cloudWorktreeAbs,
+            sessionJsonlSnapshotPath: sessionJsonlSnapshotPath ?? "",
+            worktreeBranch: candidate.worktreeBranch,
+            freshPrompt,
+        });
+    }
+    return entries;
+}
+async function copyWorktreeFiles(worktreePath, target, _repoRoot) {
+    const result = await runCommand("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
+        cwd: worktreePath,
+        allowFailure: true,
+    });
+    const files = result.code === 0
+        ? result.stdout.split("\0").filter(Boolean)
+        : await listFiles(worktreePath);
+    for (const relative of files) {
+        if (!relative || relative.startsWith(".git/") || relative === ".git" || relative.startsWith(".rudder/")) {
+            continue;
+        }
+        const source = path.join(worktreePath, relative);
+        const dest = path.join(target, relative);
+        if (!isInside(worktreePath, source) || !isInside(target, dest)) {
+            continue;
+        }
+        const stat = await fsp.lstat(source).catch(() => null);
+        if (!stat || stat.isDirectory() || !(await shouldIncludeSnapshotPath(source))) {
+            continue;
+        }
+        await ensureDir(path.dirname(dest));
+        await fsp.cp(source, dest, { dereference: false, force: true });
+    }
 }
 async function copyRudderState(repoRoot, repoStage) {
     const copied = [];
@@ -1014,6 +1235,32 @@ function normalizeHomePaths(requested) {
         paths.push(resolved);
     }
     return paths;
+}
+async function stageClaudeKeychainCredentials(homeStage) {
+    if (process.platform !== "darwin") {
+        return false;
+    }
+    if (!commandExists("security")) {
+        return false;
+    }
+    const result = await runCommand("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], { allowFailure: true });
+    if (result.code !== 0) {
+        return false;
+    }
+    const payload = result.stdout.trim();
+    if (!payload || !payload.startsWith("{")) {
+        return false;
+    }
+    try {
+        JSON.parse(payload);
+    }
+    catch {
+        return false;
+    }
+    const targetDir = path.join(homeStage, ".claude");
+    await ensureDir(targetDir);
+    await fsp.writeFile(path.join(targetDir, ".credentials.json"), payload + "\n", { mode: 0o600 });
+    return true;
 }
 async function copyHomePath(source, homeStage) {
     if (!(await pathExists(source)) || !(await shouldIncludeSnapshotPath(source))) {
@@ -1196,7 +1443,15 @@ async function workspaceCommand(args, options) {
     const sub = args[0] ?? "";
     const rest = args.slice(1);
     if (sub === "" || sub === "attach") {
-        await workspaceAttach(options);
+        await workspaceAttach(rest, options);
+        return;
+    }
+    if (sub === "share") {
+        await workspaceShare(options);
+        return;
+    }
+    if (sub === "status") {
+        await workspaceStatus(options);
         return;
     }
     if (sub === "stop") {
@@ -1207,13 +1462,78 @@ async function workspaceCommand(args, options) {
         await workspaceList(options);
         return;
     }
-    throw new Error("Usage: rudder cloud workspace [attach|stop|list]");
+    throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|stop|list]");
 }
 function computeWorkspaceKey(repoRoot) {
     const normalized = path.resolve(repoRoot);
     return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
 }
-async function workspaceAttach(options) {
+let cachedFlyRegion;
+async function detectFlyRegion(baseUrl) {
+    if (process.env.RUDDER_CLOUD_REGION) {
+        return process.env.RUDDER_CLOUD_REGION.trim().toLowerCase();
+    }
+    if (cachedFlyRegion) {
+        return cachedFlyRegion;
+    }
+    try {
+        const response = await fetch(`${baseUrl.replace(/\/$/, "")}/health`, { method: "GET" });
+        const requestId = response.headers.get("fly-request-id");
+        if (requestId) {
+            // Fly request-id format: <ulid>-<region>
+            const dash = requestId.lastIndexOf("-");
+            const region = dash > 0 ? requestId.slice(dash + 1).trim().toLowerCase() : "";
+            if (region && region.length <= 6 && /^[a-z]+$/.test(region)) {
+                cachedFlyRegion = region;
+                return region;
+            }
+        }
+    }
+    catch {
+        // ignore — server will fall back to its default region
+    }
+    return undefined;
+}
+async function computeSnapshotFingerprint(repoRoot, _requestedHomePaths) {
+    const hash = createHash("sha256");
+    // Repo state: HEAD commit + the porcelain dirty file list. Two attaches
+    // from the same repo at the same commit with no edits should produce the
+    // same fingerprint.
+    const headCommit = await currentCommit(repoRoot).catch(() => "");
+    hash.update(`repo:head:${headCommit}\n`);
+    const status = await runCommand("git", ["status", "--porcelain", "-z"], {
+        cwd: repoRoot,
+        allowFailure: true,
+    });
+    if (status.code === 0) {
+        hash.update(`repo:status:${status.stdout}\n`);
+    }
+    // macOS Keychain claude credentials: hash content so re-logging in
+    // invalidates the cache but a steady-state user keeps it.
+    if (process.platform === "darwin") {
+        const creds = await runCommand("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
+            allowFailure: true,
+        });
+        if (creds.code === 0) {
+            hash.update(`keychain:claude:${createHash("sha256").update(creds.stdout).digest("hex")}\n`);
+        }
+    }
+    // Captured env vars (excluding ones we know rotate like AWS session tokens).
+    const env = captureCloudEnv();
+    const unstable = new Set(["AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"]);
+    for (const key of Object.keys(env).sort()) {
+        if (unstable.has(key))
+            continue;
+        hash.update(`env:${key}:${createHash("sha256").update(env[key] ?? "").digest("hex")}\n`);
+    }
+    return hash.digest("hex").slice(0, 32);
+}
+async function workspaceAttach(args, options) {
+    const explicitId = args[0];
+    if (explicitId) {
+        await workspaceAttachById(explicitId, options);
+        return;
+    }
     const repoRoot = findRepoRoot();
     const workspaceKey = computeWorkspaceKey(repoRoot);
     const repoName = path.basename(repoRoot);
@@ -1221,23 +1541,45 @@ async function workspaceAttach(options) {
     if (!options.json) {
         process.stderr.write(`Resolving cloud workspace for ${repoName}...\n`);
     }
-    const baseBody = { workspaceKey, repoName };
+    // Kick off the non-interactive work in parallel. planAgentMigration can
+    // call promptConfirm for a TTY prompt, so we serialize it AFTER the
+    // parallel work resolves to avoid garbled stdout during the prompt.
+    const [region, fingerprint] = await Promise.all([
+        detectFlyRegion(client.baseUrl).catch(() => undefined),
+        computeSnapshotFingerprint(repoRoot, options.homePaths ?? []),
+    ]);
+    const migrationPlan = await planAgentMigration(repoRoot, options);
+    const mustUploadSnapshot = Boolean(migrationPlan && migrationPlan.migrated.length > 0);
+    const baseBody = {
+        workspaceKey,
+        repoName,
+        snapshotFingerprint: fingerprint,
+        ...(region ? { region } : {}),
+    };
     let result = null;
-    try {
-        result = await client.request("/api/rudder/workspace/attach", {
-            method: "POST",
-            body: baseBody,
-        });
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!/snapshot/i.test(message)) {
-            throw error;
+    if (!mustUploadSnapshot) {
+        try {
+            result = await client.request("/api/rudder/workspace/attach", {
+                method: "POST",
+                body: baseBody,
+            });
         }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/snapshot/i.test(message)) {
+                throw error;
+            }
+            result = null;
+        }
+    }
+    if (!result) {
         if (!options.json) {
             process.stderr.write(`Uploading workspace snapshot...\n`);
         }
-        const snapshot = await createSnapshot(repoRoot, options.homePaths ?? []);
+        const snapshot = await createSnapshot(repoRoot, options.homePaths ?? [], {
+            includeRudderState: true,
+            migration: migrationPlan ? { repoName, plan: migrationPlan } : undefined,
+        });
         try {
             const body = {
                 ...baseBody,
@@ -1248,6 +1590,9 @@ async function workspaceAttach(options) {
                     manifest: snapshot.manifest,
                 },
             };
+            if (migrationPlan && migrationPlan.migrated.length > 0) {
+                body.migratedAgents = summaryAsJson(migrationPlan);
+            }
             result = await client.request("/api/rudder/workspace/attach", {
                 method: "POST",
                 body,
@@ -1257,10 +1602,39 @@ async function workspaceAttach(options) {
             await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
         }
     }
+    if (migrationPlan && !options.json) {
+        process.stderr.write(`${migrationSummary(migrationPlan)}\n`);
+    }
     if (!result) {
         throw new Error("Workspace attach returned no result");
     }
     await attachToWorkspaceResult(result, options);
+}
+async function planAgentMigration(repoRoot, options) {
+    const candidates = await findMigrationCandidates(repoRoot);
+    if (candidates.length === 0) {
+        return null;
+    }
+    const plan = applyDefaultDecisions(candidates);
+    if (options.json) {
+        return plan;
+    }
+    if (!isTty()) {
+        return plan;
+    }
+    console.log(migrationSummary(plan));
+    if (plan.migrated.length === 0) {
+        return plan;
+    }
+    const confirmed = await promptConfirm("Move resumable agents to cloud?", true);
+    if (confirmed) {
+        return plan;
+    }
+    return {
+        candidates,
+        migrated: [],
+        stayedLocal: candidates.map((c) => ({ ...c, decision: "stay" })),
+    };
 }
 async function attachToWorkspaceResult(result, options) {
     if (!result || typeof result !== "object" || Array.isArray(result)) {
@@ -1282,13 +1656,134 @@ async function attachToWorkspaceResult(result, options) {
     if (process.env.RUDDER_CLOUD_NO_ATTACH === "1") {
         return;
     }
-    await waitForWorkspaceWorker(workspaceId);
     await runAttach({ kind: "workspace", id: workspaceId, label: `workspace ${workspaceId}` }, { ...options, quietBanner: false });
 }
-async function waitForWorkspaceWorker(workspaceId) {
-    // Give the Fly machine a moment to boot before the WS attach so users see the dashboard, not a wait-for-worker banner.
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    void workspaceId;
+async function workspaceAttachById(workspaceId, options) {
+    if (options.json) {
+        printJson({ id: workspaceId, attaching: true });
+    }
+    else if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        process.stderr.write(`Workspace ${workspaceId}: attach requires a TTY.\n`);
+        return;
+    }
+    if (process.env.RUDDER_CLOUD_NO_ATTACH === "1") {
+        return;
+    }
+    await runAttach({ kind: "workspace", id: workspaceId, label: `workspace ${workspaceId}` }, { ...options, quietBanner: false });
+}
+async function lookupWorkspaceForRepo(options) {
+    void options;
+    const repoRoot = findRepoRoot();
+    const workspaceKey = computeWorkspaceKey(repoRoot);
+    const client = await cloudClient({ requireToken: true });
+    try {
+        const result = await client.request(`/api/rudder/workspace/lookup?key=${encodeURIComponent(workspaceKey)}`, { method: "GET" });
+        if (result && typeof result === "object" && !Array.isArray(result)) {
+            return result;
+        }
+        return null;
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/not found/i.test(message) || /404/.test(message)) {
+            return null;
+        }
+        throw error;
+    }
+}
+async function workspaceShare(options) {
+    const workspace = await lookupWorkspaceForRepo(options);
+    if (!workspace) {
+        if (options.json) {
+            printJson({ workspace: null });
+            return;
+        }
+        console.log("No cloud workspace exists for this repo yet. Run `rudder cloud workspace attach` to create one.");
+        return;
+    }
+    const id = typeof workspace.id === "string" ? workspace.id : "";
+    if (!id) {
+        throw new Error("Workspace lookup returned no id");
+    }
+    if (options.json) {
+        printJson({
+            id,
+            attachCommand: `rudder cloud workspace attach ${id}`,
+            status: workspace.status ?? null,
+        });
+        return;
+    }
+    console.log("Share this workspace with a teammate by sending them:");
+    console.log("");
+    console.log(`  rudder cloud workspace attach ${id}`);
+    console.log("");
+    console.log("They must already be logged in to Rudder Cloud with their own account (run `rudder cloud login` if not).");
+}
+async function workspaceStatus(options) {
+    if (process.env.RUDDER_OFFLINE === "1") {
+        if (options.json) {
+            printJson({ offline: true, workspace: null });
+        }
+        else {
+            console.log("RUDDER_OFFLINE is set; skipping cloud workspace status check.");
+        }
+        return;
+    }
+    const workspace = await lookupWorkspaceForRepo(options).catch((error) => {
+        if (!options.json) {
+            console.warn(`Could not reach Rudder Cloud: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return null;
+    });
+    if (!workspace) {
+        if (options.json) {
+            printJson({ workspace: null });
+        }
+        else {
+            console.log("No cloud workspace for this repo.");
+        }
+        return;
+    }
+    const id = typeof workspace.id === "string" ? workspace.id : "";
+    const status = typeof workspace.status === "string" ? workspace.status : "unknown";
+    const clientCount = typeof workspace.clientCount === "number" ? workspace.clientCount : 0;
+    const lastActivityAt = typeof workspace.lastActivityAt === "string" ? workspace.lastActivityAt : undefined;
+    const idleMinutes = computeIdleMinutes(lastActivityAt);
+    const activeAgents = clientCount > 0 || (idleMinutes !== null && idleMinutes < 5);
+    if (options.json) {
+        printJson({
+            id,
+            status,
+            clientCount,
+            lastActivityAt: lastActivityAt ?? null,
+            idleMinutes,
+            activeAgents,
+            repoName: typeof workspace.repoName === "string" ? workspace.repoName : null,
+        });
+        return;
+    }
+    const idlePart = idleMinutes !== null ? `  idle ${idleMinutes}m` : "";
+    console.log(`workspace ${id}  ${status}  clients=${clientCount}${idlePart}`);
+    if (activeAgents) {
+        console.log("Active agents likely running.");
+    }
+    else {
+        console.log("No recent activity.");
+    }
+}
+function computeIdleMinutes(lastActivityAt) {
+    if (!lastActivityAt) {
+        return null;
+    }
+    const ms = Date.parse(lastActivityAt);
+    if (!Number.isFinite(ms)) {
+        return null;
+    }
+    const diff = Date.now() - ms;
+    if (diff < 0) {
+        return 0;
+    }
+    return Math.floor(diff / 60_000);
 }
 async function workspaceMutate(action, args, options) {
     const id = args[0];
@@ -1335,7 +1830,10 @@ async function runAttach(target, options) {
         socket.binaryType = "nodebuffer";
         let opened = false;
         let cleaned = false;
+        let firstFrameRendered = false;
         let result = "exited";
+        const splashAllowed = isInteractive && !options.json && !options.quietBanner;
+        const splash = splashAllowed ? new AttachSplash(stdout, target.label) : null;
         const sendResize = () => {
             if (socket.readyState !== WebSocket.OPEN) {
                 return;
@@ -1344,14 +1842,54 @@ async function runAttach(target, options) {
             const rows = stdout.rows ?? 32;
             socket.send(JSON.stringify({ type: "resize", cols, rows }));
         };
+        let lastCtrlC = 0;
         const onStdin = (chunk) => {
             if (socket.readyState !== WebSocket.OPEN) {
                 return;
             }
             const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+            const isCtrlC = buffer.length === 1 && buffer[0] === 0x03;
+            // While the loading splash is up (no remote frame has rendered yet),
+            // Ctrl+C should cancel the local attach instead of being forwarded to
+            // a remote dashboard the user can't see.
+            if (isCtrlC && !firstFrameRendered) {
+                try {
+                    socket.close(1000, "client-cancel");
+                }
+                catch { /* ignore */ }
+                cleanup();
+                if (!opened) {
+                    reject(new Error("Cloud attach cancelled"));
+                }
+                else {
+                    process.stderr.write("\nCancelled.\n");
+                    resolve("exited");
+                }
+                return;
+            }
+            // After handoff: forward Ctrl+C to the remote so Claude/codex can be
+            // cancelled, but if the user mashes Ctrl+C twice within 2 seconds we
+            // take it as "the remote is unresponsive; get me out".
+            if (isCtrlC && firstFrameRendered) {
+                const now = Date.now();
+                if (now - lastCtrlC < 2000) {
+                    process.stderr.write("\nForce-exiting local attach (press Ctrl+C again to re-enter).\n");
+                    try {
+                        socket.close(1000, "client-force-quit");
+                    }
+                    catch { /* ignore */ }
+                    cleanup();
+                    resolve("exited");
+                    return;
+                }
+                lastCtrlC = now;
+            }
             socket.send(buffer, { binary: true });
         };
-        const onResize = () => sendResize();
+        const onResize = () => {
+            sendResize();
+            splash?.redraw();
+        };
         const cleanup = () => {
             if (cleaned) {
                 return;
@@ -1359,7 +1897,24 @@ async function runAttach(target, options) {
             cleaned = true;
             stdin.off("data", onStdin);
             stdout.off("resize", onResize);
+            process.off("SIGINT", onSigint);
+            splash?.dispose();
             if (isInteractive && stdin.isTTY) {
+                // Disable local mouse capture before leaving raw mode so the user's
+                // shell prompt does not get spammed with mouse SGR bytes.
+                try {
+                    stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+                }
+                catch {
+                    // ignore
+                }
+                // Release the tab title so the user's shell prompt can rewrite it.
+                try {
+                    stdout.write("\x1b]0;\x07");
+                }
+                catch {
+                    // ignore
+                }
                 try {
                     stdin.setRawMode(false);
                 }
@@ -1367,11 +1922,62 @@ async function runAttach(target, options) {
                     // ignore
                 }
             }
+            if (splashAllowed) {
+                // We held the local terminal in the alt-screen buffer for the entire
+                // attach session (see AttachSplash.handoff). Restore the main buffer
+                // and cursor now so the user is dropped back to their shell prompt
+                // instead of a blank alt-screen with the dashboard frozen on it.
+                try {
+                    stdout.write("\x1b[?1049l\x1b[?25h");
+                }
+                catch {
+                    // ignore
+                }
+            }
             stdin.pause();
         };
+        const onSigint = () => {
+            // Belt-and-suspenders: if raw mode failed for any reason, Node still
+            // sees SIGINT. Close cleanly so the user never gets a frozen terminal.
+            process.stderr.write("\nReceived SIGINT, closing cloud attach.\n");
+            try {
+                socket.close(1000, "sigint");
+            }
+            catch { /* ignore */ }
+            cleanup();
+            if (!opened) {
+                reject(new Error("Cloud attach cancelled"));
+            }
+            else {
+                resolve("exited");
+            }
+        };
+        process.once("SIGINT", onSigint);
         socket.on("open", () => {
             opened = true;
-            if (!options.json && !options.quietBanner) {
+            // Disable Nagle on the underlying TCP socket so single keystrokes don't
+            // sit in the send buffer waiting for piggyback ACKs (~40ms savings per
+            // keypress on the WAN).
+            try {
+                const underlying = socket._socket;
+                underlying?.setNoDelay?.(true);
+            }
+            catch {
+                // ignore
+            }
+            // Label this terminal tab so the user can find the right rudder cloud
+            // session at a glance instead of squinting at a row of "ghostty" tabs.
+            try {
+                stdout.write(`\x1b]0;Rudder cloud: ${target.label}\x07`);
+            }
+            catch {
+                // ignore
+            }
+            if (splash) {
+                splash.start();
+                splash.setStatus(`Booting cloud workspace · ${target.label}`);
+            }
+            else if (!options.json && !options.quietBanner) {
                 const tail = isInteractive ? " (Ctrl+C sends to remote; close this pane to detach)" : "";
                 process.stderr.write(`Attached to ${target.label}${tail}\n`);
             }
@@ -1383,6 +1989,17 @@ async function runAttach(target, options) {
                 catch {
                     // ignore
                 }
+                // Enable mouse tracking on the LOCAL terminal so scroll/click events
+                // get forwarded into stdin. The remote rudder TUI also emits these
+                // enable sequences, but they arrive as PTY output bytes and the local
+                // terminal does not interpret output bytes as mode toggles. We have
+                // to enable mouse capture locally too.
+                try {
+                    stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+                }
+                catch {
+                    // ignore
+                }
             }
             stdin.resume();
             stdin.on("data", onStdin);
@@ -1390,6 +2007,16 @@ async function runAttach(target, options) {
         });
         socket.on("message", (data, isBinary) => {
             if (isBinary && Buffer.isBuffer(data)) {
+                if (!firstFrameRendered) {
+                    firstFrameRendered = true;
+                    splash?.handoff();
+                    // Re-send resize right after handoff and once more on a small
+                    // delay; some terminals don't surface accurate columns/rows
+                    // until after alt-screen exits, so the initial resize at WS
+                    // open can race.
+                    sendResize();
+                    setTimeout(sendResize, 150);
+                }
                 stdout.write(data);
                 return;
             }
@@ -1435,16 +2062,140 @@ async function runAttach(target, options) {
                 }
                 return;
             }
-            if (message.type === "status" && !options.json && !options.quietBanner) {
-                if (message.state === "worker-disconnected") {
-                    process.stderr.write("\nCloud worker disconnected; waiting for reconnect...\n");
+            if (message.type === "status") {
+                // If the worker dies before we've ever seen a remote frame, the
+                // session is effectively dead. Don't sit on a splash spinner pretending
+                // it'll come back; bail.
+                if (message.state === "worker-disconnected" && !firstFrameRendered) {
+                    splash?.dispose();
+                    try {
+                        socket.close(1000, "worker-gone");
+                    }
+                    catch { /* ignore */ }
+                    cleanup();
+                    if (!opened) {
+                        reject(new Error("Cloud worker exited before the dashboard started"));
+                    }
+                    else {
+                        process.stderr.write("\nCloud worker exited before the dashboard started.\n");
+                        result = "failed";
+                        resolve(result);
+                    }
+                    return;
                 }
-                else if (message.state === "worker-connected") {
-                    process.stderr.write("Cloud worker connected.\n");
+                if (splash && !firstFrameRendered) {
+                    if (message.state === "worker-waiting") {
+                        splash.setStatus(`Waiting for cloud worker · ${target.label}`);
+                    }
+                    else if (message.state === "worker-connected") {
+                        // Hand off the splash as soon as the server reports the worker
+                        // is connected. Waiting for the first BINARY PTY frame can add
+                        // 3-6s on warm restart because the worker may not flush until
+                        // after its first render. The binary-frame path below still
+                        // calls handoff() as a safety net if we never see this status.
+                        firstFrameRendered = true;
+                        splash.handoff();
+                        sendResize();
+                        setTimeout(sendResize, 150);
+                    }
+                }
+                else if (!options.json && !options.quietBanner) {
+                    if (message.state === "worker-disconnected") {
+                        process.stderr.write("\nCloud worker disconnected; waiting for reconnect...\n");
+                    }
+                    else if (message.state === "worker-connected") {
+                        process.stderr.write("Cloud worker connected.\n");
+                    }
                 }
             }
         }
     });
+}
+class AttachSplash {
+    stdout;
+    label;
+    frame = 0;
+    status;
+    timer;
+    active = false;
+    static FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    constructor(stdout, label) {
+        this.stdout = stdout;
+        this.label = label;
+        this.status = `Connecting to ${label}`;
+    }
+    start() {
+        if (this.active) {
+            return;
+        }
+        this.active = true;
+        this.stdout.write("\x1b[?1049h\x1b[?25l");
+        this.redraw();
+        this.timer = setInterval(() => {
+            this.frame = (this.frame + 1) % AttachSplash.FRAMES.length;
+            this.redraw();
+        }, 100);
+        this.timer.unref?.();
+    }
+    setStatus(status) {
+        this.status = status;
+        if (this.active) {
+            this.redraw();
+        }
+    }
+    redraw() {
+        if (!this.active) {
+            return;
+        }
+        const cols = this.stdout.columns ?? 80;
+        const rows = this.stdout.rows ?? 24;
+        const spinner = AttachSplash.FRAMES[this.frame] ?? "·";
+        const lines = [
+            `${spinner}  ${this.status}`,
+            `   Ctrl+C to disconnect`,
+        ];
+        const top = Math.max(1, Math.floor(rows / 2) - 1);
+        this.stdout.write("\x1b[2J");
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i] ?? "";
+            const visible = stripAnsi(line);
+            const left = Math.max(1, Math.floor((cols - visible.length) / 2) + 1);
+            this.stdout.write(`\x1b[${top + i};${left}H${line}`);
+        }
+    }
+    handoff() {
+        if (!this.active) {
+            return;
+        }
+        this.stop();
+        // Stay in the alt-screen buffer for the rest of the attach session. The
+        // remote dashboard will render into this same buffer, and runAttach's
+        // cleanup() will exit the alt screen on shutdown. Wipe the splash content
+        // first so the remote's partial frames don't render on top of leftover
+        // spinner text (and so any tiny window before the remote's first frame
+        // is a clean buffer, not main-buffer scrollback).
+        this.stdout.write("\x1b[2J\x1b[H\x1b[?25h");
+    }
+    dispose() {
+        if (!this.active) {
+            return;
+        }
+        this.stop();
+        // dispose() is the abort path (worker died, user cancelled before any
+        // remote frame). Leave the alt screen so the user is dropped back to their
+        // shell prompt instead of staring at a frozen spinner buffer.
+        this.stdout.write("\x1b[?1049l\x1b[?25h");
+    }
+    stop() {
+        this.active = false;
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+        }
+    }
+}
+function stripAnsi(value) {
+    return value.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 }
 async function maybeAutoAttach(result, options) {
     if (options.json || options.noAttach) {
@@ -1496,6 +2247,8 @@ Usage:
   rudder cloud logs <id>
   rudder cloud attach <id>
       stream the live cloud worker terminal into this pane
+  rudder cloud workspace [attach [id]|share|status [--json]|stop <id>|list]
+      shared cloud workspace for this repo
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]
   rudder cloud setup-byoc <ssh-host>   compatibility alias

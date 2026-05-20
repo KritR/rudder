@@ -40,6 +40,15 @@ export declare function createRunRecord(params: {
 }): Promise<RunRecord>;
 export declare function saveRunRecord(record: RunRecord): Promise<void>;
 export declare function loadRunRecord(repoRoot: string, runId: string): Promise<RunRecord | null>;
+/**
+ * Scan every run record in the repo and fire a background LLM summarization
+ * for any whose task summary has never been upgraded. Used by the CLI before
+ * spawning the native dashboard so the next launch picks up nicer titles even
+ * though the native dashboard reads run.json directly and skips the TS load
+ * path. Caps the number of in-flight summaries so a big repo doesn't blast
+ * Anthropic. Never throws.
+ */
+export declare function backfillLlmTaskSummaries(repoRoot: string, maxInFlight?: number): Promise<void>;
 export declare function appendEvent(repoRoot: string, event: RudderEvent): Promise<void>;
 export declare function listRuns(repoRoot: string): Promise<RunRecord[]>;
 export declare function resolveRun(repoRoot: string, runId?: string): Promise<RunRecord | null>;

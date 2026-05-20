@@ -19,7 +19,7 @@ import {
   slugify,
   writeJson,
 } from "./util.js";
-import { summarizeTask } from "./task-summary.js";
+import { llmSummarizeTask, summarizeTask } from "./task-summary.js";
 
 export function globalConfigPath(): string {
   return path.join(rudderHome(), "config.json");
@@ -281,12 +281,85 @@ export async function saveRunRecord(record: RunRecord): Promise<void> {
   await writeJson(runRecordPath(record.repoRoot, record.id), record);
 }
 
+const inflightLlmSummaries = new Set<string>();
+
 export async function loadRunRecord(repoRoot: string, runId: string): Promise<RunRecord | null> {
   const record = await readJson<RunRecord>(runRecordPath(repoRoot, runId));
   if (record && !record.taskSummary) {
     record.taskSummary = summarizeTask(record.task);
   }
+  if (record) {
+    maybeBackgroundLlmSummarize(record);
+  }
   return record;
+}
+
+/**
+ * Scan every run record in the repo and fire a background LLM summarization
+ * for any whose task summary has never been upgraded. Used by the CLI before
+ * spawning the native dashboard so the next launch picks up nicer titles even
+ * though the native dashboard reads run.json directly and skips the TS load
+ * path. Caps the number of in-flight summaries so a big repo doesn't blast
+ * Anthropic. Never throws.
+ */
+export async function backfillLlmTaskSummaries(repoRoot: string, maxInFlight = 8): Promise<void> {
+  try {
+    const dir = runsDir(repoRoot);
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    const ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    const slice = ids.slice(0, maxInFlight);
+    for (const id of slice) {
+      const record = await readJson<RunRecord>(runRecordPath(repoRoot, id));
+      if (record) {
+        maybeBackgroundLlmSummarize(record);
+      }
+    }
+  } catch {
+    // ignore — best-effort
+  }
+}
+
+function maybeBackgroundLlmSummarize(record: RunRecord): void {
+  if (record.taskSummaryLlm) {
+    return;
+  }
+  const task = (record.task ?? "").trim();
+  if (!task) {
+    return;
+  }
+  const naive = summarizeTask(record.task);
+  const current = (record.taskSummary ?? "").trim();
+  if (current && current !== naive) {
+    // user (or some other path) already set a non-naive title; skip
+    return;
+  }
+  const key = `${record.repoRoot}::${record.id}`;
+  if (inflightLlmSummaries.has(key)) {
+    return;
+  }
+  inflightLlmSummaries.add(key);
+  (async () => {
+    try {
+      const title = await llmSummarizeTask(record.task);
+      if (!title) {
+        return;
+      }
+      const fresh = await readJson<RunRecord>(runRecordPath(record.repoRoot, record.id));
+      if (!fresh) {
+        return;
+      }
+      if (fresh.taskSummaryLlm) {
+        return;
+      }
+      fresh.taskSummary = title;
+      fresh.taskSummaryLlm = true;
+      await saveRunRecord(fresh);
+    } catch {
+      // swallow — background best-effort
+    } finally {
+      inflightLlmSummaries.delete(key);
+    }
+  })();
 }
 
 export async function appendEvent(repoRoot: string, event: RudderEvent): Promise<void> {

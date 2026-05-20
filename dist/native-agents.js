@@ -101,6 +101,8 @@ function codexPlanArgs(run, prompt) {
         "read-only",
         "--ask-for-approval",
         "never",
+        "--enable",
+        "goals",
         "--search",
         effort ? "-c" : undefined,
         effort ? `model_reasoning_effort="${effort}"` : undefined,

@@ -33,17 +33,27 @@ if (alreadyStaged()) {
   console.log(`Rudder worker re-using staged workspace`);
   chdirToStagedWorkdir();
 } else {
-  if (!snapshotUrl) {
-    console.error("RUDDER_SNAPSHOT_URL is required for first start");
+  // Fly Machines disks are ephemeral across stop+start, so the staged marker
+  // is missing on every cold boot. Try fetching a freshly signed snapshot URL
+  // from the control plane first, because the URL injected via env is signed
+  // at machine-create time and expires after one hour.
+  const freshUrl = await freshSnapshotUrl();
+  const effectiveSnapshotUrl = freshUrl || snapshotUrl;
+  if (!effectiveSnapshotUrl) {
+    console.error("RUDDER_SNAPSHOT_URL is required for first start (and control-plane refresh failed)");
     process.exit(2);
   }
-  stageSnapshot();
+  if (freshUrl) {
+    console.log("Using freshly signed snapshot URL from control plane.");
+  } else {
+    console.log("Falling back to snapshot URL from env (control-plane refresh unavailable).");
+  }
+  stageSnapshot(effectiveSnapshotUrl);
   markStaged();
 }
 
 const cwd = process.cwd();
 console.log(`Rudder worker ready in ${cwd}`);
-shSoft("rudder doctor");
 
 const capturedEnv = loadCapturedEnv();
 if (Object.keys(capturedEnv).length > 0) {
@@ -246,11 +256,33 @@ function markStaged() {
   }
 }
 
-function stageSnapshot() {
+async function freshSnapshotUrl() {
+  const id = (process.env.RUDDER_WORKSPACE_ID || "").trim();
+  const token = (process.env.RUDDER_WORKER_TOKEN || "").trim();
+  const base = (process.env.RUDDER_CLOUD_URL || "").trim();
+  if (!id || !token || !base) return null;
+  try {
+    const url = `${base.replace(/\/$/, "")}/api/rudder/workspace/${encodeURIComponent(id)}/snapshot-url`;
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      console.warn(`snapshot-url refresh: HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    return typeof data?.url === "string" ? data.url : null;
+  } catch (error) {
+    console.warn(`snapshot-url refresh failed: ${error?.message || error}`);
+    return null;
+  }
+}
+
+function stageSnapshot(downloadUrl) {
   fs.mkdirSync("/workspace", { recursive: true });
   process.chdir("/workspace");
   console.log("Downloading Rudder snapshot...");
-  sh(`curl -fsSL ${shQuote(snapshotUrl)} -o snapshot.tgz`);
+  sh(`curl -fsSL ${shQuote(downloadUrl)} -o snapshot.tgz`);
   fs.mkdirSync("unpacked", { recursive: true });
   sh("tar -xzf snapshot.tgz -C unpacked");
   if (fs.existsSync("unpacked/home")) {

@@ -3,6 +3,7 @@ dist/
 target/
 .rudder/
 .rudder-worktrees/
+.claude/
 npm-debug.log*
 .DS_Store
 RUDDER.md

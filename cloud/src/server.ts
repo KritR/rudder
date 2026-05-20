@@ -66,6 +66,7 @@ type Workspace = {
   snapshotKey?: string;
   snapshotFingerprint?: string;
   region?: string;
+  volumeId?: string;
   lastActivityAt?: string;
   lastHeartbeatAt?: string;
   createdAt: string;
@@ -95,7 +96,8 @@ const flyWorkerImage = process.env.RUDDER_WORKER_IMAGE || "ghcr.io/viraatdas/rud
 const flyWorkerMemoryMb = Number(process.env.RUDDER_WORKER_MEMORY_MB || 1024);
 const flyWorkerCpus = Number(process.env.RUDDER_WORKER_CPUS || 1);
 const flyWorkerCpuKind = process.env.RUDDER_WORKER_CPU_KIND || "shared";
-const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 15 * 60 * 1000);
+const flyWorkspaceVolumeGb = Number(process.env.RUDDER_WORKSPACE_VOLUME_GB || 3);
+const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 120 * 60 * 1000);
 const stateKey = process.env.RUDDER_CLOUD_STATE_KEY || "control-plane/rudder-cloud.sqlite";
 const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
 const githubDeviceClientId = process.env.RUDDER_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
@@ -202,6 +204,7 @@ database.exec(`
     last_heartbeat_at text,
     created_at text not null,
     updated_at text not null,
+    volume_id text,
     unique(account_id, workspace_key)
   );
 `);
@@ -210,6 +213,7 @@ ensureColumn("rudder_sails", "last_heartbeat_at", "text");
 ensureColumn("rudder_sails", "runtime", "text");
 ensureColumn("rudder_workspaces", "region", "text");
 ensureColumn("rudder_workspaces", "snapshot_fingerprint", "text");
+ensureColumn("rudder_workspaces", "volume_id", "text");
 
 const insertToken = database.prepare(`
   insert or replace into rudder_tokens (token_hash, account_id, email, created_at, last_used_at)
@@ -256,13 +260,20 @@ const updateWorkerToken = database.prepare(`
 const insertWorkspace = database.prepare(`
   insert into rudder_workspaces (
     id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
-    snapshot_key, snapshot_fingerprint, region, worker_token_hash, last_activity_at,
-    last_heartbeat_at, created_at, updated_at
+    snapshot_key, snapshot_fingerprint, region, volume_id, worker_token_hash,
+    last_activity_at, last_heartbeat_at, created_at, updated_at
   ) values (
     @id, @accountId, @workspaceKey, @repoName, @status, @machineId, @machineState,
-    @snapshotKey, @snapshotFingerprint, @region, @workerTokenHash, @lastActivityAt,
-    @lastHeartbeatAt, @createdAt, @updatedAt
+    @snapshotKey, @snapshotFingerprint, @region, @volumeId, @workerTokenHash,
+    @lastActivityAt, @lastHeartbeatAt, @createdAt, @updatedAt
   )
+`);
+const updateWorkspaceVolume = database.prepare(`
+  update rudder_workspaces
+  set volume_id = @volumeId,
+      region = @region,
+      updated_at = @updatedAt
+  where id = @id
 `);
 const findWorkspaceByKey = database.prepare(
   "select * from rudder_workspaces where account_id = ? and workspace_key = ?",
@@ -396,6 +407,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/cli/approve") {
       await handleCliApprove(req, res, url);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/admin/workspace/gc") {
+      await handleAdminWorkspaceGc(req, res, url);
       return;
     }
     if (url.pathname.startsWith("/api/rudder/sail")) {
@@ -1406,6 +1421,188 @@ async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: 
   renderSuccessPage(res, login.email);
 }
 
+async function handleAdminWorkspaceGc(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+): Promise<void> {
+  await requireAdminRequest(req);
+  ensureFlyConfigured();
+  const dryRun = url.searchParams.get("dry") === "1" || url.searchParams.get("dryRun") === "1";
+  const now = new Date().toISOString();
+  const workspaceRows = database
+    .prepare("select * from rudder_workspaces")
+    .all() as Record<string, unknown>[];
+  const sailRows = database
+    .prepare("select * from rudder_sails")
+    .all() as Record<string, unknown>[];
+
+  const reclaimedWorkspaces: { id: string; machineId: string; previousStatus: string }[] = [];
+  const reclaimedSails: { id: string; machineId: string; previousStatus: string }[] = [];
+  const reclaimedVolumes: { id: string; volumeId: string }[] = [];
+  const skipped: { kind: "workspace" | "sail"; id: string; reason: string }[] = [];
+  const errors: { kind: "workspace" | "sail"; id: string; error: string }[] = [];
+
+  const update = database.prepare(
+    "update rudder_workspaces set status = ?, machine_id = NULL, machine_state = 'destroyed', updated_at = ? where id = ?",
+  );
+  const clearVolume = database.prepare(
+    "update rudder_workspaces set volume_id = NULL, updated_at = ? where id = ?",
+  );
+  const updateSailRow = database.prepare(
+    "update rudder_sails set status = ?, machine_id = NULL, machine_state = 'destroyed', updated_at = ? where id = ?",
+  );
+
+  for (const row of workspaceRows) {
+    const id = String(row.id);
+    const status = String(row.status);
+    const machineId = optionalString(row.machine_id);
+    if (!machineId) {
+      skipped.push({ kind: "workspace", id, reason: "no machineId" });
+      continue;
+    }
+    if (status === "stopped" && !machineId) {
+      skipped.push({ kind: "workspace", id, reason: "already stopped" });
+      continue;
+    }
+    try {
+      const exists = await flyMachineExists(machineId);
+      if (exists) {
+        skipped.push({ kind: "workspace", id, reason: "machine still present on Fly" });
+        continue;
+      }
+      reclaimedWorkspaces.push({ id, machineId, previousStatus: status });
+      const volumeId = optionalString(row.volume_id);
+      if (volumeId) {
+        reclaimedVolumes.push({ id, volumeId });
+      }
+      if (!dryRun) {
+        update.run("stopped", now, id);
+        if (volumeId) {
+          await destroyWorkspaceVolume(volumeId);
+          clearVolume.run(now, id);
+        }
+      }
+    } catch (error) {
+      errors.push({
+        kind: "workspace",
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  for (const row of sailRows) {
+    const id = String(row.id);
+    const status = String(row.status);
+    const machineId = optionalString(row.machine_id);
+    if (!machineId) {
+      skipped.push({ kind: "sail", id, reason: "no machineId" });
+      continue;
+    }
+    if (status === "completed" || status === "failed") {
+      skipped.push({ kind: "sail", id, reason: `terminal status: ${status}` });
+      continue;
+    }
+    try {
+      const exists = await flyMachineExists(machineId);
+      if (exists) {
+        skipped.push({ kind: "sail", id, reason: "machine still present on Fly" });
+        continue;
+      }
+      reclaimedSails.push({ id, machineId, previousStatus: status });
+      if (!dryRun) {
+        updateSailRow.run("completed", now, id);
+      }
+    } catch (error) {
+      errors.push({
+        kind: "sail",
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  if (!dryRun && (reclaimedWorkspaces.length || reclaimedSails.length)) {
+    schedulePersistDatabase();
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    dryRun,
+    reclaimedWorkspaces,
+    reclaimedSails,
+    reclaimedVolumes,
+    skipped,
+    errors,
+  });
+}
+
+async function flyMachineExists(machineId: string): Promise<boolean> {
+  const response = await fetch(
+    `${flyApiBase}/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${flyApiToken}`,
+        Accept: "application/json",
+      },
+    },
+  );
+  if (response.status === 404) {
+    return false;
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Fly API ${response.status}: ${text.trim()}`);
+  }
+  // 200 means the machine exists, but Fly may still report state "destroyed"
+  // for already-deleted machines. Treat destroyed/destroying as gone.
+  try {
+    const body = (await response.json()) as { state?: string } | null;
+    const state = body?.state;
+    if (state === "destroyed" || state === "destroying") {
+      return false;
+    }
+  } catch {
+    // fall through: assume exists
+  }
+  return true;
+}
+
+async function requireAdminRequest(req: IncomingMessage): Promise<void> {
+  const adminToken = process.env.RUDDER_ADMIN_TOKEN || "";
+  const authHeader = req.headers.authorization || "";
+  const bearer = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length).trim()
+    : "";
+  if (adminToken && bearer && timingSafeEqualString(bearer, adminToken)) {
+    return;
+  }
+  // Fallback: admin-email rudder bearer token.
+  if (bearer.startsWith("rdr_")) {
+    const ctx = requireBearer(req);
+    requireAdmin(ctx);
+    return;
+  }
+  // Fallback: better-auth session cookie from an admin email.
+  const session = await getBetterAuthSession(req);
+  const email = typeof session?.user?.email === "string" ? session.user.email.toLowerCase() : undefined;
+  if (email && adminEmails.has(email)) {
+    return;
+  }
+  throw unauthorized();
+}
+
+function timingSafeEqualString(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) {
+    return false;
+  }
+  return timingSafeEqual(ba, bb);
+}
+
 async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const heartbeatMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/heartbeat$/);
   if (req.method === "POST" && heartbeatMatch) {
@@ -1460,6 +1657,12 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
   const heartbeatMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/heartbeat$/);
   if (req.method === "POST" && heartbeatMatch) {
     await handleWorkspaceHeartbeat(req, res, heartbeatMatch[1]);
+    return;
+  }
+
+  const snapshotUrlMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/snapshot-url$/);
+  if (req.method === "GET" && snapshotUrlMatch) {
+    await handleWorkspaceSnapshotUrl(req, res, snapshotUrlMatch[1]);
     return;
   }
 
@@ -1947,11 +2150,21 @@ async function createWorkspace(
     snapshotKey: snapshot.key,
     snapshotFingerprint,
     region,
+    volumeId: null,
     workerTokenHash: tokenHash(workerToken),
     lastActivityAt: now,
     lastHeartbeatAt: null,
     createdAt: now,
     updatedAt: now,
+  });
+  const regionToUse = region ?? flyRegion;
+  const volume = await createWorkspaceVolume(id, regionToUse);
+  const volumeId = volume.id;
+  updateWorkspaceVolume.run({
+    id,
+    volumeId: volumeId ?? null,
+    region: regionToUse,
+    updatedAt: new Date().toISOString(),
   });
   const snapshotUrl = await signedSnapshotUrl(snapshot.key);
   const machine = await createFlyWorkspaceMachine({
@@ -1960,7 +2173,8 @@ async function createWorkspace(
     snapshotUrl,
     workerToken,
     repoName,
-    region: region ?? undefined,
+    region: regionToUse,
+    volumeId,
   });
   const status = flyStateToWorkspaceStatus(machine.state);
   updateWorkspaceMachine.run({
@@ -2025,10 +2239,12 @@ async function reuseOrRestartWorkspace(
   );
 
   // Path 2: warm restart — machine exists but is stopped, and the user's
-  // local state hasn't changed (fingerprint matches). Update the machine's
-  // env with a freshly-signed snapshot URL and start it; the supervisor
-  // skips re-staging because the marker file is still there. Much faster
-  // than destroy+recreate.
+  // local state hasn't changed (fingerprint matches). With a persistent
+  // Fly Volume mounted at /workspace, the supervisor's alreadyStaged()
+  // marker survives stop+start so the supervisor skips re-staging entirely
+  // (~1-2s total). Without a volume, the marker is on the ephemeral rootfs
+  // and the supervisor re-downloads using a fresh URL via the snapshot-url
+  // endpoint (~10-30s). Either way, no destroy+recreate is needed.
   if (
     machine
     && machine.id
@@ -2062,7 +2278,11 @@ async function reuseOrRestartWorkspace(
 
   // Path 3: must (re)create a machine. Either no machine, machine is gone,
   // or fingerprint mismatch (user's local state changed). Need a fresh
-  // snapshot from the CLI.
+  // snapshot from the CLI. Also destroy + recreate the volume so the user
+  // sees their new repo state instead of the cached one on the old disk.
+  if (workspace.volumeId) {
+    await destroyWorkspaceVolume(workspace.volumeId);
+  }
   if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
     await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
@@ -2076,6 +2296,28 @@ async function reuseOrRestartWorkspace(
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const now = new Date().toISOString();
   const region = sanitizeRegion(stringField(body, "region")) ?? workspace.region ?? null;
+  const regionToUse = region ?? flyRegion;
+  let newVolumeId: string | undefined;
+  try {
+    const freshVolume = await createWorkspaceVolume(workspace.id, regionToUse);
+    newVolumeId = freshVolume.id;
+  } catch (error) {
+    // Volume name may still be reserved if the prior delete is still
+    // settling on Fly's side. Retry once with a timestamp suffix.
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`recreate volume for ${workspace.id} failed (${message}); retrying with suffix`);
+    const suffixed = await createWorkspaceVolumeNamed(
+      workspaceVolumeName(workspace.id, String(Date.now()).slice(-6)),
+      regionToUse,
+    );
+    newVolumeId = suffixed.id;
+  }
+  updateWorkspaceVolume.run({
+    id: workspace.id,
+    volumeId: newVolumeId ?? null,
+    region: regionToUse,
+    updatedAt: new Date().toISOString(),
+  });
   updateWorkspaceSnapshot.run({ id: workspace.id, snapshotKey, snapshotFingerprint: incomingFingerprint, updatedAt: now });
   updateWorkspaceWorkerToken.run({ id: workspace.id, workerTokenHash: tokenHash(workerToken), updatedAt: now });
   const snapshotUrl = await signedSnapshotUrl(snapshotKey);
@@ -2085,7 +2327,8 @@ async function reuseOrRestartWorkspace(
     snapshotUrl,
     workerToken,
     repoName: repoName ?? workspace.repoName,
-    region: region ?? undefined,
+    region: regionToUse,
+    volumeId: newVolumeId,
   });
   updateWorkspaceMachine.run({
     id: workspace.id,
@@ -2116,11 +2359,12 @@ async function warmRestartWorkspaceMachine(params: {
   snapshotKey: string;
 }): Promise<FlyMachine | null> {
   ensureFlyConfigured();
-  // Don't update env — Fly's machine update POST replaces the machine and
-  // breaks the start. Instead just start it; the supervisor's alreadyStaged()
-  // marker check inside /workspace lets it skip the snapshot download.
-  // (Workers can fetch a fresh snapshot URL on demand from the control plane
-  // if they ever need to re-stage.)
+  // Don't update env. Fly's machine update POST replaces the machine and
+  // breaks the start. Just start it. Fly machine disks are ephemeral across
+  // stop+start, so the supervisor's alreadyStaged() marker is missing on cold
+  // boot and it will re-download the snapshot. The supervisor refreshes its
+  // own pre-signed URL via GET /api/rudder/workspace/:id/snapshot-url, which
+  // means the stale env URL is no longer a problem on warm restart.
   void params.snapshotKey;
   try {
     return await flyRequest<FlyMachine>(
@@ -2140,31 +2384,36 @@ async function createFlyWorkspaceMachine(params: {
   workerToken: string;
   repoName?: string;
   region?: string;
+  volumeId?: string;
 }): Promise<FlyMachine> {
   ensureFlyConfigured();
+  const config: JsonRecord = {
+    image: flyWorkerImage,
+    env: {
+      RUDDER_WORKSPACE_ID: params.workspaceId,
+      RUDDER_ACCOUNT_ID: params.accountId,
+      RUDDER_CLOUD_URL: baseURL,
+      RUDDER_WORKER_TOKEN: params.workerToken,
+      RUDDER_SNAPSHOT_URL: params.snapshotUrl,
+      RUDDER_REPO_NAME: params.repoName || "",
+    },
+    guest: {
+      cpu_kind: flyWorkerCpuKind,
+      cpus: flyWorkerCpus,
+      memory_mb: flyWorkerMemoryMb,
+    },
+    restart: { policy: "no" },
+    auto_destroy: false,
+  };
+  if (params.volumeId) {
+    config.mounts = [{ volume: params.volumeId, path: "/workspace" }];
+  }
   const machine = await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
     method: "POST",
     body: {
       name: `rudder-ws-${params.workspaceId}`,
       region: params.region || flyRegion,
-      config: {
-        image: flyWorkerImage,
-        env: {
-          RUDDER_WORKSPACE_ID: params.workspaceId,
-          RUDDER_ACCOUNT_ID: params.accountId,
-          RUDDER_CLOUD_URL: baseURL,
-          RUDDER_WORKER_TOKEN: params.workerToken,
-          RUDDER_SNAPSHOT_URL: params.snapshotUrl,
-          RUDDER_REPO_NAME: params.repoName || "",
-        },
-        guest: {
-          cpu_kind: flyWorkerCpuKind,
-          cpus: flyWorkerCpus,
-          memory_mb: flyWorkerMemoryMb,
-        },
-        restart: { policy: "no" },
-        auto_destroy: false,
-      },
+      config,
     },
   });
   if (!machine.id) {
@@ -2174,6 +2423,56 @@ async function createFlyWorkspaceMachine(params: {
     `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machine.id)}/start`,
     { method: "POST", body: {} },
   ).catch(() => machine);
+}
+
+type FlyVolume = {
+  id?: string;
+  name?: string;
+  region?: string;
+  state?: string;
+};
+
+function workspaceVolumeName(workspaceId: string, suffix?: string): string {
+  // Fly volume names allow only alphanumeric + underscore, max 30 chars per
+  // the API. Replace any other char (e.g. "-") with "_" and truncate.
+  const base = `rdr_${workspaceId.replace(/[^a-zA-Z0-9]/g, "_")}`;
+  if (!suffix) {
+    return base.slice(0, 30);
+  }
+  const tail = `_${suffix}`;
+  const maxBase = 30 - tail.length;
+  return `${base.slice(0, maxBase)}${tail}`;
+}
+
+async function createWorkspaceVolume(workspaceId: string, region: string): Promise<FlyVolume> {
+  return await createWorkspaceVolumeNamed(workspaceVolumeName(workspaceId), region);
+}
+
+async function createWorkspaceVolumeNamed(name: string, region: string): Promise<FlyVolume> {
+  ensureFlyConfigured();
+  return await flyRequest<FlyVolume>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/volumes`,
+    {
+      method: "POST",
+      body: {
+        name,
+        region,
+        size_gb: flyWorkspaceVolumeGb,
+      },
+    },
+  );
+}
+
+async function destroyWorkspaceVolume(volumeId: string): Promise<void> {
+  if (!flyApiToken || !flyAppName) {
+    return;
+  }
+  await flyRequest<FlyVolume>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/volumes/${encodeURIComponent(volumeId)}`,
+    { method: "DELETE" },
+  ).catch((error) => {
+    console.warn(`destroy volume ${volumeId} failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
 }
 
 async function mutateWorkspace(workspace: Workspace, action: string): Promise<Workspace> {
@@ -2231,6 +2530,22 @@ async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerRespons
   sendJson(res, 200, { ok: true, status });
 }
 
+async function handleWorkspaceSnapshotUrl(req: IncomingMessage, res: ServerResponse, workspaceId: string): Promise<void> {
+  const row = findWorkspaceById.get(workspaceId) as Record<string, unknown> | undefined;
+  if (!row) {
+    sendJson(res, 404, { error: "workspace not found" });
+    return;
+  }
+  requireWorkerBearer(req, row);
+  const snapshotKey = optionalString(row.snapshot_key);
+  if (!snapshotKey) {
+    sendJson(res, 400, { error: "workspace has no snapshot" });
+    return;
+  }
+  const signed = await signedSnapshotUrl(snapshotKey);
+  sendJson(res, 200, { url: signed, expiresInSeconds: 3600 });
+}
+
 function listAccountWorkspaces(accountId: string): Workspace[] {
   return (listWorkspacesForAccount.all(accountId) as unknown[]).map(rowToWorkspace);
 }
@@ -2258,6 +2573,7 @@ function rowToWorkspace(row: unknown): Workspace {
     snapshotKey: optionalString(value.snapshot_key),
     snapshotFingerprint: optionalString(value.snapshot_fingerprint),
     region: optionalString(value.region),
+    volumeId: optionalString(value.volume_id),
     lastActivityAt: optionalString(value.last_activity_at),
     lastHeartbeatAt: optionalString(value.last_heartbeat_at),
     createdAt: String(value.created_at),
