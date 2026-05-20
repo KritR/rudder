@@ -49,6 +49,8 @@ const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
+const REVIEW_ALL_MODEL: &str = "gpt-5.5";
+const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "Enter focus",
@@ -173,6 +175,7 @@ enum AgentMode {
     Execute,
     Plan,
     RudderPlan,
+    ReviewAll,
     Main,
 }
 
@@ -187,6 +190,7 @@ impl AgentMode {
             Self::Execute => "execute",
             Self::Plan => "plan",
             Self::RudderPlan => "rudder-plan",
+            Self::ReviewAll => "review-all",
             Self::Main => "main",
         }
     }
@@ -196,6 +200,7 @@ impl AgentMode {
             "execute" | "run" | "task" => Some(Self::Execute),
             "plan" | "planning" => Some(Self::Plan),
             "rudder-plan" | "rudder_plan" | "orchestrate" => Some(Self::RudderPlan),
+            "review-all" | "review_all" | "reviewall" => Some(Self::ReviewAll),
             "main" => Some(Self::Main),
             _ => None,
         }
@@ -319,6 +324,23 @@ enum MergeIntent {
     All { ids: Vec<String> },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReviewAllSource {
+    id: String,
+    branch: String,
+    task: String,
+    summary: String,
+    worktree_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReviewAllPremerge {
+    merged_branches: Vec<String>,
+    stopped_branch: Option<String>,
+    stopped_error: Option<String>,
+    remaining_branches: Vec<String>,
+}
+
 struct MergeConflictPrompt {
     task: String,
     conflicted_files: Vec<String>,
@@ -366,6 +388,7 @@ struct AgentRun {
     worker_input_cursor: usize,
     worker_input_is_prompt: bool,
     last_drain_at: Option<Instant>,
+    review_source_ids: Vec<String>,
 }
 
 impl AgentRun {
@@ -957,56 +980,152 @@ impl App {
     }
 
     fn review_all_ready(&mut self) {
-        let ready_indices: Vec<usize> = self
-            .agents
-            .iter()
-            .enumerate()
-            .filter_map(|(index, run)| {
-                (run.status == AgentStatus::Done && run.worktree_branch.is_some()).then_some(index)
-            })
-            .collect();
+        let sources = self.review_all_sources();
 
-        if ready_indices.is_empty() {
+        if sources.is_empty() {
             self.notice = Some("no completed worktrees ready to review".to_string());
             return;
         }
 
-        let current_position = ready_indices
+        #[cfg(test)]
+        {
+            self.start_review_all_test_agent(sources);
+            return;
+        }
+
+        #[cfg(not(test))]
+        if let Err(error) = self.start_review_all_agent(sources) {
+            self.notice = Some(format!("review all failed: {error}"));
+        }
+    }
+
+    fn review_all_sources(&self) -> Vec<ReviewAllSource> {
+        let claimed = self.review_all_claimed_source_ids();
+        self.agents
             .iter()
-            .position(|&index| index == self.selected_agent);
-        let already_reviewing_selected = current_position.is_some()
-            && self.focus == FocusPane::Worker
-            && self.worker_view == WorkerView::Diff;
-        let next_position = match (current_position, already_reviewing_selected) {
-            (Some(position), true) => (position + 1) % ready_indices.len(),
-            (Some(position), false) => position,
-            (None, _) => 0,
+            .filter(|run| run.status == AgentStatus::Done)
+            .filter(|run| !claimed.contains(&run.id))
+            .filter_map(|run| {
+                let branch = run.worktree_branch.clone()?;
+                Some(ReviewAllSource {
+                    id: run.id.clone(),
+                    branch,
+                    task: run.task.clone(),
+                    summary: if run.task_summary.trim().is_empty() {
+                        short_task(&run.task)
+                    } else {
+                        run.task_summary.trim().to_string()
+                    },
+                    worktree_path: run.worktree_path.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn review_all_claimed_source_ids(&self) -> HashSet<String> {
+        self.agents
+            .iter()
+            .filter(|run| run.mode == AgentMode::ReviewAll && run.status != AgentStatus::Merged)
+            .flat_map(|run| run.review_source_ids.iter().cloned())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn start_review_all_test_agent(&mut self, sources: Vec<ReviewAllSource>) {
+        let worktree = WorktreeInfo {
+            id: new_run_id("review all"),
+            path: self.cwd.join(".rudder-review-all-test"),
+            branch: Some("rudder/test-review-all".to_string()),
+            path_is_worktree: true,
         };
-        let target_index = ready_indices[next_position];
-        self.selected_agent = target_index;
+        let premerge = ReviewAllPremerge {
+            merged_branches: sources.iter().map(|source| source.branch.clone()).collect(),
+            ..ReviewAllPremerge::default()
+        };
+        let prompt = review_all_prompt(
+            current_branch().as_deref().unwrap_or("HEAD"),
+            &worktree,
+            &sources,
+            &premerge,
+        );
+        let run = review_all_run(worktree, prompt, sources, None);
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
         self.worker_selection = None;
-        self.worker_view = WorkerView::Diff;
+        self.worker_view = WorkerView::Terminal;
         self.focus = FocusPane::Worker;
-        self.ensure_hunk_review();
+        self.notice = Some("started Codex review-all merge agent".to_string());
+    }
 
-        let summary = self
-            .agents
-            .get(target_index)
-            .map(|run| {
-                if run.task_summary.trim().is_empty() {
-                    short_task(&run.task)
-                } else {
-                    run.task_summary.trim().to_string()
-                }
+    #[cfg(not(test))]
+    fn start_review_all_agent(&mut self, sources: Vec<ReviewAllSource>) -> Result<()> {
+        for source in &sources {
+            if let Some(run) = self.agents.iter().find(|run| run.id == source.id) {
+                commit_pending_changes_for_run(run)?;
+            }
+        }
+
+        let target_ref = current_branch()
+            .or_else(|| {
+                git_output(&self.cwd, ["rev-parse", "HEAD"])
+                    .ok()
+                    .map(|value| value.trim().to_string())
             })
-            .unwrap_or_else(|| "agent".to_string());
-        self.notice = Some(format!(
-            "reviewing {}/{}: {}; press R for next, M to merge all",
-            next_position + 1,
-            ready_indices.len(),
-            truncate_chars(&summary, 48)
-        ));
+            .unwrap_or_else(|| "HEAD".to_string());
+        let worktree = prepare_worktree(&self.cwd, "review all completed worktrees")?;
+        let premerge = premerge_review_all_sources(&worktree.path, &sources);
+        let prompt = review_all_prompt(&target_ref, &worktree, &sources, &premerge);
+        let session_id = mint_session_id_for(Backend::Codex);
+        let command = agent_command(
+            Backend::Codex,
+            REVIEW_ALL_MODEL,
+            Some(REVIEW_ALL_EFFORT),
+            &prompt,
+            AgentMode::ReviewAll,
+            session_id.as_deref(),
+        );
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(worktree.path.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        let mut run = review_all_run(worktree, prompt, sources, session_id);
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("failed to start Codex review-all: {error}"));
+            }
+        }
+        let started = run.status == AgentStatus::Running;
+
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.worker_selection = None;
+        self.worker_view = WorkerView::Terminal;
+        self.focus = FocusPane::Worker;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        if started {
+            let count = self
+                .agents
+                .get(self.selected_agent)
+                .map(|run| run.review_source_ids.len())
+                .unwrap_or(0);
+            self.notice = Some(format!(
+                "started Codex {REVIEW_ALL_MODEL} review-all for {count} worktree{}; press m on that row when done",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(())
     }
 
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
@@ -2018,6 +2137,7 @@ impl App {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
             last_drain_at: None,
+            review_source_ids: Vec::new(),
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2100,6 +2220,7 @@ impl App {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
             last_drain_at: None,
+            review_source_ids: Vec::new(),
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2185,6 +2306,7 @@ impl App {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
             last_drain_at: None,
+            review_source_ids: Vec::new(),
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -3109,6 +3231,7 @@ impl App {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
             last_drain_at: None,
+            review_source_ids: Vec::new(),
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -3436,10 +3559,15 @@ impl App {
     }
 
     fn request_merge_all_ready(&mut self) {
+        let claimed = self.review_all_claimed_source_ids();
         let ready_runs: Vec<&AgentRun> = self
             .agents
             .iter()
-            .filter(|run| run.status == AgentStatus::Done && run.worktree_branch.is_some())
+            .filter(|run| {
+                run.status == AgentStatus::Done
+                    && run.worktree_branch.is_some()
+                    && !claimed.contains(&run.id)
+            })
             .collect();
 
         if ready_runs.is_empty() {
@@ -3789,27 +3917,9 @@ What to do\n\
         let Some(branch) = run.worktree_branch.clone() else {
             anyhow::bail!("selected agent is not in a worktree");
         };
-        let cwd = run.cwd.clone();
-        let task = run.task.clone();
-        let task_summary = run.task_summary.clone();
+        let review_source_ids = run.review_source_ids.clone();
 
-        if has_git_changes(&cwd) {
-            git_status_command(&cwd, &["add", "-A"])?;
-            let headline = if task_summary.trim().is_empty() {
-                short_task(&task)
-            } else {
-                task_summary.trim().to_string()
-            };
-            // Multi-line commit: short headline plus the full original task as the
-            // body so reviewers reading `git log` see what the agent was asked to
-            // do, not just our compressed summary.
-            let message = if task.trim() == headline.trim() {
-                headline
-            } else {
-                format!("{headline}\n\n{}", task.trim())
-            };
-            let _ = git_status_command(&cwd, &["commit", "-m", &message]);
-        }
+        commit_pending_changes_for_run(run)?;
 
         git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
         // Successful merge: keep the agent's row in the dashboard but flip it
@@ -3818,7 +3928,34 @@ What to do\n\
         // keeps merge confirmation responsive and preserves cleanup control.
         // Never touch the pinned main slot.
         if index < self.agents.len() && !self.agents[index].is_main() {
-            if let Some(run) = self.agents.get_mut(index) {
+            self.mark_agent_and_review_sources_merged(index, review_source_ids);
+        }
+        Ok(())
+    }
+
+    fn mark_agent_and_review_sources_merged(
+        &mut self,
+        index: usize,
+        review_source_ids: Vec<String>,
+    ) {
+        let mut merge_indices = Vec::new();
+        if index < self.agents.len() && !self.agents[index].is_main() {
+            merge_indices.push(index);
+        }
+        for source_id in review_source_ids {
+            if let Some(source_index) = self
+                .agents
+                .iter()
+                .position(|run| run.id == source_id && !run.is_main())
+            {
+                if !merge_indices.contains(&source_index) {
+                    merge_indices.push(source_index);
+                }
+            }
+        }
+
+        for merge_index in merge_indices {
+            if let Some(run) = self.agents.get_mut(merge_index) {
                 run.terminal = None;
                 run.review_terminal = None;
                 run.status = AgentStatus::Merged;
@@ -3830,9 +3967,8 @@ What to do\n\
                 run.user_input_notified = false;
                 let _ = save_native_run_record(&self.cwd, run);
             }
-            let _ = write_rudder_context(&self.cwd, &self.agents, None);
         }
-        Ok(())
+        let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
     fn poll_agents(&mut self) {
@@ -5947,6 +6083,7 @@ mod app_tests {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
             last_drain_at: None,
+            review_source_ids: Vec::new(),
         }
     }
 
@@ -6075,7 +6212,7 @@ mod app_tests {
     }
 
     #[test]
-    fn review_all_opens_selected_completed_worktree_first() {
+    fn review_all_starts_codex_aggregate_agent() {
         let mut app = App::new();
         let mut first = test_agent_run("run-1", "first task");
         first.status = AgentStatus::Done;
@@ -6087,45 +6224,30 @@ mod app_tests {
         second.worktree_path = Some(app.cwd.join("worktree-2"));
         app.agents.push(first);
         app.agents.push(second);
-        app.selected_agent = 1;
         app.focus = FocusPane::Agents;
 
         app.review_all_ready();
 
-        assert_eq!(app.selected_agent, 1);
+        assert_eq!(app.agents.len(), 3);
+        assert_eq!(app.selected_agent, 2);
+        let review = &app.agents[2];
+        assert_eq!(review.mode, AgentMode::ReviewAll);
+        assert_eq!(review.backend, Backend::Codex);
+        assert_eq!(review.model, REVIEW_ALL_MODEL);
+        assert_eq!(review.effort, Some(REVIEW_ALL_EFFORT));
+        assert_eq!(
+            review.review_source_ids,
+            vec!["run-1".to_string(), "run-2".to_string()]
+        );
+        assert!(review.task.contains("/review"));
+        assert!(review.task.contains("rudder/first"));
+        assert!(review.task.contains("rudder/second"));
         assert_eq!(app.focus, FocusPane::Worker);
-        assert_eq!(app.worker_view, WorkerView::Diff);
+        assert_eq!(app.worker_view, WorkerView::Terminal);
         assert!(app
             .notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("reviewing 2/2")));
-    }
-
-    #[test]
-    fn review_all_advances_when_already_reviewing() {
-        let mut app = App::new();
-        let mut first = test_agent_run("run-1", "first task");
-        first.status = AgentStatus::Done;
-        first.worktree_branch = Some("rudder/first".to_string());
-        first.worktree_path = Some(app.cwd.join("worktree-1"));
-        let mut second = test_agent_run("run-2", "second task");
-        second.status = AgentStatus::Done;
-        second.worktree_branch = Some("rudder/second".to_string());
-        second.worktree_path = Some(app.cwd.join("worktree-2"));
-        app.agents.push(first);
-        app.agents.push(second);
-        app.selected_agent = 0;
-        app.focus = FocusPane::Worker;
-        app.worker_view = WorkerView::Diff;
-
-        app.review_all_ready();
-
-        assert_eq!(app.selected_agent, 1);
-        assert_eq!(app.worker_view, WorkerView::Diff);
-        assert!(app
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("reviewing 2/2")));
+            .is_some_and(|notice| notice.contains("Codex review-all")));
     }
 
     #[test]
@@ -6141,17 +6263,13 @@ mod app_tests {
 
         app.handle_worker_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
 
-        assert_eq!(app.selected_agent, 0);
-        assert_eq!(app.focus, FocusPane::Worker);
-        assert_eq!(app.worker_view, WorkerView::Diff);
-        assert!(app
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("reviewing 1/1")));
+        assert_eq!(app.selected_agent, 1);
+        assert_eq!(app.agents[1].mode, AgentMode::ReviewAll);
+        assert_eq!(app.agents[1].review_source_ids, vec!["run-1".to_string()]);
     }
 
     #[test]
-    fn review_all_command_opens_review() {
+    fn review_all_command_starts_codex_review_agent() {
         let mut app = App::new();
         let mut run = test_agent_run("run-1", "test task");
         run.status = AgentStatus::Done;
@@ -6161,12 +6279,78 @@ mod app_tests {
 
         assert!(app.handle_command("/review-all"));
 
-        assert_eq!(app.selected_agent, 0);
-        assert_eq!(app.worker_view, WorkerView::Diff);
+        assert_eq!(app.selected_agent, 1);
+        assert_eq!(app.agents[1].mode, AgentMode::ReviewAll);
+        assert_eq!(app.agents[1].model, REVIEW_ALL_MODEL);
+    }
+
+    #[test]
+    fn review_all_without_ready_worktrees_shows_notice() {
+        let mut app = App::new();
+
+        app.review_all_ready();
+
+        assert!(app.agents.is_empty());
         assert!(app
             .notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("reviewing 1/1")));
+            .is_some_and(|notice| notice.contains("no completed worktrees")));
+    }
+
+    #[test]
+    fn review_all_claimed_sources_are_not_merge_all_ready() {
+        let mut app = App::new();
+        let mut source = test_agent_run("run-1", "source task");
+        source.status = AgentStatus::Done;
+        source.worktree_branch = Some("rudder/source".to_string());
+        source.worktree_path = Some(app.cwd.join("source"));
+        let mut review = test_agent_run("review-1", "review all");
+        review.mode = AgentMode::ReviewAll;
+        review.status = AgentStatus::Running;
+        review.worktree_branch = Some("rudder/review-all".to_string());
+        review.worktree_path = Some(app.cwd.join("review"));
+        review.review_source_ids = vec!["run-1".to_string()];
+        app.agents.push(source);
+        app.agents.push(review);
+
+        app.request_merge_all_ready();
+
+        assert!(app.merge_confirm.is_none());
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("no completed worktrees")));
+    }
+
+    #[test]
+    fn merging_review_all_row_moves_source_agents_to_merged_section() {
+        let mut app = App::new();
+        let mut first = test_agent_run("run-1", "first task");
+        first.status = AgentStatus::Done;
+        first.worktree_branch = Some("rudder/first".to_string());
+        let mut second = test_agent_run("run-2", "second task");
+        second.status = AgentStatus::Done;
+        second.worktree_branch = Some("rudder/second".to_string());
+        let mut review = test_agent_run("review-1", "review all");
+        review.mode = AgentMode::ReviewAll;
+        review.status = AgentStatus::Done;
+        review.worktree_branch = Some("rudder/review-all".to_string());
+        review.review_source_ids = vec!["run-1".to_string(), "run-2".to_string()];
+        let live = test_agent_run("run-live", "live task");
+        app.agents.push(first);
+        app.agents.push(second);
+        app.agents.push(review);
+        app.agents.push(live);
+
+        app.mark_agent_and_review_sources_merged(2, vec!["run-1".to_string(), "run-2".to_string()]);
+
+        assert_eq!(app.agents[0].status, AgentStatus::Merged);
+        assert_eq!(app.agents[1].status, AgentStatus::Merged);
+        assert_eq!(app.agents[2].status, AgentStatus::Merged);
+        assert!(app.agents[0].worktree_branch.is_none());
+        assert!(app.agents[1].worktree_branch.is_none());
+        assert!(app.agents[2].worktree_branch.is_none());
+        assert_eq!(app.visible_agent_indices(), vec![3, 0, 1, 2]);
     }
 
     #[test]
@@ -6226,6 +6410,7 @@ mod app_tests {
             worker_input_cursor: 0,
             worker_input_is_prompt: false,
             last_drain_at: None,
+            review_source_ids: Vec::new(),
         });
 
         app.delete_selected_agent();
@@ -6852,6 +7037,8 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Span::styled("cloud", accent_style(focused).add_modifier(Modifier::BOLD))
             } else if agent.mode == AgentMode::RudderPlan {
                 Span::styled("rudder-plan", accent_style(focused))
+            } else if agent.mode == AgentMode::ReviewAll {
+                Span::styled("review-all", accent_style(focused))
             } else if agent.mode == AgentMode::Plan {
                 Span::styled("plan", accent_style(focused))
             } else {
@@ -9859,7 +10046,7 @@ fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
     args.push("--enable".to_string());
     args.push("goals".to_string());
     match run.mode {
-        AgentMode::Execute | AgentMode::Main => {
+        AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
         AgentMode::Plan | AgentMode::RudderPlan => {
@@ -9899,6 +10086,7 @@ fn agent_command(
         AgentMode::Execute => Some(execution_prompt(task)),
         AgentMode::Plan => Some(plan_prompt(task)),
         AgentMode::RudderPlan => Some(rudder_plan_prompt(task)),
+        AgentMode::ReviewAll => Some(task.to_string()),
         AgentMode::Main => {
             if task.trim().is_empty() {
                 None
@@ -9910,7 +10098,7 @@ fn agent_command(
     match backend {
         Backend::Claude => {
             let mut args = match mode {
-                AgentMode::Execute | AgentMode::Main => vec![
+                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => vec![
                     "--permission-mode".to_string(),
                     "bypassPermissions".to_string(),
                 ],
@@ -9943,7 +10131,7 @@ fn agent_command(
             args.push("--enable".to_string());
             args.push("goals".to_string());
             match mode {
-                AgentMode::Execute | AgentMode::Main => {
+                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => {
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
                 }
                 AgentMode::Plan | AgentMode::RudderPlan => {
@@ -9972,6 +10160,156 @@ fn agent_command(
             TerminalCommand::with_args("codex", args)
         }
     }
+}
+
+fn review_all_run(
+    worktree: WorktreeInfo,
+    prompt: String,
+    sources: Vec<ReviewAllSource>,
+    session_id: Option<String>,
+) -> AgentRun {
+    let created_at = now_stamp();
+    let source_ids = sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    AgentRun {
+        id: worktree.id,
+        created_at: created_at.clone(),
+        mode: AgentMode::ReviewAll,
+        task: prompt.clone(),
+        task_summary: format!("review all {} worktrees", source_ids.len()),
+        current_prompt: prompt.clone(),
+        turns: vec![AgentTurn {
+            ts: created_at.clone(),
+            prompt,
+            source: "user".to_string(),
+        }],
+        last_user_input_at: created_at,
+        backend: Backend::Codex,
+        model: REVIEW_ALL_MODEL.to_string(),
+        effort: Some(REVIEW_ALL_EFFORT),
+        status: AgentStatus::Running,
+        cwd: worktree.path.clone(),
+        worktree_branch: worktree.branch.clone(),
+        worktree_path: worktree.path_is_worktree.then_some(worktree.path),
+        session_id,
+        terminal: None,
+        terminal_size: None,
+        review_terminal: None,
+        review_size: None,
+        review_error: None,
+        last_output_at: Instant::now(),
+        completed_at: None,
+        autosteered: false,
+        needs_permission: false,
+        permission_notified: false,
+        needs_user_input: false,
+        user_input_notified: false,
+        last_error: None,
+        worker_input_draft: String::new(),
+        worker_input_cursor: 0,
+        worker_input_is_prompt: false,
+        last_drain_at: None,
+        review_source_ids: source_ids,
+    }
+}
+
+fn review_all_prompt(
+    target_ref: &str,
+    worktree: &WorktreeInfo,
+    sources: &[ReviewAllSource],
+    premerge: &ReviewAllPremerge,
+) -> String {
+    let aggregate_branch = worktree.branch.as_deref().unwrap_or("current branch");
+    let source_lines = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let path = source
+                .worktree_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(unknown worktree path)".to_string());
+            format!(
+                "{}. {} ({})\n   branch: {}\n   worktree: {}\n   task: {}",
+                index + 1,
+                source.summary,
+                source.id,
+                source.branch,
+                path,
+                truncate_chars(&source.task, 220)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let merged = if premerge.merged_branches.is_empty() {
+        "- none yet".to_string()
+    } else {
+        premerge
+            .merged_branches
+            .iter()
+            .map(|branch| format!("- {branch}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let remaining = if premerge.remaining_branches.is_empty() {
+        "- none".to_string()
+    } else {
+        premerge
+            .remaining_branches
+            .iter()
+            .map(|branch| format!("- {branch}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let stopped = match (
+        premerge.stopped_branch.as_deref(),
+        premerge.stopped_error.as_deref(),
+    ) {
+        (Some(branch), Some(error)) => {
+            format!("Rudder stopped while merging `{branch}`:\n{error}")
+        }
+        _ => "No merge conflict was detected while building the aggregate branch.".to_string(),
+    };
+
+    format!(
+        "/review Review the combined Rudder agent worktree changes against `{target_ref}`.\n\
+\n\
+You are the Rudder review-all integration agent. You are running on an aggregate worktree branch that is meant to become one reviewed merge back into main.\n\
+\n\
+Aggregate worktree\n\
+- path: {path}\n\
+- branch: {aggregate_branch}\n\
+- target/base ref: {target_ref}\n\
+\n\
+Source worktrees included in this review\n\
+{source_lines}\n\
+\n\
+Pre-merge state\n\
+Already merged into this aggregate branch:\n\
+{merged}\n\
+\n\
+Still not fully merged:\n\
+{remaining}\n\
+\n\
+{stopped}\n\
+\n\
+Instructions\n\
+1. Run `git status` first. If a merge is in progress, resolve the conflicts, `git add` the resolutions, and commit the merge.\n\
+2. Merge every branch listed under \"Still not fully merged\" into this aggregate branch, in the listed order. Resolve conflicts carefully.\n\
+3. Run the Codex `/review` flow on the combined diff against `{target_ref}`. If the slash command is unavailable, perform an equivalent code review using `git diff {target_ref}...HEAD`.\n\
+4. Fix real review findings directly in this aggregate worktree. Do not edit the original source worktrees.\n\
+5. Run the relevant tests/checks for the files touched. If a check cannot run, say exactly why.\n\
+6. Do not check out `{target_ref}` and do not merge into `{target_ref}` yourself. When the aggregate branch is ready, stop and say: `Rudder review-all branch is ready; press m on this row to merge to main.`\n",
+        target_ref = target_ref,
+        path = worktree.path.display(),
+        aggregate_branch = aggregate_branch,
+        source_lines = source_lines,
+        merged = merged,
+        remaining = remaining,
+        stopped = stopped,
+    )
 }
 
 fn execution_prompt(task: &str) -> String {
@@ -10959,6 +11297,7 @@ fn ensure_main_agent(
         worker_input_cursor: 0,
         worker_input_is_prompt: false,
         last_drain_at: None,
+        review_source_ids: Vec::new(),
     };
     agents.insert(0, main);
 }
@@ -11064,6 +11403,17 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         .and_then(|value| value.get("nativeSessionId"))
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned);
+    let review_source_ids = record
+        .get("reviewSourceIds")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     Some(AgentRun {
         id,
@@ -11099,6 +11449,7 @@ fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<
         worker_input_cursor: 0,
         worker_input_is_prompt: false,
         last_drain_at: None,
+        review_source_ids,
     })
 }
 
@@ -11211,6 +11562,7 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
         "turns": turns,
         "lastUserInputAt": run.last_user_input_at,
         "autoSteer": { "count": if run.autosteered { 1 } else { 0 }, "max": 2 },
+        "reviewSourceIds": run.review_source_ids,
         "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),
     });
     let temp = record_path.with_extension(format!(
@@ -11347,6 +11699,46 @@ fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     } else {
         message
     });
+}
+
+fn commit_pending_changes_for_run(run: &AgentRun) -> Result<()> {
+    if !has_git_changes(&run.cwd) {
+        return Ok(());
+    }
+
+    git_status_command(&run.cwd, &["add", "-A"])?;
+    let headline = if run.task_summary.trim().is_empty() {
+        short_task(&run.task)
+    } else {
+        run.task_summary.trim().to_string()
+    };
+    let message = if run.task.trim() == headline.trim() {
+        headline
+    } else {
+        format!("{headline}\n\n{}", run.task.trim())
+    };
+    let _ = git_status_command(&run.cwd, &["commit", "-m", &message]);
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn premerge_review_all_sources(cwd: &Path, sources: &[ReviewAllSource]) -> ReviewAllPremerge {
+    let mut premerge = ReviewAllPremerge::default();
+    for (index, source) in sources.iter().enumerate() {
+        match git_status_command(cwd, &["merge", "--no-ff", &source.branch]) {
+            Ok(()) => premerge.merged_branches.push(source.branch.clone()),
+            Err(error) => {
+                premerge.stopped_branch = Some(source.branch.clone());
+                premerge.stopped_error = Some(error.to_string());
+                premerge.remaining_branches = sources[index..]
+                    .iter()
+                    .map(|item| item.branch.clone())
+                    .collect();
+                break;
+            }
+        }
+    }
+    premerge
 }
 
 fn conflicted_files(cwd: &Path) -> Vec<String> {

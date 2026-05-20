@@ -374,7 +374,7 @@ or another full-screen app can scroll its own view.
 | `Esc` | Leave the review view when it is focused |
 | `r` | Restart the selected stopped agent in its worktree |
 | `m` | Merge the selected completed worktree |
-| `R` | Review each completed worktree before merging |
+| `R` | Combine completed worktrees and start a Codex review-all agent |
 | `M` | Merge all completed worktrees |
 | `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
 | `q` | Quit when the worker is not consuming input |
@@ -391,7 +391,7 @@ through suggestions and `Enter` to choose one.
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/rudder-plan <task>` | Start a planning coordinator that decomposes the task and spawns worker agents |
 | `/run <task>` | Start an implementation run even when plan mode is on |
-| `/review-all` | Review each completed worktree before merging |
+| `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
 | `/login` | Open browser login for Rudder Cloud |
 | `/cloud` | Ask whether to onload the current Rudder workspace or start a fresh Fly worker |
@@ -534,10 +534,16 @@ keyboard input into Hunk while the review pane is focused and keeps wheel or
 trackpad scrolling on Rudder's review scrollback. Press `v` or `Esc` to return
 to the live Claude Code or Codex worker.
 
-Press `R` to review completed worktrees one at a time before merging. Rudder
-opens the selected completed worktree if it is ready, then each subsequent
-`R` advances to the next completed worktree. After reviewing, press `M` to
-merge all completed worktrees into the main checkout.
+Press `R` to review all completed worktrees as one bundle. Rudder creates a new
+aggregate worktree, commits pending source-worktree changes, merges the
+completed agent branches into that aggregate branch, and starts a Codex
+`gpt-5.5` review-all agent with a `/review` prompt. If the pre-merge hits a
+conflict, that same review agent starts in the conflicted aggregate worktree and
+is instructed to resolve it before continuing.
+
+When the Codex review-all row is done, press `m` on that row to merge the
+reviewed aggregate branch back into the main checkout. Rudder then marks the
+source agent rows as merged too.
 
 Rudder writes a per-worktree `.hunk/config.toml` in Hunk's light mode and
 ignores that config through git's local info exclude, so it does not get merged.
