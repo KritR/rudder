@@ -45,7 +45,7 @@ const RUNNING_COLOR: Color = Color::Yellow;
 const DONE_COLOR: Color = Color::Gray;
 const FAILED_COLOR: Color = Color::Red;
 const CLOUD_COLOR: Color = Color::Cyan;
-const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
+const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
@@ -1923,9 +1923,6 @@ impl App {
         if moved || forwarded {
             return true;
         }
-        if rows != 0 {
-            self.notice = Some("worker scrollback is at the edge".to_string());
-        }
         true
     }
 
@@ -1999,9 +1996,6 @@ impl App {
         }
         if moved || forwarded {
             return true;
-        }
-        if rows != 0 {
-            self.notice = Some("review scrollback is at the edge".to_string());
         }
         true
     }
@@ -4807,9 +4801,9 @@ mod app_tests {
     #[test]
     fn worker_wheel_scroll_rows_scale_with_viewport() {
         assert_eq!(wheel_scroll_rows(2, KeyModifiers::empty()), 1);
-        assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 3);
-        assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 3);
-        assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 3);
+        assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 1);
+        assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 1);
+        assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 1);
         assert_eq!(wheel_scroll_rows(30, KeyModifiers::CONTROL), 29);
 
         let down = MouseEvent {
@@ -4818,7 +4812,7 @@ mod app_tests {
             row: 0,
             modifiers: KeyModifiers::empty(),
         };
-        assert_eq!(mouse_scrollback_delta(down, 30), -3);
+        assert_eq!(mouse_scrollback_delta(down, 30), -1);
     }
 
     #[cfg(not(windows))]
@@ -5068,7 +5062,54 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
         assert_ne!(after, before);
-        assert!(after.contains("line035"), "after was {after:?}");
+        assert!(after.contains("line037"), "after was {after:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_wheel_at_edge_does_not_flash_notice() {
+        let command =
+            TerminalCommand::with_args("/bin/sh", ["-lc", "printf 'ready\\r\\n'; sleep 1"]);
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("ready") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
+        app.notice = Some("keep me".to_string());
+        app.agents.push(test_agent_run_with_terminal(&app, pane));
+        app.selected_agent = 0;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.scroll_selected_worker_or_forward(
+            mouse,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+        ));
+
+        assert_eq!(app.notice.as_deref(), Some("keep me"));
     }
 
     #[cfg(not(windows))]
@@ -5127,7 +5168,7 @@ mod app_tests {
             .selected_terminal_mut()
             .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
-        assert!(after.contains("line035"), "after was {after:?}");
+        assert!(after.contains("line036"), "after was {after:?}");
         assert_eq!(app.focus, FocusPane::Task);
     }
 

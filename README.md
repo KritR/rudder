@@ -411,9 +411,9 @@ If trackpad scrolling does not behave as expected, run
 `rudder mouse-test parsed` to confirm your terminal is sending `ScrollUp` and
 `ScrollDown` events. For lower-level escape bytes, run `rudder mouse-test raw`.
 To inspect live dashboard routing, start Rudder with `RUDDER_MOUSE_DEBUG=1`.
-Rudder scrolls three terminal rows per wheel event by default, matching common
-terminal scrollback behavior. Override with `RUDDER_WHEEL_SCROLL_ROWS=<n>` if
-your terminal is configured differently.
+Rudder scrolls one terminal row per wheel event by default so trackpad scrolling
+feels smooth in worker and review panes. Override with
+`RUDDER_WHEEL_SCROLL_ROWS=<n>` if your terminal is configured differently.
 
 ## Models
 
