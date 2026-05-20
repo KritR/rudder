@@ -651,7 +651,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
-                "nav mode: 1 agents  2 worker  3 task  v review  R review-all  Esc exits"
+                "nav mode: 1 agents  2 worker  3 task  v review  R review-all  M merge-all  Esc exits"
                     .to_string()
             } else {
                 "worker input restored".to_string()
@@ -778,11 +778,6 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
-        if key.code == KeyCode::Char('M') && !key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.request_merge_all_ready();
-            return false;
-        }
-
         if self.worker_view == WorkerView::Diff {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => {
@@ -1871,6 +1866,47 @@ impl App {
         };
         let before = terminal.scrollback();
         let alternate = terminal.uses_alternate_screen();
+        let mut forwarded = false;
+        let mut write_error = None;
+        if rows != 0 && backend == Some(Backend::Codex) && alternate {
+            terminal.reset_scrollback();
+            let wants_mouse = terminal.wants_sgr_mouse_events();
+            if wants_mouse {
+                if let Some(bytes) = mouse_bytes.as_ref() {
+                    if let Err(error) = terminal.write_input(bytes) {
+                        write_error = Some(error.to_string());
+                    } else {
+                        forwarded = true;
+                    }
+                }
+            }
+            if !forwarded {
+                if let Some(bytes) = scroll_key_bytes(mouse.kind) {
+                    if let Err(error) = terminal.write_input(&bytes) {
+                        write_error = Some(error.to_string());
+                    } else {
+                        forwarded = true;
+                    }
+                }
+            }
+            let after = terminal.scrollback();
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=worker rows={} before={} after={} moved=false alt={} wants_mouse={} forwarded={}",
+                mouse.kind,
+                mouse.column,
+                mouse.row,
+                rows,
+                before,
+                after,
+                alternate,
+                wants_mouse,
+                forwarded
+            ));
+            if let Some(error) = write_error {
+                self.set_selected_error(error);
+            }
+            return true;
+        }
         terminal.scrollback_by(rows);
         let after = terminal.scrollback();
         let moved = after != before;
@@ -1879,8 +1915,6 @@ impl App {
         } else {
             terminal.wants_sgr_mouse_events()
         };
-        let mut forwarded = false;
-        let mut write_error = None;
         if !moved && rows != 0 && wants_mouse {
             if let Some(bytes) = mouse_bytes {
                 if let Err(error) = terminal.write_input(&bytes) {
@@ -5004,6 +5038,75 @@ mod app_tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn codex_alternate_screen_wheel_forwards_before_snapshot_scrollback() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "stty raw -echo; printf '\\033[?1049hfirst\\r\\n'; sleep 0.1; printf '\\033[2J\\033[Hsecond\\r\\n'; cat -v",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.uses_alternate_screen()
+                && pane.visible_lines_snapshot().join("\n").contains("second")
+            {
+                break;
+            }
+        }
+        assert!(pane.uses_alternate_screen());
+
+        // Seed Rudder's alternate-screen snapshot history. Codex should still
+        // receive the wheel as PageUp instead of Rudder consuming it locally.
+        pane.scrollback_by(1);
+        assert!(pane.scrollback() > 0);
+
+        let mut app = App::new();
+        let mut run = test_agent_run_with_terminal(&app, pane);
+        run.backend = Backend::Codex;
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.scroll_selected_worker_or_forward(
+            mouse,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+        ));
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("^[[5~"), "output was {output:?}");
+        assert!(app
+            .selected_terminal_mut()
+            .is_some_and(|terminal| terminal.scrollback() == 0));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn worker_wheel_scroll_moves_normal_screen_scrollback() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
@@ -6062,7 +6165,7 @@ mod app_tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn worker_uppercase_r_is_forwarded_to_terminal() {
+    fn worker_plain_shifted_letters_are_forwarded_to_terminal() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
             ["-lc", "stty raw -echo; printf 'ready\\r\\n'; cat -v"],
@@ -6092,14 +6195,18 @@ mod app_tests {
         app.agents.push(run);
         app.selected_agent = 0;
 
-        app.handle_worker_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        for ch in 'A'..='Z' {
+            app.handle_worker_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT));
+        }
 
         std::thread::sleep(Duration::from_millis(50));
         let output = app
             .selected_terminal_mut()
             .map(|terminal| terminal.visible_lines().join("\n"))
             .unwrap_or_default();
-        assert!(output.contains("R"), "output was {output:?}");
+        for ch in 'A'..='Z' {
+            assert!(output.contains(ch), "missing {ch:?}; output was {output:?}");
+        }
         assert_eq!(app.agents.len(), 1);
     }
 
@@ -6256,7 +6363,7 @@ mod app_tests {
     }
 
     #[test]
-    fn merge_all_can_be_triggered_from_worker_focus() {
+    fn merge_all_can_be_triggered_from_nav_mode() {
         let mut app = App::new();
         let mut run = test_agent_run("run-1", "test task");
         run.status = AgentStatus::Done;
@@ -6265,8 +6372,9 @@ mod app_tests {
         app.agents.push(run);
         app.selected_agent = 0;
         app.focus = FocusPane::Worker;
+        app.nav_mode = true;
 
-        app.handle_worker_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
 
         assert!(matches!(
             app.merge_confirm.as_ref().map(|confirm| &confirm.intent),
