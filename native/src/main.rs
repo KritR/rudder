@@ -651,7 +651,8 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
-                "nav mode: 1 agents  2 worker  3 task  v review  Esc exits".to_string()
+                "nav mode: 1 agents  2 worker  3 task  v review  R review-all  Esc exits"
+                    .to_string()
             } else {
                 "worker input restored".to_string()
             });
@@ -777,11 +778,6 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
-        if key.code == KeyCode::Char('R') && !key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.review_all_ready();
-            return false;
-        }
-
         if key.code == KeyCode::Char('M') && !key.modifiers.contains(KeyModifiers::CONTROL) {
             self.request_merge_all_ready();
             return false;
@@ -6064,6 +6060,49 @@ mod app_tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn worker_uppercase_r_is_forwarded_to_terminal() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            ["-lc", "stty raw -echo; printf 'ready\\r\\n'; cat -v"],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("ready") {
+                break;
+            }
+        }
+
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut run = test_agent_run_with_terminal(&app, pane);
+        run.backend = Backend::Codex;
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        app.handle_worker_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("R"), "output was {output:?}");
+        assert_eq!(app.agents.len(), 1);
+    }
+
     #[test]
     fn merge_confirm_hint_highlights_merge_action() {
         let line = merge_confirm_hint_line();
@@ -6292,7 +6331,7 @@ mod app_tests {
     }
 
     #[test]
-    fn review_all_can_be_triggered_from_worker_focus() {
+    fn review_all_can_be_triggered_from_nav_mode() {
         let mut app = App::new();
         let mut run = test_agent_run("run-1", "test task");
         run.status = AgentStatus::Done;
@@ -6301,8 +6340,9 @@ mod app_tests {
         app.agents.push(run);
         app.selected_agent = 0;
         app.focus = FocusPane::Worker;
+        app.nav_mode = true;
 
-        app.handle_worker_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
 
         assert_eq!(app.selected_agent, 1);
         assert_eq!(app.agents[1].mode, AgentMode::ReviewAll);

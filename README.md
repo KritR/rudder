@@ -374,7 +374,7 @@ or another full-screen app can scroll its own view.
 | `Esc` | Leave the review view when it is focused |
 | `r` | Restart the selected stopped agent in its worktree |
 | `m` | Merge the selected completed worktree |
-| `R` | Combine completed worktrees and start a Codex review-all agent |
+| `R` | Combine completed worktrees and start a Codex review-all agent when the agents pane or nav mode is active |
 | `M` | Merge all completed worktrees |
 | `dd` | Delete the selected agent and remove its worktree; if it has changes, Rudder gives you a merge chance first |
 | `q` | Quit when the worker is not consuming input |
