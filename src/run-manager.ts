@@ -34,11 +34,28 @@ import {
   processAlive,
   removeWorktree,
 } from "./git.js";
-import { ensureDir, isTty, newRunId, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
+import {
+  commandExists,
+  ensureDir,
+  isTty,
+  MissingToolError,
+  newRunId,
+  nowIso,
+  pathExists,
+  runCommand,
+  shortenHome,
+} from "./util.js";
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
+
+function missingBackendError(backend: BackendId, healthMessage: string): Error {
+  if (!commandExists(backend)) {
+    return new MissingToolError(backend);
+  }
+  return new Error(healthMessage);
+}
 
 export async function startRun(params: {
   task: string;
@@ -58,6 +75,9 @@ export async function startRun(params: {
   const repoRoot = findRepoRoot();
   const config = await loadConfig();
   const backend = params.backend ?? config.lastUsedBackend ?? config.defaultBackend;
+  if (!commandExists(backend)) {
+    throw new MissingToolError(backend);
+  }
   const model =
     params.model ??
     (backend === "claude"
@@ -165,6 +185,9 @@ export async function startNativeRun(params: {
   const repoRoot = findRepoRoot();
   const config = await loadConfig();
   const backend = params.backend ?? toNativeBackend(config.lastUsedBackend ?? config.defaultBackend);
+  if (!commandExists(backend)) {
+    throw new MissingToolError(backend);
+  }
   const model =
     params.model ??
     (backend === "claude"
@@ -215,7 +238,7 @@ export async function startNativeRun(params: {
     const backendAdapter = getBackend(backend);
     const health = await backendAdapter.verify();
     if (!health.ok) {
-      throw new Error(health.message);
+      throw missingBackendError(backend, health.message);
     }
 
     const spec = await createSpec(run);
@@ -300,6 +323,9 @@ export async function startNativePlan(params: {
   const repoRoot = findRepoRoot();
   const config = await loadConfig();
   const backend = params.backend ?? toNativeBackend(config.lastUsedBackend ?? config.defaultBackend);
+  if (!commandExists(backend)) {
+    throw new MissingToolError(backend);
+  }
   const model =
     params.model ??
     (backend === "claude"
@@ -348,7 +374,7 @@ export async function startNativePlan(params: {
     const backendAdapter = getBackend(backend);
     const health = await backendAdapter.verify();
     if (!health.ok) {
-      throw new Error(health.message);
+      throw missingBackendError(backend, health.message);
     }
 
     const command = nativeAgentCommand({
@@ -626,7 +652,7 @@ async function runBackendPass(run: RunRecord): Promise<{ run: RunRecord; exitCod
   const backend = getBackend(run.backend);
   const health = await backend.verify();
   if (!health.ok) {
-    throw new Error(health.message);
+    throw missingBackendError(run.backend, health.message);
   }
   const exitCode = await backend.run(
     {

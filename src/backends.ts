@@ -3,7 +3,16 @@ import { spawn } from "node:child_process";
 import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore, EffortLevel } from "./types.js";
 import { loadAuthStore, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
-import { commandExists, lineSplitBuffer, nowIso, parseJsonLine, runCommand } from "./util.js";
+import {
+  commandExists,
+  formatMissingToolMessage,
+  isMissingToolSpawnError,
+  lineSplitBuffer,
+  MissingToolError,
+  nowIso,
+  parseJsonLine,
+  runCommand,
+} from "./util.js";
 
 export function getBackend(id: BackendId): BackendAdapter {
   if (id === "claude") {
@@ -21,7 +30,7 @@ function claudeBackend(): BackendAdapter {
     async verify() {
       return commandExists("claude")
         ? { ok: true, message: "claude found" }
-        : { ok: false, message: "claude is not on PATH" };
+        : { ok: false, message: formatMissingToolMessage("claude") };
     },
     async run(request, emit) {
       const prompt = stripRudderPromptWrappers(request.prompt);
@@ -73,7 +82,7 @@ function codexBackend(): BackendAdapter {
     async verify() {
       return commandExists("codex")
         ? { ok: true, message: "codex found" }
-        : { ok: false, message: "codex is not on PATH" };
+        : { ok: false, message: formatMissingToolMessage("codex") };
     },
     async run(request, emit) {
       const prompt = stripRudderPromptWrappers(request.prompt);
@@ -119,7 +128,7 @@ function acpxBackend(): BackendAdapter {
     async verify() {
       return commandExists("acpx")
         ? { ok: true, message: "acpx found" }
-        : { ok: false, message: "acpx is not on PATH" };
+        : { ok: false, message: formatMissingToolMessage("acpx") };
     },
     async run(request, emit) {
       const prompt = stripRudderPromptWrappers(request.prompt);
@@ -285,8 +294,12 @@ async function spawnAndStream(params: {
     }
   });
 
-  return await new Promise((resolve) => {
+  return await new Promise((resolve, reject) => {
     child.on("error", (error) => {
+      if (isMissingToolSpawnError(error)) {
+        reject(new MissingToolError(params.command));
+        return;
+      }
       void params.emit({
         ts: nowIso(),
         runId: params.request.run.id,

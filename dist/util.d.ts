@@ -12,6 +12,14 @@ export declare function writeJson(filePath: string, value: JsonValue, options?: 
     mode?: number;
 }): Promise<void>;
 export declare function commandExists(command: string): boolean;
+export declare class MissingToolError extends Error {
+    readonly tool: string;
+    readonly hint: string;
+    constructor(tool: string, message?: string);
+}
+export declare function formatMissingToolMessage(tool: string, hintOverride?: string): string;
+export declare function requireBackendTool(tool: string): void;
+export declare function isMissingToolSpawnError(error: unknown): boolean;
 export declare function runCommand(command: string, args: string[], options?: {
     cwd?: string;
     allowFailure?: boolean;
