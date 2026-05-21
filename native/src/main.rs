@@ -1868,7 +1868,7 @@ impl App {
         let alternate = terminal.uses_alternate_screen();
         let mut forwarded = false;
         let mut write_error = None;
-        if rows != 0 && backend == Some(Backend::Codex) && alternate {
+        if rows != 0 && backend == Some(Backend::Codex) {
             terminal.reset_scrollback();
             let wants_mouse = terminal.wants_sgr_mouse_events();
             if wants_mouse {
@@ -4562,6 +4562,17 @@ mod app_tests {
     use super::*;
 
     #[test]
+    fn worktree_dir_name_leads_with_task_slug() {
+        let name = worktree_dir_name(
+            "1779248379804-add-dark-and-light-mode-56991",
+            "Add dark and light mode",
+        );
+
+        assert!(name.starts_with("add-dark-and-light-mode-"));
+        assert!(!name.starts_with("1779248379804"));
+    }
+
+    #[test]
     fn detects_common_idle_prompts() {
         assert!(looks_like_agent_prompt(Backend::Claude, "> "));
         assert!(looks_like_agent_prompt(Backend::Claude, "› try something"));
@@ -5034,6 +5045,69 @@ mod app_tests {
             .map(|terminal| terminal.visible_lines().join("\n"))
             .unwrap_or_default();
         assert!(output.contains("^[[5~"), "output was {output:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_worker_wheel_forwards_before_normal_scrollback() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "stty raw -echo; i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; cat -v",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("line040") {
+                break;
+            }
+        }
+        assert!(pane.visible_lines_snapshot().join("\n").contains("line040"));
+        assert_eq!(pane.scrollback(), 0);
+
+        let mut app = App::new();
+        let mut run = test_agent_run_with_terminal(&app, pane);
+        run.backend = Backend::Codex;
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.scroll_selected_worker_or_forward(
+            mouse,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+        ));
+
+        std::thread::sleep(Duration::from_millis(50));
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("^[[5~"), "output was {output:?}");
+        assert!(app
+            .selected_terminal_mut()
+            .is_some_and(|terminal| terminal.scrollback() == 0));
     }
 
     #[cfg(not(windows))]
@@ -11805,8 +11879,9 @@ fn prepare_worktree(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
 
     let id = new_run_id(task);
     let base_commit = git_output(&repo, ["rev-parse", "HEAD"])?;
-    let branch = format!("rudder/{}-{}", id_short(&id), slugify(task, "task"));
-    let path = worktree_path(&repo, &id);
+    let task_slug = slugify(task, "task");
+    let branch = format!("rudder/{}-{}", task_slug, worktree_unique_suffix(&id));
+    let path = worktree_path(&repo, &id, task);
     let parent = path
         .parent()
         .context("worktree target has no parent directory")?;
@@ -12028,7 +12103,7 @@ fn count_uncommitted_changes(cwd: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn worktree_path(repo_root: &Path, run_id: &str) -> PathBuf {
+fn worktree_path(repo_root: &Path, run_id: &str, task: &str) -> PathBuf {
     let parent = repo_root.parent().unwrap_or(repo_root);
     let repo_name = format!(
         "{}-{}",
@@ -12044,7 +12119,12 @@ fn worktree_path(repo_root: &Path, run_id: &str) -> PathBuf {
     parent
         .join(".rudder-worktrees")
         .join(repo_name)
-        .join(run_id)
+        .join(worktree_dir_name(run_id, task))
+}
+
+fn worktree_dir_name(run_id: &str, task: &str) -> String {
+    let task_slug = slugify(task, "task");
+    format!("{}-{}", task_slug, worktree_unique_suffix(run_id))
 }
 
 fn write_rudder_context(
@@ -12183,10 +12263,6 @@ fn now_stamp() -> String {
         .to_string()
 }
 
-fn id_short(id: &str) -> String {
-    id.chars().take(14).collect()
-}
-
 fn slugify(input: &str, fallback: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
@@ -12216,4 +12292,8 @@ fn short_hash(value: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:010x}", hasher.finish())[..10].to_string()
+}
+
+fn worktree_unique_suffix(run_id: &str) -> String {
+    short_hash(run_id).chars().take(8).collect()
 }
