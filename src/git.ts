@@ -37,6 +37,14 @@ export async function currentCommit(repoRoot: string): Promise<string> {
   return result.stdout.trim() || "";
 }
 
+export async function worktreeBaseCommit(repoRoot: string): Promise<string> {
+  const result = await runCommand("git", ["rev-parse", "main"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  return result.stdout.trim() || await currentCommit(repoRoot);
+}
+
 export async function gitStatus(repoRoot: string): Promise<string[]> {
   const result = await runCommand("git", ["status", "--short"], {
     cwd: repoRoot,

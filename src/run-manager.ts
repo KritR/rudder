@@ -33,6 +33,7 @@ import {
   mergeRunIntoCurrentBranch,
   processAlive,
   removeWorktree,
+  worktreeBaseCommit,
 } from "./git.js";
 import {
   commandExists,
@@ -92,7 +93,7 @@ export async function startRun(params: {
     throw new Error("Queue mode is not implemented yet; omit --queue to create a worktree run.");
   }
   const useWorktree = Boolean(params.worktree || active.length > 0);
-  const baseCommit = await currentCommit(repoRoot);
+  const baseCommit = useWorktree ? await worktreeBaseCommit(repoRoot) : await currentCommit(repoRoot);
   const targetBranch = await currentBranch(repoRoot);
   const id = newRunId(params.task);
   const worktreeInfo = useWorktree
@@ -194,7 +195,7 @@ export async function startNativeRun(params: {
       ? config.backends.claude?.model
       : config.backends.codex?.model);
   const effort = params.effort ?? effortForBackend(backend, config);
-  const baseCommit = await currentCommit(repoRoot);
+  const baseCommit = await worktreeBaseCommit(repoRoot);
   const targetBranch = await currentBranch(repoRoot);
   const id = newRunId(params.task);
   const worktreeInfo = await createRunWorktree({ repoRoot, runId: id, task: params.task, baseCommit });

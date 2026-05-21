@@ -144,8 +144,15 @@ function truncate(value: string, maxChars: number): string {
 const LLM_TITLE_MAX = 80;
 
 function cleanLlmTitle(raw: string): string | null {
-  let text = raw.trim();
+  const text = raw.trim();
   if (!text) return null;
+  const jsonTitle = titleFromJsonOutput(text);
+  if (jsonTitle) return jsonTitle;
+  return cleanLlmTitleText(text);
+}
+
+function cleanLlmTitleText(raw: string): string | null {
+  let text = raw;
   // Strip enclosing quotes (straight + smart) and trailing punctuation.
   text = text.replace(/^["'`“”‘’]+/, "");
   text = text.replace(/["'`“”‘’]+$/, "");
@@ -163,8 +170,22 @@ function cleanLlmTitle(raw: string): string | null {
   return text;
 }
 
+function titleFromJsonOutput(raw: string): string | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end < start) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(raw.slice(start, end + 1)) as { title?: unknown };
+    return typeof value.title === "string" ? cleanLlmTitleText(value.title.trim()) : null;
+  } catch {
+    return null;
+  }
+}
+
 const SUMMARY_PROMPT_PREFIX =
-  "Generate a 5-12 word title for this coding task. Be direct, skip boilerplate. Return ONLY the title on one line, no punctuation, no quotes.\n\nTask: ";
+  "Summarize this coding agent task for a compact sidebar label. Return exactly one JSON object and no markdown: {\"title\":\"5-8 word imperative title\"}. No quotes inside the title, no trailing punctuation.\n\nTask: ";
 
 async function summarizeViaApiKey(task: string, apiKey: string): Promise<string | null> {
   try {
@@ -179,7 +200,7 @@ async function summarizeViaApiKey(task: string, apiKey: string): Promise<string 
         model: "claude-haiku-4-5-20251001",
         max_tokens: 50,
         system:
-          "Generate a 5-12 word title summarizing a coding task. Be direct, skip boilerplate. Return title only, no punctuation, no quotes.",
+          "Summarize coding tasks for compact sidebar labels. Return exactly one JSON object with a title string and no markdown.",
         messages: [{ role: "user", content: task }],
       }),
     });

@@ -3,6 +3,7 @@ export declare function findRepoRoot(cwd?: string): string;
 export declare function isGitRepo(cwd: string): boolean;
 export declare function currentBranch(repoRoot: string): Promise<string>;
 export declare function currentCommit(repoRoot: string): Promise<string>;
+export declare function worktreeBaseCommit(repoRoot: string): Promise<string>;
 export declare function gitStatus(repoRoot: string): Promise<string[]>;
 export declare function gitDiff(repoRoot: string): Promise<string>;
 export declare function hasChanges(repoRoot: string): Promise<boolean>;

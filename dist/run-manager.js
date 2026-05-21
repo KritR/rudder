@@ -8,7 +8,7 @@ import { nativeAgentCommand } from "./native-agents.js";
 import { buildPlanPrompt, PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { createRunRecord, agentContextPath, eventsPath, listRuns, loadConfig, loadRunRecord, outputPath, rememberBackendSelection, resolveRun, runDir, saveRunRecord, } from "./state.js";
 import { appendEvent, } from "./state.js";
-import { activeRunsForCheckout, createRunWorktree, currentBranch, currentCommit, findRepoRoot, hasChanges, mergeRunIntoCurrentBranch, processAlive, removeWorktree, } from "./git.js";
+import { activeRunsForCheckout, createRunWorktree, currentBranch, currentCommit, findRepoRoot, hasChanges, mergeRunIntoCurrentBranch, processAlive, removeWorktree, worktreeBaseCommit, } from "./git.js";
 import { commandExists, ensureDir, isTty, MissingToolError, newRunId, nowIso, pathExists, runCommand, shortenHome, } from "./util.js";
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
@@ -38,7 +38,7 @@ export async function startRun(params) {
         throw new Error("Queue mode is not implemented yet; omit --queue to create a worktree run.");
     }
     const useWorktree = Boolean(params.worktree || active.length > 0);
-    const baseCommit = await currentCommit(repoRoot);
+    const baseCommit = useWorktree ? await worktreeBaseCommit(repoRoot) : await currentCommit(repoRoot);
     const targetBranch = await currentBranch(repoRoot);
     const id = newRunId(params.task);
     const worktreeInfo = useWorktree
@@ -128,7 +128,7 @@ export async function startNativeRun(params) {
             ? config.backends.claude?.model
             : config.backends.codex?.model);
     const effort = params.effort ?? effortForBackend(backend, config);
-    const baseCommit = await currentCommit(repoRoot);
+    const baseCommit = await worktreeBaseCommit(repoRoot);
     const targetBranch = await currentBranch(repoRoot);
     const id = newRunId(params.task);
     const worktreeInfo = await createRunWorktree({ repoRoot, runId: id, task: params.task, baseCommit });

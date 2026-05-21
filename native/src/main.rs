@@ -51,6 +51,7 @@ const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
+const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "Enter focus",
@@ -242,6 +243,8 @@ struct App {
     last_workspace_check: Option<Instant>,
     workspace_status_rx: Option<mpsc::Receiver<Option<CloudWorkspaceStatus>>>,
     workspace_idle_notified: bool,
+    task_summary_tx: mpsc::Sender<TaskSummaryResult>,
+    task_summary_rx: mpsc::Receiver<TaskSummaryResult>,
     last_user_activity: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
@@ -391,6 +394,12 @@ struct AgentRun {
     review_source_ids: Vec<String>,
 }
 
+#[derive(Debug)]
+struct TaskSummaryResult {
+    run_id: String,
+    title: Option<String>,
+}
+
 impl AgentRun {
     fn is_main(&self) -> bool {
         self.id == MAIN_AGENT_ID
@@ -443,7 +452,7 @@ struct CliSelection {
 impl App {
     fn new() -> Self {
         let cwd = std::env::current_dir()
-            .map(|path| repo_root(&path))
+            .map(|path| dashboard_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
         let agents = if cfg!(test) {
@@ -462,12 +471,14 @@ impl App {
         };
         let cloud = read_cloud_summary();
         let session_started_iso = load_or_init_session_started(&cwd);
+        let (task_summary_tx, task_summary_rx) = mpsc::channel();
+        let branch = current_branch_at(&cwd);
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
             worker_view: WorkerView::Terminal,
             cwd,
-            branch: current_branch(),
+            branch,
             task_input,
             task_cursor,
             task_history: Vec::new(),
@@ -497,6 +508,8 @@ impl App {
             last_workspace_check: None,
             workspace_status_rx: None,
             workspace_idle_notified: false,
+            task_summary_tx,
+            task_summary_rx,
             last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
@@ -1034,7 +1047,7 @@ impl App {
             ..ReviewAllPremerge::default()
         };
         let prompt = review_all_prompt(
-            current_branch().as_deref().unwrap_or("HEAD"),
+            current_branch_at(&self.cwd).as_deref().unwrap_or("HEAD"),
             &worktree,
             &sources,
             &premerge,
@@ -1057,7 +1070,7 @@ impl App {
             }
         }
 
-        let target_ref = current_branch()
+        let target_ref = current_branch_at(&self.cwd)
             .or_else(|| {
                 git_output(&self.cwd, ["rev-parse", "HEAD"])
                     .ok()
@@ -2085,6 +2098,7 @@ impl App {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .or_else(|| rudder_plan_worker_title_from_prompt(input));
+        let should_generate_summary = planner_title.is_none();
         let worktree_label = planner_title.as_deref().unwrap_or(input);
         let task_summary = planner_title
             .as_deref()
@@ -2176,12 +2190,16 @@ impl App {
             }
         }
 
+        let run_id = run.id.clone();
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
         self.focus = FocusPane::Worker;
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
+        }
+        if should_generate_summary {
+            spawn_task_summary_worker(self.task_summary_tx.clone(), run_id, input.to_string());
         }
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
@@ -3744,7 +3762,7 @@ impl App {
         }
 
         let count = conflicted_files.len();
-        let target_branch = current_branch();
+        let target_branch = current_branch_at(&self.cwd);
         self.conflict_prompt = Some(MergeConflictPrompt {
             task,
             conflicted_files,
@@ -3996,6 +4014,8 @@ What to do\n\
     }
 
     fn poll_agents(&mut self) {
+        self.poll_task_summary_workers();
+
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
             if self.cloud_connected != cloud.connected || self.cloud_runtime != cloud.runtime {
@@ -4166,6 +4186,32 @@ What to do\n\
         }
 
         if any_dirty {
+            self.dirty = true;
+        }
+    }
+
+    fn poll_task_summary_workers(&mut self) {
+        let mut changed = false;
+        let repo_root = self.cwd.clone();
+        while let Ok(result) = self.task_summary_rx.try_recv() {
+            let Some(title) = result.title else {
+                continue;
+            };
+            let Some(run) = self.agents.iter_mut().find(|run| run.id == result.run_id) else {
+                continue;
+            };
+            if run.is_main() || !matches!(run.mode, AgentMode::Execute) {
+                continue;
+            }
+            if run.task_summary == title {
+                continue;
+            }
+            run.task_summary = title;
+            let _ = save_native_run_record(&repo_root, run);
+            changed = true;
+        }
+        if changed {
+            let _ = write_rudder_context(&self.cwd, &self.agents, None);
             self.dirty = true;
         }
     }
@@ -4570,6 +4616,34 @@ mod app_tests {
 
         assert!(name.starts_with("add-dark-and-light-mode-"));
         assert!(!name.starts_with("1779248379804"));
+    }
+
+    #[test]
+    fn parses_main_worktree_from_porcelain() {
+        let output = "\
+worktree /repo/feature\n\
+HEAD 111\n\
+branch refs/heads/rudder/task\n\
+\n\
+worktree /repo/main\n\
+HEAD 222\n\
+branch refs/heads/main\n";
+
+        assert_eq!(
+            main_worktree_from_porcelain(output),
+            Some(PathBuf::from("/repo/main"))
+        );
+    }
+
+    #[test]
+    fn parses_json_task_summary_title() {
+        assert_eq!(
+            task_title_from_summary_output(
+                "Here is the JSON:\n{\"title\":\"Fix Codex worker scrolling.\"}",
+            )
+            .as_deref(),
+            Some("Fix Codex worker scrolling")
+        );
     }
 
     #[test]
@@ -10783,6 +10857,71 @@ fn summarize_task(task: &str) -> String {
     summarize_task_to(task, 56)
 }
 
+fn spawn_task_summary_worker(tx: mpsc::Sender<TaskSummaryResult>, run_id: String, task: String) {
+    thread::spawn(move || {
+        let title = generate_task_summary_title(&task);
+        let _ = tx.send(TaskSummaryResult { run_id, title });
+    });
+}
+
+fn generate_task_summary_title(task: &str) -> Option<String> {
+    let task = normalize_task_text(task);
+    if task.is_empty() {
+        return None;
+    }
+    let prompt = format!(
+        "Summarize this coding agent task for a compact sidebar label.\n\
+Return exactly one JSON object and no markdown: {{\"title\":\"5-8 word imperative title\"}}\n\
+Rules: no quotes inside the title, no trailing punctuation, do not mention Rudder unless it is the product being changed.\n\n\
+Task:\n{task}"
+    );
+    let output = Command::new("claude")
+        .args(["-p", &prompt, "--model", TASK_SUMMARY_MODEL])
+        .env("CLAUDE_CODE_NO_FLICKER", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    task_title_from_summary_output(&stdout)
+}
+
+fn task_title_from_summary_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end >= start {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
+                {
+                    if let Some(title) = value.get("title").and_then(|value| value.as_str()) {
+                        return clean_task_summary_title(title);
+                    }
+                }
+            }
+        }
+    }
+    clean_task_summary_title(trimmed)
+}
+
+fn clean_task_summary_title(raw: &str) -> Option<String> {
+    let mut title = raw
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'))
+        .to_string();
+    title = strip_terminal_punctuation(&title);
+    title = normalize_task_text(&title);
+    if title.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&title, 56))
+}
+
 fn summarize_task_to(task: &str, max_chars: usize) -> String {
     let original = normalize_task_text(task);
     if original.is_empty() {
@@ -11434,9 +11573,10 @@ fn modified_arrow(final_byte: &str, modifiers: KeyModifiers) -> Vec<u8> {
     }
 }
 
-fn current_branch() -> Option<String> {
-    let output = std::process::Command::new("git")
+fn current_branch_at(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
         .args(["branch", "--show-current"])
+        .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -11513,7 +11653,7 @@ fn ensure_main_agent(
     model: &str,
     effort: Option<EffortLevel>,
 ) {
-    let branch_summary = current_branch().unwrap_or_else(|| "HEAD".to_string());
+    let branch_summary = current_branch_at(repo_root).unwrap_or_else(|| "HEAD".to_string());
     if let Some(existing_index) = agents.iter().position(|a| a.id == MAIN_AGENT_ID) {
         let mut existing = agents.remove(existing_index);
         existing.task_summary = branch_summary;
@@ -11786,7 +11926,7 @@ fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result<()> {
     let run_dir = native_run_dir(repo_root, &run.id);
     fs::create_dir_all(&run_dir)?;
     let record_path = run_dir.join("run.json");
-    let target_branch = current_branch().unwrap_or_else(|| "HEAD".to_string());
+    let target_branch = current_branch_at(repo_root).unwrap_or_else(|| "HEAD".to_string());
     let base_commit = git_output(repo_root, ["rev-parse", "HEAD"])
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
@@ -11872,13 +12012,14 @@ impl WorktreeInfo {
 }
 
 fn prepare_worktree(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
-    let repo = repo_root(cwd);
+    let repo = dashboard_root(cwd);
     if !is_git_repo(&repo) {
         return Ok(WorktreeInfo::current(cwd.to_path_buf()));
     }
 
     let id = new_run_id(task);
-    let base_commit = git_output(&repo, ["rev-parse", "HEAD"])?;
+    let base_commit = git_output(&repo, ["rev-parse", "main"])
+        .or_else(|_| git_output(&repo, ["rev-parse", "HEAD"]))?;
     let task_slug = slugify(task, "task");
     let branch = format!("rudder/{}-{}", task_slug, worktree_unique_suffix(&id));
     let path = worktree_path(&repo, &id, task);
@@ -11918,6 +12059,30 @@ fn repo_root(cwd: &Path) -> PathBuf {
     git_output(cwd, ["rev-parse", "--show-toplevel"])
         .map(|root| PathBuf::from(root.trim()))
         .unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+fn dashboard_root(cwd: &Path) -> PathBuf {
+    let repo = repo_root(cwd);
+    main_worktree_root(&repo).unwrap_or(repo)
+}
+
+fn main_worktree_root(repo: &Path) -> Option<PathBuf> {
+    let output = git_output_args(repo, &["worktree", "list", "--porcelain"]).ok()?;
+    main_worktree_from_porcelain(&output)
+}
+
+fn main_worktree_from_porcelain(output: &str) -> Option<PathBuf> {
+    let mut current_path: Option<PathBuf> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path));
+            continue;
+        }
+        if line.trim() == "branch refs/heads/main" {
+            return current_path.clone();
+        }
+    }
+    None
 }
 
 fn is_git_repo(cwd: &Path) -> bool {

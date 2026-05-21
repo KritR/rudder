@@ -29,6 +29,13 @@ export async function currentCommit(repoRoot) {
     });
     return result.stdout.trim() || "";
 }
+export async function worktreeBaseCommit(repoRoot) {
+    const result = await runCommand("git", ["rev-parse", "main"], {
+        cwd: repoRoot,
+        allowFailure: true,
+    });
+    return result.stdout.trim() || await currentCommit(repoRoot);
+}
 export async function gitStatus(repoRoot) {
     const result = await runCommand("git", ["status", "--short"], {
         cwd: repoRoot,
