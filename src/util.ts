@@ -103,6 +103,44 @@ export function commandExists(command: string): boolean {
   return result.status === 0 && result.stdout.trim().length > 0;
 }
 
+const TOOL_INSTALL_HINTS: Record<string, string> = {
+  claude: "Install with `npm install -g @anthropic-ai/claude-code` (see https://github.com/anthropics/claude-code).",
+  codex: "Install with `npm install -g @openai/codex` (see https://github.com/openai/codex).",
+  acpx: "Install with `npm install -g acpx@latest` or run `rudder onboard`.",
+};
+
+export class MissingToolError extends Error {
+  readonly tool: string;
+  readonly hint: string;
+
+  constructor(tool: string, message?: string) {
+    const hint = TOOL_INSTALL_HINTS[tool] ?? "Please install it and ensure it is on your PATH.";
+    super(message ?? formatMissingToolMessage(tool, hint));
+    this.name = "MissingToolError";
+    this.tool = tool;
+    this.hint = hint;
+  }
+}
+
+export function formatMissingToolMessage(tool: string, hintOverride?: string): string {
+  const hint = hintOverride ?? TOOL_INSTALL_HINTS[tool] ?? "Please install it and ensure it is on your PATH.";
+  return `${tool} is not installed or not found on PATH. ${hint}`;
+}
+
+export function requireBackendTool(tool: string): void {
+  if (!commandExists(tool)) {
+    throw new MissingToolError(tool);
+  }
+}
+
+export function isMissingToolSpawnError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const code = (error as { code?: unknown }).code;
+  return code === "ENOENT";
+}
+
 export async function runCommand(
   command: string,
   args: string[],

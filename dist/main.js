@@ -12,7 +12,7 @@ import { cleanupRuns, deleteRun, listProjectRuns, mergeRun, printLogs, startRun,
 import { runInteractiveShell } from "./repl.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
-import { commandExists, isTty, runCommand } from "./util.js";
+import { commandExists, isTty, MissingToolError, runCommand } from "./util.js";
 import { getUpdateAvailable } from "./version-check.js";
 import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 export async function main() {
@@ -188,6 +188,9 @@ export async function main() {
         }
         case "claude":
         case "codex": {
+            if (!commandExists(parsed.command)) {
+                throw new MissingToolError(parsed.command);
+            }
             await maybeOnboard();
             const task = parsed.args.join(" ").trim();
             if (!task) {
@@ -206,6 +209,9 @@ export async function main() {
             return;
         }
         case "acpx": {
+            if (!commandExists("acpx")) {
+                throw new MissingToolError("acpx");
+            }
             await maybeOnboard();
             const args = parsed.args[0] === "codex" ? parsed.args.slice(1) : parsed.args;
             const task = args.join(" ").trim();
