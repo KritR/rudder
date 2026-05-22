@@ -460,9 +460,9 @@ impl App {
         } else {
             load_persisted_agents(&cwd)
         };
-        // Main slot is no longer auto-pinned. If the user wants one, they type
-        // /main from the task pane. Persisted main records from older versions
-        // continue to load and behave as a normal agent row with a "main" badge.
+        // Main is no longer auto-pinned. If the user wants one, they type
+        // /main from the task pane. Main records render in their own section
+        // instead of being mixed into ordinary worktree agents.
         let (task_input, task_cursor) = (String::new(), 0);
         let pending_migration_resumes = if cfg!(test) {
             Vec::new()
@@ -2517,7 +2517,7 @@ impl App {
 
     fn start_rename_selected_agent(&mut self) {
         if self.selected_is_main() {
-            self.notice = Some("main slot: rename disabled".to_string());
+            self.notice = Some("main agent: rename disabled".to_string());
             return;
         }
         let Some(run) = self.agents.get(self.selected_agent) else {
@@ -2625,7 +2625,7 @@ impl App {
         let main_index = match self.agents.iter().position(|run| run.is_main()) {
             Some(idx) => idx,
             None => {
-                self.notice = Some("no main slot".to_string());
+                self.notice = Some("no main agent".to_string());
                 return;
             }
         };
@@ -3492,7 +3492,7 @@ impl App {
             return;
         }
         if self.selected_is_main() {
-            self.notice = Some("main slot: delete disabled".to_string());
+            self.notice = Some("main agent: delete disabled".to_string());
             return;
         }
         let selected = &self.agents[self.selected_agent];
@@ -3552,7 +3552,7 @@ impl App {
 
     fn request_merge_selected_agent(&mut self) {
         if self.selected_is_main() {
-            self.notice = Some("main slot: merge disabled".to_string());
+            self.notice = Some("main agent: merge disabled".to_string());
             return;
         }
         let Some(run) = self.agents.get(self.selected_agent) else {
@@ -3968,7 +3968,7 @@ What to do\n\
         // to Merged so it appears in a dedicated section. Keep the worktree
         // path on the record and defer `git worktree remove` to delete, which
         // keeps merge confirmation responsive and preserves cleanup control.
-        // Never touch the pinned main slot.
+        // Never touch the dedicated main agent.
         if index < self.agents.len() && !self.agents[index].is_main() {
             self.mark_agent_and_review_sources_merged(index, review_source_ids);
         }
@@ -6495,6 +6495,21 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn agent_navigation_keeps_main_section_first() {
+        let mut app = App::new();
+        let live = test_agent_run("run-live", "live task");
+        let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
+        main.mode = AgentMode::Main;
+        let mut merged = test_agent_run("run-merged", "merged task");
+        merged.status = AgentStatus::Merged;
+        app.agents.push(live);
+        app.agents.push(main);
+        app.agents.push(merged);
+
+        assert_eq!(app.visible_agent_indices(), vec![1, 0, 2]);
+    }
+
+    #[test]
     fn merge_request_clears_pending_delete() {
         let mut app = App::new();
         let mut run = test_agent_run("run-1", "test task");
@@ -6788,7 +6803,7 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn main_slot_blocks_delete_merge_and_rename() {
+    fn main_agent_blocks_delete_merge_and_rename() {
         let mut app = App::new();
         let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
         main.mode = AgentMode::Main;
@@ -6803,7 +6818,7 @@ branch refs/heads/main\n";
             .notice
             .as_deref()
             .unwrap_or_default()
-            .contains("main slot"));
+            .contains("main agent"));
 
         app.notice = None;
         app.request_merge_selected_agent();
@@ -6812,7 +6827,7 @@ branch refs/heads/main\n";
             .notice
             .as_deref()
             .unwrap_or_default()
-            .contains("main slot"));
+            .contains("main agent"));
 
         app.notice = None;
         app.start_rename_selected_agent();
@@ -6821,11 +6836,11 @@ branch refs/heads/main\n";
             .notice
             .as_deref()
             .unwrap_or_default()
-            .contains("main slot"));
+            .contains("main agent"));
     }
 
     #[test]
-    fn merge_cleanup_preserves_main_slot() {
+    fn merge_cleanup_preserves_main_agent() {
         let mut app = App::new();
         let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
         main.mode = AgentMode::Main;
@@ -7235,7 +7250,7 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             })
             .collect()
     };
-    let worktree_count = app.agents.iter().filter(|a| !a.is_main()).count();
+    let run_count = app.agents.iter().filter(|a| !a.is_main()).count();
     let mut lines = vec![
         ListItem::new(Line::from(Span::styled(
             "rudder",
@@ -7251,7 +7266,7 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("agents ", pane_text_style(focused)),
-            Span::styled(worktree_count.to_string(), accent_style(focused)),
+            Span::styled(run_count.to_string(), accent_style(focused)),
             Span::styled(" runs", pane_text_style(focused)),
         ])),
         ListItem::new(Line::default()),
@@ -7398,25 +7413,49 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
     };
 
+    let main_count = app.agents.iter().filter(|a| a.is_main()).count();
+    let active_count = app
+        .agents
+        .iter()
+        .filter(|a| a.status != AgentStatus::Merged && !a.is_main())
+        .count();
     let merged_count = app
         .agents
         .iter()
         .filter(|a| a.status == AgentStatus::Merged && !a.is_main())
         .count();
-    let mut rendered_live = false;
+
+    if main_count > 0 {
+        lines.push(ListItem::new(Line::from(Span::styled(
+            "main",
+            muted_style(focused),
+        ))));
+        for (index, agent) in app.agents.iter().enumerate() {
+            if !agent.is_main() {
+                continue;
+            }
+            push_agent_row(&mut lines, app, index, agent, None);
+        }
+    }
+
+    if active_count > 0 {
+        if main_count > 0 {
+            lines.push(ListItem::new(Line::default()));
+        }
+        lines.push(ListItem::new(Line::from(Span::styled(
+            "agents",
+            muted_style(focused),
+        ))));
+    }
+
     for (index, agent) in app.agents.iter().enumerate() {
-        if agent.status == AgentStatus::Merged && !agent.is_main() {
+        if agent.is_main() || agent.status == AgentStatus::Merged {
             continue;
         }
-        let summary = if agent.is_main() {
-            None
-        } else {
-            diff_summaries.get(index).and_then(|opt| opt.clone())
-        };
+        let summary = diff_summaries.get(index).and_then(|opt| opt.clone());
         push_agent_row(&mut lines, app, index, agent, summary);
-        rendered_live = true;
     }
-    if !rendered_live && merged_count == 0 {
+    if main_count == 0 && active_count == 0 && merged_count == 0 {
         lines.push(ListItem::new(Line::from(Span::styled(
             "no agents yet  ·  type a task or /main",
             muted_style(focused),
@@ -7449,9 +7488,16 @@ fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
     let mut indices = agents
         .iter()
         .enumerate()
-        .filter(|(_, agent)| agent.status != AgentStatus::Merged || agent.is_main())
+        .filter(|(_, agent)| agent.is_main())
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    indices.extend(
+        agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| agent.status != AgentStatus::Merged && !agent.is_main())
+            .map(|(index, _)| index),
+    );
     indices.extend(
         agents
             .iter()
@@ -7461,7 +7507,6 @@ fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
     );
     indices
 }
-
 fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let inner = block_inner(area);
     let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
