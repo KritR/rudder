@@ -30,7 +30,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
-    StyledTerminalCell, TerminalCommand, TerminalPane, TerminalPaneOptions, TerminalSize,
+    StyledTerminalCell, TerminalCommand, TerminalCursor, TerminalPane, TerminalPaneOptions,
+    TerminalSize,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -1881,45 +1882,6 @@ impl App {
         let alternate = terminal.uses_alternate_screen();
         let mut forwarded = false;
         let mut write_error = None;
-        if rows != 0 && backend == Some(Backend::Codex) {
-            terminal.reset_scrollback();
-            let wants_mouse = terminal.wants_sgr_mouse_events();
-            if wants_mouse {
-                if let Some(bytes) = mouse_bytes.as_ref() {
-                    if let Err(error) = terminal.write_input(bytes) {
-                        write_error = Some(error.to_string());
-                    } else {
-                        forwarded = true;
-                    }
-                }
-            }
-            if !forwarded {
-                if let Some(bytes) = scroll_key_bytes(mouse.kind) {
-                    if let Err(error) = terminal.write_input(&bytes) {
-                        write_error = Some(error.to_string());
-                    } else {
-                        forwarded = true;
-                    }
-                }
-            }
-            let after = terminal.scrollback();
-            self.set_mouse_debug(format!(
-                "mouse {:?} @{},{} pane=worker rows={} before={} after={} moved=false alt={} wants_mouse={} forwarded={}",
-                mouse.kind,
-                mouse.column,
-                mouse.row,
-                rows,
-                before,
-                after,
-                alternate,
-                wants_mouse,
-                forwarded
-            ));
-            if let Some(error) = write_error {
-                self.set_selected_error(error);
-            }
-            return true;
-        }
         terminal.scrollback_by(rows);
         let after = terminal.scrollback();
         let moved = after != before;
@@ -4914,6 +4876,50 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn styled_terminal_line_draws_visible_cursor_cell() {
+        let line = styled_terminal_line(vec![plain_terminal_cell("a".to_string())], None, Some(3));
+
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[0].content.as_ref(), "a");
+        assert_eq!(line.spans[3].content.as_ref(), " ");
+        assert_eq!(line.spans[3].style, cursor_cell_style());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hidden_codex_cursor_still_gets_render_cursor() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            ["-lc", "printf '\\033[?25lhidden cursor\\r\\n'; sleep 1"],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane
+                .visible_lines_snapshot()
+                .join("\n")
+                .contains("hidden cursor")
+            {
+                break;
+            }
+        }
+
+        assert!(!pane.cursor().visible);
+        assert!(worker_render_cursor(Backend::Codex, &pane, true, 5, 20, 0).is_some());
+        assert!(worker_render_cursor(Backend::Codex, &pane, false, 5, 20, 0).is_none());
+    }
+
+    #[test]
     fn worker_wheel_scroll_rows_scale_with_viewport() {
         assert_eq!(wheel_scroll_rows(2, KeyModifiers::empty()), 1);
         assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 1);
@@ -5123,7 +5129,7 @@ branch refs/heads/main\n";
 
     #[cfg(not(windows))]
     #[test]
-    fn codex_worker_wheel_forwards_before_normal_scrollback() {
+    fn codex_worker_wheel_moves_normal_scrollback_before_forwarding() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
             [
@@ -5150,6 +5156,7 @@ branch refs/heads/main\n";
         }
         assert!(pane.visible_lines_snapshot().join("\n").contains("line040"));
         assert_eq!(pane.scrollback(), 0);
+        let before = pane.visible_lines_snapshot().join("\n");
 
         let mut app = App::new();
         let mut run = test_agent_run_with_terminal(&app, pane);
@@ -5176,17 +5183,18 @@ branch refs/heads/main\n";
         std::thread::sleep(Duration::from_millis(50));
         let output = app
             .selected_terminal_mut()
-            .map(|terminal| terminal.visible_lines().join("\n"))
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
-        assert!(output.contains("^[[5~"), "output was {output:?}");
+        assert_ne!(output, before);
+        assert!(output.contains("line037"), "output was {output:?}");
         assert!(app
             .selected_terminal_mut()
-            .is_some_and(|terminal| terminal.scrollback() == 0));
+            .is_some_and(|terminal| terminal.scrollback() > 0));
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn codex_alternate_screen_wheel_forwards_before_snapshot_scrollback() {
+    fn codex_alternate_screen_wheel_moves_snapshot_scrollback_first() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
             [
@@ -5214,11 +5222,7 @@ branch refs/heads/main\n";
             }
         }
         assert!(pane.uses_alternate_screen());
-
-        // Seed Rudder's alternate-screen snapshot history. Codex should still
-        // receive the wheel as PageUp instead of Rudder consuming it locally.
-        pane.scrollback_by(1);
-        assert!(pane.scrollback() > 0);
+        assert!(pane.visible_lines_snapshot().join("\n").contains("second"));
 
         let mut app = App::new();
         let mut run = test_agent_run_with_terminal(&app, pane);
@@ -5245,12 +5249,13 @@ branch refs/heads/main\n";
         std::thread::sleep(Duration::from_millis(50));
         let output = app
             .selected_terminal_mut()
-            .map(|terminal| terminal.visible_lines().join("\n"))
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
             .unwrap_or_default();
-        assert!(output.contains("^[[5~"), "output was {output:?}");
+        assert!(output.contains("first"), "output was {output:?}");
+        assert!(!output.contains("^[[5~"), "output was {output:?}");
         assert!(app
             .selected_terminal_mut()
-            .is_some_and(|terminal| terminal.scrollback() == 0));
+            .is_some_and(|terminal| terminal.scrollback() > 0));
     }
 
     #[cfg(not(windows))]
@@ -7532,7 +7537,7 @@ fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     let lines = match app.worker_view {
-        WorkerView::Terminal => worker_lines(app, inner.height as usize),
+        WorkerView::Terminal => worker_lines(app, inner.height as usize, inner.width as usize),
         WorkerView::Diff => review_lines(app, inner.height as usize),
     };
     let paragraph = Paragraph::new(lines)
@@ -7571,7 +7576,7 @@ fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
     if cursor.row >= inner.height || cursor.col >= inner.width {
         return;
     }
-    if !cursor.visible && run.backend != Backend::Claude {
+    if !cursor.visible && !force_worker_cursor(run.backend) {
         return;
     }
     frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
@@ -7595,7 +7600,7 @@ fn set_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
     frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
 }
 
-fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
+fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Line<'static>> {
     let Some(run) = app.agents.get_mut(app.selected_agent) else {
         return vec![
             Line::from(""),
@@ -7618,6 +7623,8 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
         ];
     }
 
+    let backend = run.backend;
+    let focused = app.focus == FocusPane::Worker;
     let Some(terminal) = run.terminal.as_mut() else {
         return vec![
             Line::from(Span::styled(
@@ -7644,16 +7651,54 @@ fn worker_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
         .worker_selection
         .map(normalize_selection)
         .filter(|selection| !selection_is_empty(*selection));
-    let mut lines = terminal
-        .styled_lines()
+    let styled_rows = terminal.styled_lines();
+    let start_row = styled_rows.len().saturating_sub(height);
+    let cursor = worker_render_cursor(backend, terminal, focused, height, width, start_row);
+    let mut lines = styled_rows
         .into_iter()
         .enumerate()
-        .map(|(row, cells)| styled_terminal_line(cells, selection_for_row(selection, row)))
+        .skip(start_row)
+        .map(|(row, cells)| {
+            styled_terminal_line(
+                cells,
+                selection_for_row(selection, row),
+                cursor
+                    .filter(|cursor| cursor.row as usize == row)
+                    .map(|cursor| cursor.col as usize),
+            )
+        })
         .collect::<Vec<_>>();
     if lines.len() > height {
         lines = lines.split_off(lines.len() - height);
     }
     lines
+}
+
+fn worker_render_cursor(
+    backend: Backend,
+    terminal: &TerminalPane,
+    focused: bool,
+    height: usize,
+    width: usize,
+    start_row: usize,
+) -> Option<TerminalCursor> {
+    if !focused || terminal.scrollback() > 0 {
+        return None;
+    }
+    let cursor = terminal.cursor();
+    if !cursor.visible && !force_worker_cursor(backend) {
+        return None;
+    }
+    let row = cursor.row as usize;
+    let col = cursor.col as usize;
+    if row < start_row || row >= start_row.saturating_add(height) || col >= width {
+        return None;
+    }
+    Some(cursor)
+}
+
+fn force_worker_cursor(backend: Backend) -> bool {
+    matches!(backend, Backend::Claude | Backend::Codex)
 }
 
 fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
@@ -7690,7 +7735,7 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     let mut lines = review
         .styled_lines()
         .into_iter()
-        .map(|cells| styled_terminal_line(cells, None))
+        .map(|cells| styled_terminal_line(cells, None, None))
         .collect::<Vec<_>>();
     if lines.len() > height {
         lines = lines.split_off(lines.len() - height);
@@ -8587,20 +8632,49 @@ fn run_clipboard_command(command: &str, args: &[&str], text: &str) -> Result<()>
 fn styled_terminal_line(
     cells: Vec<StyledTerminalCell>,
     selection: Option<(usize, usize)>,
+    cursor_col: Option<usize>,
 ) -> Line<'static> {
-    let spans = cells
-        .into_iter()
-        .enumerate()
-        .map(|cell| {
-            let (col, cell) = cell;
+    let column_count = cursor_col
+        .map(|col| col.saturating_add(1))
+        .unwrap_or(cells.len())
+        .max(cells.len());
+    let spans = (0..column_count)
+        .map(|col| {
+            let cell = cells
+                .get(col)
+                .cloned()
+                .unwrap_or_else(|| plain_terminal_cell(" ".to_string()));
             let mut style = terminal_cell_style(&cell);
             if selection.is_some_and(|(start, end)| col >= start && col <= end) {
                 style = style.fg(Color::Black).bg(FOCUS_COLOR);
+            }
+            if cursor_col == Some(col) {
+                style = cursor_cell_style();
             }
             Span::styled(cell.contents, style)
         })
         .collect::<Vec<_>>();
     Line::from(spans)
+}
+
+fn cursor_cell_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(FOCUS_COLOR)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn plain_terminal_cell(contents: String) -> StyledTerminalCell {
+    StyledTerminalCell {
+        contents,
+        fg: vt100::Color::Default,
+        bg: vt100::Color::Default,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+    }
 }
 
 fn styled_plain_line(text: &str, style: Style, selection: Option<(usize, usize)>) -> Line<'static> {
