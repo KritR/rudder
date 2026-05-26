@@ -1278,7 +1278,7 @@ async function stageMigratedAgents(
       await fsp.cp(candidate.sessionJsonlPath!, jsonlDest, { force: true });
       sessionJsonlSnapshotPath = path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`);
     }
-    const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId);
+    const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId, candidate.task);
     // For fresh restarts, build a prompt-engineered handoff from the local
     // run record so the new agent gets context instead of just the bare task.
     let freshPrompt: string | undefined;

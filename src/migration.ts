@@ -2,7 +2,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { JsonValue, RunRecord } from "./types.js";
-import { pathExists, readJson } from "./util.js";
+import { pathExists, readJson, shortHash, slugPrefix } from "./util.js";
 
 export type MigrationDecision = "migrate" | "migrate-fresh" | "stay" | "stop";
 
@@ -180,9 +180,14 @@ export function cloudWorkspacePath(repoName: string): string {
   return path.posix.join("/workspace", repoName);
 }
 
-export function cloudWorktreeAbsolutePath(repoName: string, runId: string): string {
+export function cloudWorktreeAbsolutePath(repoName: string, runId: string, task?: string): string {
   // Mirrors src/state.ts worktreePath() but rooted at the cloud workspace.
-  return path.posix.join("/workspace", ".rudder-worktrees", repoName, runId);
+  return path.posix.join("/workspace", ".rudder-worktrees", repoName, cloudWorktreeDirName(runId, task));
+}
+
+function cloudWorktreeDirName(runId: string, task?: string): string {
+  const slug = slugPrefix(task ?? runId, "task");
+  return `${slug}-${shortHash(runId).slice(0, 8)}`;
 }
 
 export function formatCandidateReason(candidate: MigrationCandidate): string {

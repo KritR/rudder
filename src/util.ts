@@ -268,6 +268,11 @@ export function slugify(inputValue: string, fallback = "task"): string {
   return slug || fallback;
 }
 
+export function slugPrefix(inputValue: string, fallback = "task", maxChars = 40): string {
+  const slug = slugify(inputValue, fallback).slice(0, maxChars).replace(/-+$/g, "");
+  return slug || fallback;
+}
+
 export function newRunId(task: string): string {
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
   return `${stamp}-${slugify(task)}-${randomUUID().slice(0, 8)}`;

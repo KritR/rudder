@@ -9,13 +9,14 @@ export function nativeAgentCommand(params: {
   prompt: string;
   contract: string;
   mode?: "execute" | "plan";
+  codexCommand?: string;
 }): string {
   const mode = params.mode ?? params.run.mode ?? "execute";
   const prompt = stripRudderPromptWrappers(params.prompt);
   const args = mode === "plan"
-    ? planArgs(params.run, prompt)
+    ? planArgs(params.run, prompt, params.codexCommand)
     : params.run.backend === "codex"
-      ? codexArgs(params.run, prompt, params.contract)
+      ? codexArgs(params.run, prompt, params.contract, params.codexCommand)
       : claudeArgs(params.run, prompt, params.contract);
   return args.map(shellQuote).join(" ");
 }
@@ -45,11 +46,13 @@ function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] 
   ]);
 }
 
-function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
+function codexArgs(run: RunRecord, prompt: string, contract: string, codexCommand = "codex"): string[] {
   const model = run.model || "gpt-5.5";
   const effort = normalizeEffortForBackend("codex", run.effort);
   return [
-    "codex",
+    "env",
+    "CODEX_RUDDER_SCROLLBACK_SAFE=1",
+    codexCommand,
     "--no-alt-screen",
     "--model",
     model,
@@ -68,9 +71,9 @@ function codexArgs(run: RunRecord, prompt: string, contract: string): string[] {
   ].filter((value): value is string => Boolean(value));
 }
 
-function planArgs(run: RunRecord, prompt: string): string[] {
+function planArgs(run: RunRecord, prompt: string, codexCommand?: string): string[] {
   return run.backend === "codex"
-    ? codexPlanArgs(run, prompt)
+    ? codexPlanArgs(run, prompt, codexCommand)
     : claudePlanArgs(run, prompt);
 }
 
@@ -101,11 +104,13 @@ function claudePlanArgs(run: RunRecord, prompt: string): string[] {
   ]);
 }
 
-function codexPlanArgs(run: RunRecord, prompt: string): string[] {
+function codexPlanArgs(run: RunRecord, prompt: string, codexCommand = "codex"): string[] {
   const model = run.model || "gpt-5.5";
   const effort = normalizeEffortForBackend("codex", run.effort);
   return compact([
-    "codex",
+    "env",
+    "CODEX_RUDDER_SCROLLBACK_SAFE=1",
+    codexCommand,
     "--no-alt-screen",
     "--model",
     model,

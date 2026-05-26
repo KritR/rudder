@@ -1,3 +1,4 @@
+import { ensureRudderCodexBinary } from "./codex-binary.js";
 import { runCommand } from "./util.js";
 const FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh"];
 export async function discoverEffortOptions(backend) {
@@ -35,7 +36,8 @@ async function discoverClaudeEfforts() {
     return values.length ? values : [...FALLBACK_EFFORTS, "max"];
 }
 async function discoverCodexEfforts() {
-    const help = await runCommand("codex", ["exec", "--help"], { allowFailure: true });
+    const codex = await ensureRudderCodexBinary();
+    const help = await runCommand(codex, ["exec", "--help"], { allowFailure: true });
     const values = parseEfforts(help.stdout || help.stderr).filter((value) => value !== "max");
     return values.length ? values : FALLBACK_EFFORTS;
 }

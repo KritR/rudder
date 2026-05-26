@@ -1,4 +1,5 @@
 import type { BackendId, EffortLevel } from "./types.js";
+import { ensureRudderCodexBinary } from "./codex-binary.js";
 import { runCommand } from "./util.js";
 
 export type EffortOption = {
@@ -48,7 +49,8 @@ async function discoverClaudeEfforts(): Promise<EffortLevel[]> {
 }
 
 async function discoverCodexEfforts(): Promise<EffortLevel[]> {
-  const help = await runCommand("codex", ["exec", "--help"], { allowFailure: true });
+  const codex = await ensureRudderCodexBinary();
+  const help = await runCommand(codex, ["exec", "--help"], { allowFailure: true });
   const values = parseEfforts(help.stdout || help.stderr).filter((value) => value !== "max");
   return values.length ? values : FALLBACK_EFFORTS;
 }

@@ -11,7 +11,7 @@ export declare function outputPath(repoRoot: string, runId: string): string;
 export declare function agentContextPath(repoRoot: string): string;
 export declare function specPath(repoRoot: string, runId: string): string;
 export declare function verifierPath(repoRoot: string, runId: string): string;
-export declare function worktreePath(repoRoot: string, runId: string): string;
+export declare function worktreePath(repoRoot: string, runId: string, task?: string): string;
 export declare function loadConfig(): Promise<RudderConfig>;
 export declare function defaultConfig(): RudderConfig;
 export declare function saveConfig(config: RudderConfig): Promise<void>;

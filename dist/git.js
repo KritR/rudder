@@ -1,6 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { runCommand, runCommandSync, slugify } from "./util.js";
+import { runCommand, runCommandSync, shortHash, slugPrefix } from "./util.js";
 import { listRuns, saveRunRecord, worktreePath } from "./state.js";
 export function findRepoRoot(cwd = process.cwd()) {
     const result = runCommandSync("git", ["rev-parse", "--show-toplevel"], {
@@ -96,8 +96,9 @@ export async function activeRunsForCheckout(repoRoot, checkoutPath) {
     });
 }
 export async function createRunWorktree(params) {
-    const branch = `rudder/${params.runId.slice(0, 14)}-${slugify(params.task, "task").slice(0, 32)}`;
-    const targetPath = worktreePath(params.repoRoot, params.runId);
+    const taskSlug = slugPrefix(params.task, "task");
+    const branch = `rudder/${taskSlug}-${shortHash(params.runId).slice(0, 8)}`;
+    const targetPath = worktreePath(params.repoRoot, params.runId, params.task);
     await fsp.mkdir(path.dirname(targetPath), { recursive: true });
     await runCommand("git", ["branch", branch, params.baseCommit], {
         cwd: params.repoRoot,

@@ -4,4 +4,5 @@ export declare function nativeAgentCommand(params: {
     prompt: string;
     contract: string;
     mode?: "execute" | "plan";
+    codexCommand?: string;
 }): string;

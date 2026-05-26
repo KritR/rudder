@@ -16,6 +16,7 @@ import {
   readJson,
   rudderHome,
   shortHash,
+  slugPrefix,
   slugify,
   writeJson,
 } from "./util.js";
@@ -69,10 +70,16 @@ export function verifierPath(repoRoot: string, runId: string): string {
   return path.join(runDir(repoRoot, runId), "verifier.json");
 }
 
-export function worktreePath(repoRoot: string, runId: string): string {
+export function worktreePath(repoRoot: string, runId: string, task?: string): string {
   const parent = path.dirname(repoRoot);
   const repoName = `${slugify(path.basename(repoRoot), "repo")}-${shortHash(repoRoot)}`;
-  return path.join(parent, ".rudder-worktrees", repoName, runId);
+  return path.join(parent, ".rudder-worktrees", repoName, worktreeDirName(runId, task));
+}
+
+function worktreeDirName(runId: string, task?: string): string {
+  const slug = slugPrefix(task ?? runId, "task");
+  const suffix = shortHash(runId).slice(0, 8);
+  return `${slug}-${suffix}`;
 }
 
 export async function loadConfig(): Promise<RudderConfig> {

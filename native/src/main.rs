@@ -5661,6 +5661,10 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "--enable" && window[1] == "goals"));
+        assert!(execute_codex
+            .env
+            .iter()
+            .any(|(key, value)| key == "CODEX_RUDDER_SCROLLBACK_SAFE" && value == "1"));
 
         let execute_claude = agent_command(
             Backend::Claude,
@@ -10527,7 +10531,7 @@ fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
     }
     args.push("resume".to_string());
     args.push(session_id.to_string());
-    TerminalCommand::with_args("codex", args)
+    TerminalCommand::with_args(codex_program(), args).with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
 }
 
 fn agent_command(
@@ -10613,9 +10617,18 @@ fn agent_command(
             if let Some(prompt) = prompt {
                 args.push(prompt);
             }
-            TerminalCommand::with_args("codex", args)
+            TerminalCommand::with_args(codex_program(), args)
+                .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
         }
     }
+}
+
+fn codex_program() -> String {
+    env::var("RUDDER_CODEX_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codex".to_string())
 }
 
 fn review_all_run(

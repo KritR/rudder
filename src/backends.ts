@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore, EffortLevel } from "./types.js";
+import { codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
 import { loadAuthStore, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import {
@@ -80,13 +81,17 @@ function codexBackend(): BackendAdapter {
   return {
     id: "codex",
     async verify() {
-      return commandExists("codex")
-        ? { ok: true, message: "codex found" }
-        : { ok: false, message: formatMissingToolMessage("codex") };
+      try {
+        const binary = await ensureRudderCodexBinary();
+        return { ok: true, message: `rudder-codex found at ${binary}` };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : String(error) };
+      }
     },
     async run(request, emit) {
       const prompt = stripRudderPromptWrappers(request.prompt);
-      const env = await backendEnv("openai");
+      const command = await ensureRudderCodexBinary();
+      const env = await codexLaunchEnv(await backendEnv("openai"));
       const effort = normalizeEffortForBackend("codex", request.run.effort);
       const args = compact([
         "exec",
@@ -107,7 +112,7 @@ function codexBackend(): BackendAdapter {
         `${request.contract}\n\n${prompt}`,
       ]);
       return await spawnAndStream({
-        command: "codex",
+        command,
         args,
         cwd: request.run.worktree.path,
         env,

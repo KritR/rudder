@@ -1,5 +1,5 @@
 node_modules/
-dist/
+cloud/dist/
 target/
 .rudder/
 .rudder-worktrees/

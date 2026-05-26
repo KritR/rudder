@@ -1,6 +1,6 @@
 import path from "node:path";
 import fsp from "node:fs/promises";
-import { ensureDir, newRunId, nowIso, readJson, rudderHome, shortHash, slugify, writeJson, } from "./util.js";
+import { ensureDir, newRunId, nowIso, readJson, rudderHome, shortHash, slugPrefix, slugify, writeJson, } from "./util.js";
 import { llmSummarizeTask, summarizeTask } from "./task-summary.js";
 export function globalConfigPath() {
     return path.join(rudderHome(), "config.json");
@@ -38,10 +38,15 @@ export function specPath(repoRoot, runId) {
 export function verifierPath(repoRoot, runId) {
     return path.join(runDir(repoRoot, runId), "verifier.json");
 }
-export function worktreePath(repoRoot, runId) {
+export function worktreePath(repoRoot, runId, task) {
     const parent = path.dirname(repoRoot);
     const repoName = `${slugify(path.basename(repoRoot), "repo")}-${shortHash(repoRoot)}`;
-    return path.join(parent, ".rudder-worktrees", repoName, runId);
+    return path.join(parent, ".rudder-worktrees", repoName, worktreeDirName(runId, task));
+}
+function worktreeDirName(runId, task) {
+    const slug = slugPrefix(task ?? runId, "task");
+    const suffix = shortHash(runId).slice(0, 8);
+    return `${slug}-${suffix}`;
 }
 export async function loadConfig() {
     const existing = await readJson(globalConfigPath());

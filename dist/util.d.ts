@@ -46,6 +46,7 @@ export declare function promptSelect<T extends string>(message: string, options:
     hint?: string;
 }>, defaultValue: T): Promise<T>;
 export declare function slugify(inputValue: string, fallback?: string): string;
+export declare function slugPrefix(inputValue: string, fallback?: string, maxChars?: number): string;
 export declare function newRunId(task: string): string;
 export declare function shortHash(value: string): string;
 export declare function shellQuote(value: string): string;

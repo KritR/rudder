@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createSpec, renderContract, verifyRun } from "./brain.js";
+import { ensureRudderCodexBinary } from "./codex-binary.js";
 import { getBackend } from "./backends.js";
 import { nativeAgentCommand } from "./native-agents.js";
 import { buildPlanPrompt, PLAN_MODE_CONTRACT } from "./plan-mode.js";
@@ -181,10 +182,12 @@ export async function startNativeRun(params) {
             data: spec,
         });
         const contract = renderContract(spec);
+        const codexCommand = backend === "codex" ? await ensureRudderCodexBinary() : undefined;
         const command = nativeAgentCommand({
             run,
             prompt: params.task,
             contract,
+            codexCommand,
         });
         await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
         const title = `${backend}:${shortRunTask(run)}`;
@@ -295,11 +298,13 @@ export async function startNativePlan(params) {
         if (!health.ok) {
             throw missingBackendError(backend, health.message);
         }
+        const codexCommand = backend === "codex" ? await ensureRudderCodexBinary() : undefined;
         const command = nativeAgentCommand({
             run,
             prompt: buildPlanPrompt(params.task),
             contract: PLAN_MODE_CONTRACT,
             mode: "plan",
+            codexCommand,
         });
         await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
         const title = `${backend}:plan:${shortRunTask(run)}`;
@@ -966,7 +971,8 @@ export async function reconcileNativeTerminals(repoRoot) {
             await saveRunRecord(run);
             await emit(run, { ts: nowIso(), runId: run.id, type: "steerer.prompt", message: "Automatic steering prompt sent", data: { prompt: steeringPrompt } });
             const spec = await createSpec(run);
-            const command = nativeAgentCommand({ run, prompt: steeringPrompt, contract: renderContract(spec) });
+            const codexCommand = run.backend === "codex" ? await ensureRudderCodexBinary() : undefined;
+            const command = nativeAgentCommand({ run, prompt: steeringPrompt, contract: renderContract(spec), codexCommand });
             await respawnPane({
                 paneId: run.terminal.paneId,
                 cwd: run.worktree.path,

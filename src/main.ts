@@ -3,9 +3,10 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
+import { codexEnvVars, codexLaunchEnv } from "./codex-binary.js";
 import { runCloudCommand } from "./cloud.js";
 import { findRepoRoot } from "./git.js";
-import { backfillLlmTaskSummaries } from "./state.js";
+import { backfillLlmTaskSummaries, projectStateDir, runsDir } from "./state.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
 import {
@@ -148,6 +149,11 @@ export async function main(): Promise<void> {
       return;
     case "dashboard":
       await maybeOnboard();
+      await openDashboard(parsed);
+      return;
+    case "restart":
+      await maybeOnboard();
+      await resetLocalRudderSession(parsed);
       await openDashboard(parsed);
       return;
     case "mouse-test":
@@ -572,7 +578,7 @@ async function runNativeDashboard(): Promise<boolean> {
     return false;
   }
   const update = await getUpdateAvailable().catch(() => null);
-  const env = { ...process.env };
+  const env = await codexLaunchEnv(process.env);
   if (update) {
     env.RUDDER_UPDATE_AVAILABLE = update.latest;
     env.RUDDER_UPDATE_CURRENT = update.current;
@@ -649,17 +655,40 @@ async function openTmuxDashboard(parsed: Parsed): Promise<void> {
     ...(parsed.flags.backend ? ["--backend", parsed.flags.backend] : []),
     ...(parsed.flags.model ? ["--model", parsed.flags.model] : []),
   ];
+  const managedCodexEnv = await codexEnvVars();
+  const withManagedCodex = (args: string[]) => shellCommand("env", [
+    `RUDDER_CODEX_BIN=${managedCodexEnv.RUDDER_CODEX_BIN}`,
+    `RUDDER_CODEX_VERSION=${managedCodexEnv.RUDDER_CODEX_VERSION}`,
+    `CODEX_RUDDER_SCROLLBACK_SAFE=${managedCodexEnv.CODEX_RUDDER_SCROLLBACK_SAFE}`,
+    ...args,
+  ]);
   await ensureTmuxDashboardSession({
     repoRoot,
     sessionName,
-    agentCommand: shellCommand(process.execPath, [...common, "__agents", ...commonFlags]),
-    workerCommand: shellCommand(process.execPath, [...common, "__worker-idle", ...commonFlags]),
-    taskCommand: shellCommand(process.execPath, [...common, "__task", ...commonFlags]),
+    agentCommand: withManagedCodex([process.execPath, ...common, "__agents", ...commonFlags]),
+    workerCommand: withManagedCodex([process.execPath, ...common, "__worker-idle", ...commonFlags]),
+    taskCommand: withManagedCodex([process.execPath, ...common, "__task", ...commonFlags]),
     backend: parsed.flags.backend === "codex" ? "codex" : "claude",
     model: parsed.flags.model,
   });
   const code = await attachTmuxSession(sessionName);
   process.exitCode = code;
+}
+
+async function resetLocalRudderSession(parsed: Parsed): Promise<void> {
+  const repoRoot = findRepoRoot();
+  const stateDir = projectStateDir(repoRoot);
+  await Promise.all([
+    fsp.rm(path.join(stateDir, "session.json"), { force: true }),
+    fsp.rm(runsDir(repoRoot), { recursive: true, force: true }),
+    fsp.rm(path.join(stateDir, "tmux"), { recursive: true, force: true }),
+  ]);
+  await fsp.mkdir(runsDir(repoRoot), { recursive: true });
+
+  if (hasTmux()) {
+    const sessionName = parsed.flags.tmuxSession ?? repoTmuxSessionName(repoRoot);
+    await runCommand("tmux", ["kill-session", "-t", sessionName], { allowFailure: true });
+  }
 }
 
 async function packageVersion(): Promise<string> {
@@ -678,6 +707,7 @@ function printHelp(): void {
 Usage:
   rudder                         Open native dashboard with real agent panes
   rudder tmux                    Open tmux dashboard with native agent panes
+  rudder restart                 Clear local session and open dashboard
   rudder tui                     Open legacy full-screen stream TUI
   rudder "task"
   rudder run [options] "task"

@@ -6,9 +6,9 @@ export function nativeAgentCommand(params) {
     const mode = params.mode ?? params.run.mode ?? "execute";
     const prompt = stripRudderPromptWrappers(params.prompt);
     const args = mode === "plan"
-        ? planArgs(params.run, prompt)
+        ? planArgs(params.run, prompt, params.codexCommand)
         : params.run.backend === "codex"
-            ? codexArgs(params.run, prompt, params.contract)
+            ? codexArgs(params.run, prompt, params.contract, params.codexCommand)
             : claudeArgs(params.run, prompt, params.contract);
     return args.map(shellQuote).join(" ");
 }
@@ -36,11 +36,13 @@ function claudeArgs(run, prompt, contract) {
         prompt,
     ]);
 }
-function codexArgs(run, prompt, contract) {
+function codexArgs(run, prompt, contract, codexCommand = "codex") {
     const model = run.model || "gpt-5.5";
     const effort = normalizeEffortForBackend("codex", run.effort);
     return [
-        "codex",
+        "env",
+        "CODEX_RUDDER_SCROLLBACK_SAFE=1",
+        codexCommand,
         "--no-alt-screen",
         "--model",
         model,
@@ -58,9 +60,9 @@ function codexArgs(run, prompt, contract) {
         [contract, "", prompt].join("\n"),
     ].filter((value) => Boolean(value));
 }
-function planArgs(run, prompt) {
+function planArgs(run, prompt, codexCommand) {
     return run.backend === "codex"
-        ? codexPlanArgs(run, prompt)
+        ? codexPlanArgs(run, prompt, codexCommand)
         : claudePlanArgs(run, prompt);
 }
 function claudePlanArgs(run, prompt) {
@@ -89,11 +91,13 @@ function claudePlanArgs(run, prompt) {
         prompt,
     ]);
 }
-function codexPlanArgs(run, prompt) {
+function codexPlanArgs(run, prompt, codexCommand = "codex") {
     const model = run.model || "gpt-5.5";
     const effort = normalizeEffortForBackend("codex", run.effort);
     return compact([
-        "codex",
+        "env",
+        "CODEX_RUDDER_SCROLLBACK_SAFE=1",
+        codexCommand,
         "--no-alt-screen",
         "--model",
         model,

@@ -58,7 +58,7 @@ rudder doctor
 rudder onboard
 ```
 
-Onboarding checks for `claude`, `codex`, git, auth files, env vars, and acpx.
+Onboarding checks for `claude`, Codex auth, git, auth files, env vars, and acpx.
 It uses the auth you already have whenever possible:
 
 - Claude Code auth from macOS Keychain or `~/.claude/.credentials.json`
@@ -387,6 +387,7 @@ through suggestions and `Enter` to choose one.
 | Command | Action |
 | --- | --- |
 | `/model` | Open the provider-first model picker: choose Claude or Codex, then model, then effort when supported |
+| `/main` or `/m` | Start or focus the main-branch agent pane |
 | `/plan` | Toggle Rudder's read-only plan mode for task pane submissions |
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/rudder-plan <task>` | Start a planning coordinator that decomposes the task and spawns worker agents |
@@ -438,7 +439,9 @@ model cache.
 
 ## Agent Launch
 
-Native dashboard workers launch the official CLIs directly.
+Native dashboard workers launch Claude Code directly and launch Codex through
+Rudder's pinned `rudder-codex` fork. Set `RUDDER_CODEX_BIN` to test another
+Codex-compatible binary explicitly.
 
 Claude Code:
 
@@ -452,7 +455,7 @@ CLAUDE_CODE_NO_FLICKER=0 claude \
 Codex:
 
 ```bash
-codex --no-alt-screen \
+CODEX_RUDDER_SCROLLBACK_SAFE=1 rudder-codex --no-alt-screen \
   --dangerously-bypass-approvals-and-sandbox \
   -c model_reasoning_summary="detailed" \
   -c model_supports_reasoning_summaries=true \
