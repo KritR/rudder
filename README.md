@@ -387,7 +387,7 @@ through suggestions and `Enter` to choose one.
 | Command | Action |
 | --- | --- |
 | `/model` | Open the provider-first model picker: choose Claude or Codex, then model, then effort when supported |
-| `/main` or `/m` | Start or focus the main-branch agent pane |
+| `/main` or `/m` | Start a new main-branch agent pane |
 | `/plan` | Toggle Rudder's read-only plan mode for task pane submissions |
 | `/plan <task>` | Start one read-only planning session without toggling plan mode |
 | `/rudder-plan <task>` | Start a planning coordinator that decomposes the task and spawns worker agents |

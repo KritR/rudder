@@ -403,7 +403,7 @@ struct TaskSummaryResult {
 
 impl AgentRun {
     fn is_main(&self) -> bool {
-        self.id == MAIN_AGENT_ID
+        self.mode == AgentMode::Main || self.id == MAIN_AGENT_ID
     }
 }
 
@@ -597,6 +597,14 @@ impl App {
             .get(self.selected_agent)
             .map(|run| run.is_main())
             .unwrap_or(false)
+    }
+
+    fn selected_main_index(&self) -> Option<usize> {
+        if self.selected_is_main() {
+            Some(self.selected_agent)
+        } else {
+            self.agents.iter().position(|run| run.is_main())
+        }
     }
 
     fn set_model_defaults(
@@ -1267,7 +1275,8 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /plan, /rudder-plan, /model, /main, /goal, /usage, or /cloud".to_string(),
+                    "type /plan, /rudder-plan, /model, /main|/m, /goal, /usage, or /cloud"
+                        .to_string(),
                 );
             }
             KeyCode::Char(ch) => {
@@ -1386,7 +1395,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 let mut should_spawn_main = false;
-                if let Some(main_index) = self.agents.iter().position(|run| run.is_main()) {
+                if let Some(main_index) = self.selected_main_index() {
                     let cwd = self.cwd.clone();
                     let run = &mut self.agents[main_index];
                     run.backend = backend;
@@ -1870,7 +1879,6 @@ impl App {
     fn scroll_selected_worker_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let mouse_bytes = mouse_event_to_sgr(mouse, area);
-        let backend = self.agents.get(self.selected_agent).map(|run| run.backend);
         let Some(terminal) = self.selected_terminal_mut() else {
             self.set_mouse_debug(format!(
                 "mouse {:?} @{},{} pane=worker route=no-terminal",
@@ -1892,15 +1900,6 @@ impl App {
         };
         if !moved && rows != 0 && wants_mouse {
             if let Some(bytes) = mouse_bytes {
-                if let Err(error) = terminal.write_input(&bytes) {
-                    write_error = Some(error.to_string());
-                } else {
-                    forwarded = true;
-                }
-            }
-        }
-        if !moved && rows != 0 && !forwarded && backend == Some(Backend::Codex) {
-            if let Some(bytes) = scroll_key_bytes(mouse.kind) {
                 if let Err(error) = terminal.write_input(&bytes) {
                     write_error = Some(error.to_string());
                 } else {
@@ -2584,7 +2583,7 @@ impl App {
     }
 
     fn focus_or_spawn_main_with_prompt(&mut self, override_prompt: &str) {
-        let main_index = match self.agents.iter().position(|run| run.is_main()) {
+        let main_index = match self.selected_main_index() {
             Some(idx) => idx,
             None => {
                 self.notice = Some("no main agent".to_string());
@@ -2672,6 +2671,7 @@ impl App {
                 run.last_error = None;
                 if !bootstrap.is_empty() {
                     let now = now_stamp();
+                    run.current_prompt = bootstrap.clone();
                     run.turns.push(AgentTurn {
                         ts: now.clone(),
                         prompt: bootstrap.clone(),
@@ -2688,6 +2688,7 @@ impl App {
                 run.status = AgentStatus::Failed;
                 run.last_error = Some(error.to_string());
                 self.notice = Some(format!("main launch failed: {error}"));
+                let _ = save_native_run_record(&self.cwd, run);
             }
         }
     }
@@ -2841,7 +2842,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  /plan  /rudder-plan  /model  /main  /goal"
+                    "Tab focus  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /goal"
                         .to_string(),
                 );
                 true
@@ -2872,13 +2873,14 @@ impl App {
                 self.start_rudder_cli_command(&label, args);
                 true
             }
-            Some("/main") => {
-                // Everything after "/main " is the user's prompt. If empty,
+            Some("/main") | Some("/m") => {
+                // Everything after "/main " or "/m " is the user's prompt. If empty,
                 // we use the default RUDDER.md bootstrap. The model must be
                 // set ahead of time via /model.
-                let prompt = input
-                    .trim_start()
+                let trimmed = input.trim_start();
+                let prompt = trimmed
                     .strip_prefix("/main")
+                    .or_else(|| trimmed.strip_prefix("/m"))
                     .map(|rest| rest.trim().to_string())
                     .unwrap_or_default();
                 self.handle_main_command(&prompt);
@@ -2905,30 +2907,19 @@ impl App {
         }
     }
 
-    /// Build or focus the main agent.
-    ///   /main                  spawn with the default RUDDER.md bootstrap
-    ///   /main <anything>       spawn with <anything> as the first prompt
+    /// Start a new main agent.
+    ///   /main or /m                  spawn with the default RUDDER.md bootstrap
+    ///   /main <anything> or /m ...   spawn with <anything> as the first prompt
     /// Model is whatever the user has set via /model (or their CLI default);
     /// to change it, run /model first.
     fn handle_main_command(&mut self, prompt: &str) {
         let cwd = self.cwd.clone();
-        let mut main_index = self.agents.iter().position(|a| a.is_main());
-        if main_index.is_none() {
-            ensure_main_agent(
-                &mut self.agents,
-                &cwd,
-                self.backend,
-                &self.model,
-                self.effort,
-            );
-            main_index = self.agents.iter().position(|a| a.is_main());
+        let run = create_main_agent(&cwd, self.backend, &self.model, self.effort, prompt.trim());
+        self.agents.insert(0, run);
+        self.selected_agent = 0;
+        if let Some(run) = self.agents.first() {
+            let _ = save_native_run_record(&cwd, run);
         }
-        let Some(idx) = main_index else {
-            self.notice = Some("failed to create main agent".to_string());
-            return;
-        };
-        let _ = save_native_run_record(&cwd, &self.agents[idx]);
-        self.selected_agent = idx;
         self.task_input.clear();
         self.task_cursor = 0;
         self.focus_or_spawn_main_with_prompt(prompt.trim());
@@ -5077,7 +5068,7 @@ branch refs/heads/main\n";
 
     #[cfg(not(windows))]
     #[test]
-    fn codex_worker_wheel_falls_back_to_page_keys_without_mouse_capture() {
+    fn codex_worker_wheel_at_edge_does_not_send_page_keys() {
         let command = TerminalCommand::with_args(
             "/bin/sh",
             ["-lc", "stty raw -echo; printf 'ready\\r\\n'; cat -v"],
@@ -5124,7 +5115,11 @@ branch refs/heads/main\n";
             .selected_terminal_mut()
             .map(|terminal| terminal.visible_lines().join("\n"))
             .unwrap_or_default();
-        assert!(output.contains("^[[5~"), "output was {output:?}");
+        assert!(output.contains("ready"), "output was {output:?}");
+        assert!(!output.contains("^[[5~"), "output was {output:?}");
+        assert!(app
+            .selected_terminal_mut()
+            .is_some_and(|terminal| terminal.scrollback() == 0));
     }
 
     #[cfg(not(windows))]
@@ -6784,31 +6779,27 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn ensure_main_agent_inserts_main_at_index_zero() {
-        let mut agents = vec![test_agent_run("run-a", "a task")];
-        ensure_main_agent(
-            &mut agents,
+    fn create_main_agent_returns_distinct_main_runs() {
+        let first = create_main_agent(
             std::env::temp_dir().as_path(),
             Backend::Claude,
             "sonnet",
             None,
+            "",
         );
-        assert!(agents[0].is_main());
-        assert_eq!(agents[0].id, MAIN_AGENT_ID);
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[1].id, "run-a");
-
-        // Re-running keeps a single main pinned at index 0.
-        ensure_main_agent(
-            &mut agents,
+        let second = create_main_agent(
             std::env::temp_dir().as_path(),
             Backend::Claude,
             "sonnet",
             None,
+            "inspect the CLI",
         );
-        assert!(agents[0].is_main());
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[1].id, "run-a");
+        assert!(first.is_main());
+        assert!(second.is_main());
+        assert_ne!(first.id, MAIN_AGENT_ID);
+        assert_ne!(second.id, MAIN_AGENT_ID);
+        assert_ne!(first.id, second.id);
+        assert!(second.task_summary.contains("inspect"));
     }
 
     #[test]
@@ -7244,14 +7235,14 @@ fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Agents;
     let diff_summaries: Vec<Option<String>> = {
-        let keys: Vec<(String, PathBuf)> = app
+        let keys: Vec<(String, PathBuf, bool)> = app
             .agents
             .iter()
-            .map(|a| (a.id.clone(), a.cwd.clone()))
+            .map(|a| (a.id.clone(), a.cwd.clone(), a.is_main()))
             .collect();
         keys.iter()
-            .map(|(id, cwd)| {
-                if id == MAIN_AGENT_ID {
+            .map(|(id, cwd, is_main)| {
+                if *is_main {
                     None
                 } else {
                     app.cached_diff_summary(id, cwd)
@@ -7452,7 +7443,7 @@ fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             lines.push(ListItem::new(Line::default()));
         }
         lines.push(ListItem::new(Line::from(Span::styled(
-            "agents",
+            "worktrees",
             muted_style(focused),
         ))));
     }
@@ -8339,15 +8330,6 @@ fn wheel_scroll_rows(viewport_height: u16, modifiers: KeyModifiers) -> u16 {
     }
 
     wheel_scroll_rows_setting().min(page).max(1)
-}
-
-fn scroll_key_bytes(kind: MouseEventKind) -> Option<Vec<u8>> {
-    match kind {
-        MouseEventKind::ScrollUp => Some(b"\x1b[5~".to_vec()),
-        MouseEventKind::ScrollDown => Some(b"\x1b[6~".to_vec()),
-        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
-        _ => None,
-    }
 }
 
 fn wheel_scroll_rows_setting() -> u16 {
@@ -10175,9 +10157,19 @@ fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/main".to_string()),
         },
         Suggestion {
+            label: "/m".to_string(),
+            detail: "alias for /main".to_string(),
+            action: SuggestionAction::RunCommand("/m".to_string()),
+        },
+        Suggestion {
             label: "/main <prompt>".to_string(),
             detail: "main-branch agent with a custom first prompt".to_string(),
             action: SuggestionAction::Insert("/main ".to_string()),
+        },
+        Suggestion {
+            label: "/m <prompt>".to_string(),
+            detail: "alias for /main <prompt>".to_string(),
+            action: SuggestionAction::Insert("/m ".to_string()),
         },
         Suggestion {
             label: "/goal <text>".to_string(),
@@ -11778,33 +11770,31 @@ fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
     out
 }
 
-fn ensure_main_agent(
-    agents: &mut Vec<AgentRun>,
+fn create_main_agent(
     repo_root: &Path,
     backend: Backend,
     model: &str,
     effort: Option<EffortLevel>,
-) {
-    let branch_summary = current_branch_at(repo_root).unwrap_or_else(|| "HEAD".to_string());
-    if let Some(existing_index) = agents.iter().position(|a| a.id == MAIN_AGENT_ID) {
-        let mut existing = agents.remove(existing_index);
-        existing.task_summary = branch_summary;
-        existing.cwd = repo_root.to_path_buf();
-        existing.worktree_branch = None;
-        existing.worktree_path = None;
-        existing.mode = AgentMode::Main;
-        agents.insert(0, existing);
-        return;
-    }
-
+    prompt: &str,
+) -> AgentRun {
+    let branch = current_branch_at(repo_root).unwrap_or_else(|| "HEAD".to_string());
+    let task_summary = if prompt.trim().is_empty() {
+        branch
+    } else {
+        truncate_chars(&format!("{branch}: {}", summarize_task(prompt)), 56)
+    };
     let now = now_stamp();
-    let main = AgentRun {
-        id: MAIN_AGENT_ID.to_string(),
+    AgentRun {
+        id: new_run_id("main branch"),
         created_at: now.clone(),
         mode: AgentMode::Main,
-        task: "main branch".to_string(),
-        task_summary: branch_summary,
-        current_prompt: String::new(),
+        task: if prompt.trim().is_empty() {
+            "main branch".to_string()
+        } else {
+            prompt.trim().to_string()
+        },
+        task_summary,
+        current_prompt: prompt.trim().to_string(),
         turns: Vec::new(),
         last_user_input_at: now,
         backend,
@@ -11833,8 +11823,7 @@ fn ensure_main_agent(
         worker_input_is_prompt: false,
         last_drain_at: None,
         review_source_ids: Vec::new(),
-    };
-    agents.insert(0, main);
+    }
 }
 
 fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
@@ -12545,11 +12534,11 @@ fn ensure_gitignore_contains(repo_root: &Path, line: &str) -> Result<()> {
 }
 
 fn new_run_id(task: &str) -> String {
-    let millis = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    format!("{millis}-{}-{}", slugify(task, "task"), std::process::id())
+        .as_nanos();
+    format!("{nanos}-{}-{}", slugify(task, "task"), std::process::id())
 }
 
 fn now_stamp() -> String {

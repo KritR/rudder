@@ -115,9 +115,6 @@ pub struct TerminalPane {
     alternate_history: Vec<Vec<String>>,
     alternate_history_offset: usize,
     last_alternate_snapshot: Vec<String>,
-    normal_history: Vec<Vec<String>>,
-    normal_history_offset: usize,
-    last_normal_snapshot: Vec<String>,
     alternate_history_limit: usize,
     styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
     output_log: String,
@@ -214,9 +211,6 @@ impl TerminalPane {
             alternate_history: Vec::new(),
             alternate_history_offset: 0,
             last_alternate_snapshot: Vec::new(),
-            normal_history: Vec::new(),
-            normal_history_offset: 0,
-            last_normal_snapshot: Vec::new(),
             alternate_history_limit: options.scrollback_lines.max(DEFAULT_ROWS as usize),
             styled_lines_cache: None,
             output_log: String::new(),
@@ -270,9 +264,6 @@ impl TerminalPane {
         self.parser.screen_mut().set_size(size.rows, size.cols);
         self.size = size;
         self.last_alternate_snapshot.clear();
-        self.last_normal_snapshot.clear();
-        self.normal_history.clear();
-        self.normal_history_offset = 0;
         self.invalidate_render_cache();
         Ok(())
     }
@@ -287,7 +278,6 @@ impl TerminalPane {
             self.parser.process(&chunk);
             self.append_output_log(&chunk);
             self.capture_alternate_snapshot();
-            self.capture_normal_snapshot();
             drained.extend_from_slice(&chunk);
         }
         if !drained.is_empty() {
@@ -309,9 +299,6 @@ impl TerminalPane {
 
     pub fn visible_lines_snapshot(&self) -> Vec<String> {
         if let Some(snapshot) = self.alternate_history_snapshot() {
-            return snapshot.clone();
-        }
-        if let Some(snapshot) = self.normal_history_snapshot() {
             return snapshot.clone();
         }
 
@@ -340,16 +327,6 @@ impl TerminalPane {
 
     fn compute_styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
         if let Some(snapshot) = self.alternate_history_snapshot() {
-            return snapshot
-                .iter()
-                .map(|line| {
-                    line.chars()
-                        .map(|ch| StyledTerminalCell::plain(ch.to_string()))
-                        .collect()
-                })
-                .collect();
-        }
-        if let Some(snapshot) = self.normal_history_snapshot() {
             return snapshot
                 .iter()
                 .map(|line| {
@@ -409,11 +386,7 @@ impl TerminalPane {
         if self.parser.screen().alternate_screen() {
             return self.alternate_history_offset;
         }
-        let parser_scrollback = self.parser.screen().scrollback();
-        if parser_scrollback != 0 {
-            return parser_scrollback;
-        }
-        self.normal_history_offset
+        self.parser.screen().scrollback()
     }
 
     pub fn wants_sgr_mouse_events(&mut self) -> bool {
@@ -446,41 +419,23 @@ impl TerminalPane {
             return;
         }
 
-        let current = self.parser.screen().scrollback();
+        let before = self.parser.screen().scrollback();
         let next = if rows.is_negative() {
-            current.saturating_sub(rows.unsigned_abs())
+            before.saturating_sub(rows.unsigned_abs())
         } else {
-            current.saturating_add(rows as usize)
+            before.saturating_add(rows as usize)
         };
-        if next != current {
+        if next != before {
             self.parser.screen_mut().set_scrollback(next);
-            if self.parser.screen().scrollback() != current {
-                self.invalidate_render_cache();
-                return;
-            }
         }
-
-        let max_offset = self.normal_history.len().saturating_sub(1);
-        let before = self.normal_history_offset;
-        self.normal_history_offset = if rows.is_negative() {
-            self.normal_history_offset
-                .saturating_sub(rows.unsigned_abs())
-        } else {
-            self.normal_history_offset.saturating_add(rows as usize)
-        }
-        .min(max_offset);
-        if self.normal_history_offset != before {
+        if self.parser.screen().scrollback() != before {
             self.invalidate_render_cache();
         }
     }
 
     pub fn reset_scrollback(&mut self) {
-        if self.alternate_history_offset != 0
-            || self.normal_history_offset != 0
-            || self.parser.screen().scrollback() != 0
-        {
+        if self.alternate_history_offset != 0 || self.parser.screen().scrollback() != 0 {
             self.alternate_history_offset = 0;
-            self.normal_history_offset = 0;
             self.parser.screen_mut().set_scrollback(0);
             self.invalidate_render_cache();
         }
@@ -543,29 +498,6 @@ impl TerminalPane {
         }
     }
 
-    fn capture_normal_snapshot(&mut self) {
-        if self.parser.screen().alternate_screen() {
-            self.normal_history_offset = 0;
-            self.last_normal_snapshot.clear();
-            return;
-        }
-
-        let snapshot = self.current_visible_lines_snapshot();
-        if snapshot == self.last_normal_snapshot {
-            return;
-        }
-
-        self.last_normal_snapshot = snapshot.clone();
-        self.normal_history.push(snapshot);
-        self.invalidate_render_cache();
-        if self.normal_history.len() > self.alternate_history_limit {
-            let overflow = self.normal_history.len() - self.alternate_history_limit;
-            self.normal_history.drain(0..overflow);
-            self.normal_history_offset = self.normal_history_offset.saturating_sub(overflow);
-            self.invalidate_render_cache();
-        }
-    }
-
     fn alternate_history_snapshot(&self) -> Option<&Vec<String>> {
         if !self.parser.screen().alternate_screen() || self.alternate_history_offset == 0 {
             return None;
@@ -575,17 +507,6 @@ impl TerminalPane {
             .len()
             .checked_sub(1 + self.alternate_history_offset)?;
         self.alternate_history.get(index)
-    }
-
-    fn normal_history_snapshot(&self) -> Option<&Vec<String>> {
-        if self.parser.screen().alternate_screen() || self.normal_history_offset == 0 {
-            return None;
-        }
-        let index = self
-            .normal_history
-            .len()
-            .checked_sub(1 + self.normal_history_offset)?;
-        self.normal_history.get(index)
     }
 
     fn invalidate_render_cache(&mut self) {
