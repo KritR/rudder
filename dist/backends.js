@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
+import { CODEX_RUDDER_CONFIG_ARGS, codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
 import { loadAuthStore, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import { commandExists, formatMissingToolMessage, isMissingToolSpawnError, lineSplitBuffer, MissingToolError, nowIso, parseJsonLine, runCommand, } from "./util.js";
@@ -91,12 +91,9 @@ function codexBackend() {
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--enable",
                 "goals",
+                ...CODEX_RUDDER_CONFIG_ARGS,
                 effort ? "-c" : undefined,
                 effort ? `model_reasoning_effort="${effort}"` : undefined,
-                "-c",
-                'model_reasoning_summary="detailed"',
-                "-c",
-                "model_supports_reasoning_summaries=true",
                 `${request.contract}\n\n${prompt}`,
             ]);
             return await spawnAndStream({

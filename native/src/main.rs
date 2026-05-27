@@ -79,24 +79,6 @@ enum WorkerView {
     Diff,
 }
 
-impl FocusPane {
-    fn next(self) -> Self {
-        match self {
-            Self::Agents => Self::Worker,
-            Self::Worker => Self::Task,
-            Self::Task => Self::Agents,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Agents => Self::Task,
-            Self::Worker => Self::Agents,
-            Self::Task => Self::Worker,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
     Claude,
@@ -711,20 +693,6 @@ impl App {
             }
         }
 
-        match key.code {
-            KeyCode::Tab => {
-                self.delete_pending = None;
-                self.focus = self.focus.next();
-                return false;
-            }
-            KeyCode::BackTab => {
-                self.delete_pending = None;
-                self.focus = self.focus.previous();
-                return false;
-            }
-            _ => {}
-        }
-
         match self.focus {
             FocusPane::Agents => self.handle_agents_key(key),
             FocusPane::Worker => self.handle_worker_key(key),
@@ -738,14 +706,6 @@ impl App {
                 self.nav_mode = false;
                 self.delete_pending = None;
                 self.notice = Some("worker input restored".to_string());
-            }
-            KeyCode::Tab => {
-                self.delete_pending = None;
-                self.focus = self.focus.next();
-            }
-            KeyCode::BackTab => {
-                self.delete_pending = None;
-                self.focus = self.focus.previous();
             }
             KeyCode::Char('1') => {
                 self.delete_pending = None;
@@ -1424,7 +1384,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  wheel scrolls worker  R review all  M merge all"
+                    "Option-1/2/3 pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
                         .to_string(),
                 );
             }
@@ -2843,7 +2803,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Tab focus  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /goal"
+                    "Option-1/2/3 pane  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /goal"
                         .to_string(),
                 );
                 true
@@ -2915,7 +2875,9 @@ impl App {
     /// to change it, run /model first.
     fn handle_main_command(&mut self, prompt: &str) {
         let cwd = self.cwd.clone();
-        let run = create_main_agent(&cwd, self.backend, &self.model, self.effort, prompt.trim());
+        let trimmed_prompt = prompt.trim();
+        let run = create_main_agent(&cwd, self.backend, &self.model, self.effort, trimmed_prompt);
+        let run_id = run.id.clone();
         self.agents.insert(0, run);
         self.selected_agent = 0;
         if let Some(run) = self.agents.first() {
@@ -2923,7 +2885,14 @@ impl App {
         }
         self.task_input.clear();
         self.task_cursor = 0;
-        self.focus_or_spawn_main_with_prompt(prompt.trim());
+        self.focus_or_spawn_main_with_prompt(trimmed_prompt);
+        if !trimmed_prompt.is_empty() {
+            spawn_task_summary_worker(
+                self.task_summary_tx.clone(),
+                run_id,
+                trimmed_prompt.to_string(),
+            );
+        }
     }
 
     /// Show a one-line summary of token usage and estimated cost for the
@@ -4154,7 +4123,7 @@ What to do\n\
             let Some(run) = self.agents.iter_mut().find(|run| run.id == result.run_id) else {
                 continue;
             };
-            if run.is_main() || !matches!(run.mode, AgentMode::Execute) {
+            if !matches!(run.mode, AgentMode::Execute | AgentMode::Main) {
                 continue;
             }
             if run.task_summary == title {
@@ -5681,6 +5650,26 @@ branch refs/heads/main\n";
             terminal_bytes_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
             Some(b"\x1b[13;2u".to_vec())
         );
+        assert_eq!(
+            terminal_bytes_for_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
+            Some(b"\t".to_vec())
+        );
+        assert_eq!(
+            terminal_bytes_for_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn tab_does_not_cycle_pane_focus() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())));
+        assert_eq!(app.focus, FocusPane::Task);
+
+        app.focus = FocusPane::Agents;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert_eq!(app.focus, FocusPane::Agents);
     }
 
     #[test]
@@ -5724,6 +5713,10 @@ branch refs/heads/main\n";
             .windows(2)
             .any(|window| window[0] == "--enable" && window[1] == "goals"));
         assert!(execute_codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
+        assert!(execute_codex
             .env
             .iter()
             .any(|(key, value)| key == "CODEX_RUDDER_SCROLLBACK_SAFE" && value == "1"));
@@ -5760,6 +5753,10 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "--enable" && window[1] == "goals"));
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
         assert!(!codex
             .args
             .iter()
@@ -5813,6 +5810,10 @@ branch refs/heads/main\n";
                 && arg.contains("build the feature")
                 && arg.contains("Codex `/goal`")
         }));
+        assert!(rudder_plan
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
     }
 
     #[test]
@@ -6543,6 +6544,10 @@ branch refs/heads/main\n";
             .any(|window| window[0] == "--enable" && window[1] == "goals"));
         assert!(codex_command
             .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
+        assert!(codex_command
+            .args
             .iter()
             .any(|arg| arg == "019e297b-12fe-79e2-a8f8-33ba41e5fdd4"));
     }
@@ -6867,6 +6872,46 @@ branch refs/heads/main\n";
         assert_ne!(second.id, MAIN_AGENT_ID);
         assert_ne!(first.id, second.id);
         assert!(second.task_summary.contains("inspect"));
+        assert!(!second.task_summary.contains(':'));
+    }
+
+    #[test]
+    fn task_summary_worker_updates_main_agent_label() {
+        let repo_root = std::env::temp_dir().join(format!(
+            "rudder-main-summary-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo_root).expect("create test repo root");
+
+        let mut app = App::new();
+        app.cwd = repo_root.clone();
+        let main = create_main_agent(
+            &repo_root,
+            Backend::Claude,
+            "sonnet",
+            None,
+            "make sure the main chat agent pane label is summarized",
+        );
+        let run_id = main.id.clone();
+        app.agents.push(main);
+
+        app.task_summary_tx
+            .send(TaskSummaryResult {
+                run_id,
+                title: Some("Summarize Main Chat Labels".to_string()),
+            })
+            .expect("send task summary result");
+        app.poll_task_summary_workers();
+
+        assert_eq!(
+            app.agents[0].task_summary,
+            "Summarize Main Chat Labels".to_string()
+        );
+        let _ = fs::remove_dir_all(repo_root);
     }
 
     #[test]
@@ -7805,9 +7850,9 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off"
+        "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /rudder-plan"
+        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -7906,9 +7951,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off"
+        "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /rudder-plan"
+        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -8534,9 +8579,9 @@ fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> us
 
 fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Tab focus  Option-1/2/3 pane  /plan off"
+        "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Tab focus  Option-1/2/3 pane  /plan  /rudder-plan"
+        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
@@ -10573,14 +10618,7 @@ fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
             args.push("--search".to_string());
         }
     }
-    args.push("-c".to_string());
-    args.push("model_reasoning_summary=\"detailed\"".to_string());
-    args.push("-c".to_string());
-    args.push("model_supports_reasoning_summaries=true".to_string());
-    if let Some(effort) = run.effort {
-        args.push("-c".to_string());
-        args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
-    }
+    push_codex_rudder_config_overrides(&mut args, run.effort);
     if !run.model.trim().is_empty() {
         args.push("-m".to_string());
         args.push(run.model.clone());
@@ -10658,14 +10696,7 @@ fn agent_command(
                     args.push("--search".to_string());
                 }
             }
-            args.push("-c".to_string());
-            args.push("model_reasoning_summary=\"detailed\"".to_string());
-            args.push("-c".to_string());
-            args.push("model_supports_reasoning_summaries=true".to_string());
-            if let Some(effort) = effort {
-                args.push("-c".to_string());
-                args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
-            }
+            push_codex_rudder_config_overrides(&mut args, effort);
             if !model.trim().is_empty() {
                 args.push("-m".to_string());
                 args.push(model.to_string());
@@ -10676,6 +10707,21 @@ fn agent_command(
             TerminalCommand::with_args(codex_program(), args)
                 .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
         }
+    }
+}
+
+fn push_codex_rudder_config_overrides(args: &mut Vec<String>, effort: Option<EffortLevel>) {
+    // Rudder workers run Codex as a child process, so do not inherit desktop-app
+    // notification hooks that expect the official signed app launch chain.
+    args.push("-c".to_string());
+    args.push("notify=[]".to_string());
+    args.push("-c".to_string());
+    args.push("model_reasoning_summary=\"detailed\"".to_string());
+    args.push("-c".to_string());
+    args.push("model_supports_reasoning_summaries=true".to_string());
+    if let Some(effort) = effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
     }
 }
 
@@ -11637,6 +11683,8 @@ fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[13;2u".to_vec(),
         KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => {
             if key
                 .modifiers
@@ -11845,7 +11893,7 @@ fn create_main_agent(
     let task_summary = if prompt.trim().is_empty() {
         branch
     } else {
-        truncate_chars(&format!("{branch}: {}", summarize_task(prompt)), 56)
+        summarize_task(prompt)
     };
     let now = now_stamp();
     AgentRun {

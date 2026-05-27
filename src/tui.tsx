@@ -517,19 +517,33 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       app.exit();
       return;
     }
-    if (key.tab || value === "\t") {
-      const next = nextFocusPane(focusPane);
-      setFocusPane(next);
+    if ((key.meta && value === "1") || value === "\u001b1") {
+      setFocusPane("agents");
       setModelMenuOpen(false);
       setInput("");
-      if (next === "worker" && selectedRun) {
+      setNotice("Agents focus: j/k or arrows select runs");
+      return;
+    }
+    if ((key.meta && value === "2") || value === "\u001b2") {
+      setFocusPane("worker");
+      setModelMenuOpen(false);
+      setInput("");
+      if (selectedRun) {
         setNotice(`${isActive(selectedRun.status) ? "Worker focus: type redirect, Enter interrupts" : "Worker focus: type follow-up"} ${shortId(selectedRun.id)}`);
-      } else if (next === "agents") {
-        setNotice("Agents focus: j/k or arrows select runs");
       } else {
-        setTargetRunId(undefined);
-        setNotice("Task focus: type a new task");
+        setNotice("No agent selected");
       }
+      return;
+    }
+    if ((key.meta && value === "3") || value === "\u001b3") {
+      setFocusPane("task");
+      setModelMenuOpen(false);
+      setInput("");
+      setTargetRunId(undefined);
+      setNotice("Task focus: type a new task");
+      return;
+    }
+    if (key.tab || value === "\t") {
       return;
     }
     if (mergePrompt) {
@@ -918,7 +932,7 @@ function WorkerComposer(props: { run: UiRun; input: string; submitting: boolean;
         </Text>
         <Text color="gray">{active ? "running" : "resumable"}</Text>
       </Box>
-      <Text color="gray">{fitLine(`${helper}. Tab changes pane, Esc returns to task.`, props.width)}</Text>
+      <Text color="gray">{fitLine(`${helper}. Option-1/2/3 changes pane, Esc returns to task.`, props.width)}</Text>
     </Box>
   );
 }
@@ -927,7 +941,7 @@ function Help(): React.ReactElement {
   return (
     <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
       <Text bold color="yellow">keys</Text>
-      <Text><Text color="cyan">Tab</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">j/k</Text> select run</Text>
+      <Text><Text color="cyan">Option-1/2/3</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">j/k</Text> select run</Text>
       <Text><Text color="cyan">worker focus</Text> type to selected agent; running agents are interrupted on Enter   <Text color="cyan">n</Text> new task   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
       <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">dd</Text> delete   <Text color="cyan">y</Text> copy transcript   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
       <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit</Text>
@@ -992,7 +1006,7 @@ function CommandMenu(props: { options: CommandOption[]; selectedIndex: number; w
           </Text>
         );
       })}
-      <Text color="gray">{fitLine("Enter completes/runs selected command, arrows move, Tab changes pane focus.", contentWidth)}</Text>
+      <Text color="gray">{fitLine("Enter completes/runs selected command, arrows move, Option-1/2/3 changes pane focus.", contentWidth)}</Text>
     </Box>
   );
 }
@@ -1078,7 +1092,7 @@ function StatusDock(props: { notice: string }): React.ReactElement {
 function Footer(props: { focusPane: FocusPane }): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">focus:{props.focusPane}  Tab focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help</Text>
+      <Text color="gray">focus:{props.focusPane}  Opt-1/2/3 focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help</Text>
     </Box>
   );
 }
@@ -1271,16 +1285,6 @@ function selectRelative(
   const index = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
   const next = Math.min(runs.length - 1, Math.max(0, index + delta));
   setSelectedRunId(runs[next]?.id);
-}
-
-function nextFocusPane(current: FocusPane): FocusPane {
-  if (current === "agents") {
-    return "worker";
-  }
-  if (current === "worker") {
-    return "task";
-  }
-  return "agents";
 }
 
 function chooseBackend(

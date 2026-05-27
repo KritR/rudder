@@ -453,21 +453,34 @@ function RudderTui({ defaults }) {
             app.exit();
             return;
         }
-        if (key.tab || value === "\t") {
-            const next = nextFocusPane(focusPane);
-            setFocusPane(next);
+        if ((key.meta && value === "1") || value === "\u001b1") {
+            setFocusPane("agents");
             setModelMenuOpen(false);
             setInput("");
-            if (next === "worker" && selectedRun) {
+            setNotice("Agents focus: j/k or arrows select runs");
+            return;
+        }
+        if ((key.meta && value === "2") || value === "\u001b2") {
+            setFocusPane("worker");
+            setModelMenuOpen(false);
+            setInput("");
+            if (selectedRun) {
                 setNotice(`${isActive(selectedRun.status) ? "Worker focus: type redirect, Enter interrupts" : "Worker focus: type follow-up"} ${shortId(selectedRun.id)}`);
             }
-            else if (next === "agents") {
-                setNotice("Agents focus: j/k or arrows select runs");
-            }
             else {
-                setTargetRunId(undefined);
-                setNotice("Task focus: type a new task");
+                setNotice("No agent selected");
             }
+            return;
+        }
+        if ((key.meta && value === "3") || value === "\u001b3") {
+            setFocusPane("task");
+            setModelMenuOpen(false);
+            setInput("");
+            setTargetRunId(undefined);
+            setNotice("Task focus: type a new task");
+            return;
+        }
+        if (key.tab || value === "\t") {
             return;
         }
         if (mergePrompt) {
@@ -736,10 +749,10 @@ function WorkerComposer(props) {
     const label = active ? "interrupt" : "agent";
     const helper = active ? "Enter interrupts and redirects this run" : "Enter continues this completed session";
     const value = props.input || (active ? "type a redirect..." : "type a follow-up...");
-    return (_jsxs(Box, { flexDirection: "column", marginTop: 1, borderStyle: "single", borderColor: "cyan", paddingX: 1, children: [_jsxs(Box, { justifyContent: "space-between", children: [_jsxs(Text, { children: [_jsx(FocusPill, { label: label }), _jsxs(Text, { color: props.submitting ? "yellow" : "cyan", children: [" ", props.submitting ? "sending" : shortId(props.run.id)] }), _jsxs(Text, { children: ["  ", truncate(value, Math.max(8, props.width - 28))] }), _jsx(Text, { color: "cyan", children: "_" })] }), _jsx(Text, { color: "gray", children: active ? "running" : "resumable" })] }), _jsx(Text, { color: "gray", children: fitLine(`${helper}. Tab changes pane, Esc returns to task.`, props.width) })] }));
+    return (_jsxs(Box, { flexDirection: "column", marginTop: 1, borderStyle: "single", borderColor: "cyan", paddingX: 1, children: [_jsxs(Box, { justifyContent: "space-between", children: [_jsxs(Text, { children: [_jsx(FocusPill, { label: label }), _jsxs(Text, { color: props.submitting ? "yellow" : "cyan", children: [" ", props.submitting ? "sending" : shortId(props.run.id)] }), _jsxs(Text, { children: ["  ", truncate(value, Math.max(8, props.width - 28))] }), _jsx(Text, { color: "cyan", children: "_" })] }), _jsx(Text, { color: "gray", children: active ? "running" : "resumable" })] }), _jsx(Text, { color: "gray", children: fitLine(`${helper}. Option-1/2/3 changes pane, Esc returns to task.`, props.width) })] }));
 }
 function Help() {
-    return (_jsxs(Box, { borderStyle: "single", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { bold: true, color: "yellow", children: "keys" }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "Tab" }), " focus agents/worker/task   ", _jsx(Text, { color: "cyan", children: "Enter" }), " submit focused input   ", _jsx(Text, { color: "cyan", children: "j/k" }), " select run"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "worker focus" }), " type to selected agent; running agents are interrupted on Enter   ", _jsx(Text, { color: "cyan", children: "n" }), " new task   ", _jsx(Text, { color: "cyan", children: "x" }), " expand   ", _jsx(Text, { color: "cyan", children: "l" }), " transcript"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "o" }), " model picker   ", _jsx(Text, { color: "cyan", children: "/" }), " command search   ", _jsx(Text, { color: "cyan", children: "dd" }), " delete   ", _jsx(Text, { color: "cyan", children: "y" }), " copy transcript   ", _jsx(Text, { color: "cyan", children: "s" }), " stop   ", _jsx(Text, { color: "cyan", children: "m/M" }), " merge"] }), _jsx(Text, { color: "gray", children: "Slash: /backend claude|codex, /model, /model <name>, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit" })] }));
+    return (_jsxs(Box, { borderStyle: "single", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { bold: true, color: "yellow", children: "keys" }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "Option-1/2/3" }), " focus agents/worker/task   ", _jsx(Text, { color: "cyan", children: "Enter" }), " submit focused input   ", _jsx(Text, { color: "cyan", children: "j/k" }), " select run"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "worker focus" }), " type to selected agent; running agents are interrupted on Enter   ", _jsx(Text, { color: "cyan", children: "n" }), " new task   ", _jsx(Text, { color: "cyan", children: "x" }), " expand   ", _jsx(Text, { color: "cyan", children: "l" }), " transcript"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "o" }), " model picker   ", _jsx(Text, { color: "cyan", children: "/" }), " command search   ", _jsx(Text, { color: "cyan", children: "dd" }), " delete   ", _jsx(Text, { color: "cyan", children: "y" }), " copy transcript   ", _jsx(Text, { color: "cyan", children: "s" }), " stop   ", _jsx(Text, { color: "cyan", children: "m/M" }), " merge"] }), _jsx(Text, { color: "gray", children: "Slash: /backend claude|codex, /model, /model <name>, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit" })] }));
 }
 function FocusPill(props) {
     return (_jsxs(Text, { backgroundColor: "cyan", color: "black", bold: true, children: [" ", props.label.toUpperCase(), " "] }));
@@ -768,7 +781,7 @@ function CommandMenu(props) {
                 const selected = index === props.selectedIndex;
                 const line = `${selected ? "> " : "  "}/${option.name.padEnd(12, " ")} ${option.detail}`;
                 return (_jsx(Text, { color: selected ? "white" : "gray", bold: selected, wrap: "truncate", children: fitLine(line, contentWidth) }, option.name));
-            }), _jsx(Text, { color: "gray", children: fitLine("Enter completes/runs selected command, arrows move, Tab changes pane focus.", contentWidth) })] }));
+            }), _jsx(Text, { color: "gray", children: fitLine("Enter completes/runs selected command, arrows move, Option-1/2/3 changes pane focus.", contentWidth) })] }));
 }
 function DeletePromptBox(props) {
     const contentWidth = Math.max(24, props.width - 4);
@@ -800,7 +813,7 @@ function StatusDock(props) {
     return (_jsxs(Box, { borderStyle: "single", borderColor: "gray", paddingX: 1, justifyContent: "space-between", children: [_jsx(Text, { color: "gray", children: "worker input is active inside the selected agent pane" }), _jsx(Text, { color: "gray", children: props.notice })] }));
 }
 function Footer(props) {
-    return (_jsx(Box, { children: _jsxs(Text, { color: "gray", children: ["focus:", props.focusPane, "  Tab focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help"] }) }));
+    return (_jsx(Box, { children: _jsxs(Text, { color: "gray", children: ["focus:", props.focusPane, "  Opt-1/2/3 focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help"] }) }));
 }
 async function loadUiRuns(repoRoot) {
     const runs = await listRuns(repoRoot);
@@ -966,15 +979,6 @@ function selectRelative(runs, selectedRunId, delta, setSelectedRunId) {
     const index = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
     const next = Math.min(runs.length - 1, Math.max(0, index + delta));
     setSelectedRunId(runs[next]?.id);
-}
-function nextFocusPane(current) {
-    if (current === "agents") {
-        return "worker";
-    }
-    if (current === "worker") {
-        return "task";
-    }
-    return "agents";
 }
 function chooseBackend(backend, setBackend, setModel, setNotice) {
     setBackend(backend);

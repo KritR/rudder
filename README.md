@@ -354,16 +354,18 @@ mouse input, Rudder passes the wheel event through so Claude Code, Codex, Hunk,
 or another full-screen app can scroll its own view.
 
 Codex needs one extra guard. Rudder launches its pinned `rudder-codex` fork with
-`--no-alt-screen` and `CODEX_RUDDER_SCROLLBACK_SAFE=1`, so Codex keeps its
-normal renderer without clearing the parent pane's scrollback. Codex still
-inserts finalized transcript rows with top-origin terminal scroll regions rather
-than ordinary newlines. Rudder's embedded `vt100` parser does not expose those
-rows as normal scrollback, so the native worker pane mirrors rows that leave a
-top-origin scroll region into Rudder-owned pane scrollback before applying the
-bytes to the parser. Wheel and trackpad events then scroll that pane history
-first, which makes Codex and Claude worker panes follow the same rule: Rudder
-scrolls the visible worker transcript, and only forwards wheel events to an
-inner TUI when Rudder has no pane scrollback to move.
+`--no-alt-screen`, `CODEX_RUDDER_SCROLLBACK_SAFE=1`, and `-c notify=[]`, so
+Codex keeps its normal renderer without clearing the parent pane's scrollback
+and does not inherit desktop-app notification hooks that expect the official
+signed app launch chain. Codex still inserts finalized transcript rows with
+top-origin terminal scroll regions rather than ordinary newlines. Rudder's
+embedded `vt100` parser does not expose those rows as normal scrollback, so the
+native worker pane mirrors rows that leave a top-origin scroll region into
+Rudder-owned pane scrollback before applying the bytes to the parser. Wheel and
+trackpad events then scroll that pane history first, which makes Codex and
+Claude worker panes follow the same rule: Rudder scrolls the visible worker
+transcript, and only forwards wheel events to an inner TUI when Rudder has no
+pane scrollback to move.
 
 Keep that behavior covered with:
 
@@ -383,8 +385,8 @@ process is still running.
 | Key | Action |
 | --- | --- |
 | `Enter` | Start the typed task, or focus the selected worker when the task input is empty |
-| `Tab` / `Shift+Tab` | Cycle focus across agents, worker, and task panes |
 | `Option-1` / `Option-2` / `Option-3` | Focus agents, worker, or task directly |
+| `Tab` / `Shift+Tab` in worker | Forward to the focused agent TUI |
 | `Ctrl-G` | Toggle Rudder nav mode while focused inside a worker |
 | `Alt-v` | Toggle the selected agent's review view from any pane |
 | `Shift+Enter` | Insert a new line in the focused worker prompt |
