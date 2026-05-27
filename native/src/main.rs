@@ -5190,6 +5190,72 @@ branch refs/heads/main\n";
 
     #[cfg(not(windows))]
     #[test]
+    fn codex_worker_wheel_moves_scroll_region_scrollback() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "stty raw -echo; printf '\\033[1;3r\\033[3;1H\\r\\nhistory001\\r\\nhistory002\\r\\nhistory003\\r\\nhistory004\\r\\nhistory005\\033[r'; cat -v",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            pane.drain_output();
+            if pane
+                .visible_lines_snapshot()
+                .join("\n")
+                .contains("history005")
+            {
+                break;
+            }
+        }
+        assert_eq!(pane.scrollback(), 0);
+
+        let mut app = App::new();
+        let mut run = test_agent_run_with_terminal(&app, pane);
+        run.backend = Backend::Codex;
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.scroll_selected_worker_or_forward(
+            mouse,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            },
+        ));
+
+        let output = app
+            .selected_terminal_mut()
+            .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+            .unwrap_or_default();
+        assert!(output.contains("history002"), "output was {output:?}");
+        assert!(output.contains("history005"), "output was {output:?}");
+        assert!(app
+            .selected_terminal_mut()
+            .is_some_and(|terminal| terminal.scrollback() > 0));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn codex_alternate_screen_wheel_moves_snapshot_scrollback_first() {
         let command = TerminalCommand::with_args(
             "/bin/sh",

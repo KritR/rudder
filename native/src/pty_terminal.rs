@@ -116,9 +116,21 @@ pub struct TerminalPane {
     alternate_history_offset: usize,
     last_alternate_snapshot: Vec<String>,
     alternate_history_limit: usize,
+    region_scrollback: Vec<Vec<StyledTerminalCell>>,
+    region_scrollback_offset: usize,
+    region_scrollback_limit: usize,
+    tracked_scroll_region: Option<(u16, u16)>,
+    ansi_state: AnsiTrackState,
     styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
     output_log: String,
     output_log_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnsiTrackState {
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +224,11 @@ impl TerminalPane {
             alternate_history_offset: 0,
             last_alternate_snapshot: Vec::new(),
             alternate_history_limit: options.scrollback_lines.max(DEFAULT_ROWS as usize),
+            region_scrollback: Vec::new(),
+            region_scrollback_offset: 0,
+            region_scrollback_limit: options.scrollback_lines,
+            tracked_scroll_region: None,
+            ansi_state: AnsiTrackState::Ground,
             styled_lines_cache: None,
             output_log: String::new(),
             output_log_limit: 200_000,
@@ -264,6 +281,7 @@ impl TerminalPane {
         self.parser.screen_mut().set_size(size.rows, size.cols);
         self.size = size;
         self.last_alternate_snapshot.clear();
+        self.tracked_scroll_region = None;
         self.invalidate_render_cache();
         Ok(())
     }
@@ -275,9 +293,8 @@ impl TerminalPane {
     pub fn drain_output(&mut self) -> Vec<u8> {
         let mut drained = Vec::new();
         while let Ok(chunk) = self.output_rx.try_recv() {
-            self.parser.process(&chunk);
+            self.process_output_chunk(&chunk);
             self.append_output_log(&chunk);
-            self.capture_alternate_snapshot();
             drained.extend_from_slice(&chunk);
         }
         if !drained.is_empty() {
@@ -302,7 +319,13 @@ impl TerminalPane {
             return snapshot.clone();
         }
 
-        self.current_visible_lines_snapshot()
+        if self.region_scrollback_offset == 0 {
+            return self.current_visible_lines_snapshot();
+        }
+
+        self.region_scrollback_view(self.current_visible_lines_snapshot(), |cells| {
+            styled_cells_to_plain(cells)
+        })
     }
 
     pub fn output_log_snapshot(&self) -> &str {
@@ -337,42 +360,72 @@ impl TerminalPane {
                 .collect();
         }
 
-        let screen = self.parser.screen();
+        let current = self.current_styled_screen_rows();
+        if self.region_scrollback_offset > 0 {
+            return self.region_scrollback_view(current, Clone::clone);
+        }
+
+        current
+    }
+
+    fn current_styled_screen_rows(&self) -> Vec<Vec<StyledTerminalCell>> {
         let mut rows = Vec::with_capacity(self.size.rows as usize);
 
         for row in 0..self.size.rows {
-            let mut cells = Vec::with_capacity(self.size.cols as usize);
-            for col in 0..self.size.cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let contents = if cell.has_contents() {
-                    cell.contents().to_string()
-                } else {
-                    " ".to_string()
-                };
-                cells.push(StyledTerminalCell {
-                    contents,
-                    fg: cell.fgcolor(),
-                    bg: cell.bgcolor(),
-                    bold: cell.bold(),
-                    dim: cell.dim(),
-                    italic: cell.italic(),
-                    underline: cell.underline(),
-                    inverse: cell.inverse(),
-                });
-            }
+            rows.push(self.styled_screen_row(row));
+        }
 
-            while cells
-                .last()
-                .is_some_and(|cell| cell.contents == " " && cell.bg == vt100::Color::Default)
-            {
-                cells.pop();
+        rows
+    }
+
+    fn styled_screen_row(&self, row: u16) -> Vec<StyledTerminalCell> {
+        let screen = self.parser.screen();
+        let mut cells = Vec::with_capacity(self.size.cols as usize);
+        for col in 0..self.size.cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
             }
-            rows.push(cells);
+            let contents = if cell.has_contents() {
+                cell.contents().to_string()
+            } else {
+                " ".to_string()
+            };
+            cells.push(StyledTerminalCell {
+                contents,
+                fg: cell.fgcolor(),
+                bg: cell.bgcolor(),
+                bold: cell.bold(),
+                dim: cell.dim(),
+                italic: cell.italic(),
+                underline: cell.underline(),
+                inverse: cell.inverse(),
+            });
+        }
+
+        trim_styled_cells(&mut cells);
+        cells
+    }
+
+    fn region_scrollback_view<T, F>(&self, current: Vec<T>, map_history: F) -> Vec<T>
+    where
+        T: Clone,
+        F: Fn(&Vec<StyledTerminalCell>) -> T,
+    {
+        let height = self.size.rows as usize;
+        let total = self.region_scrollback.len() + current.len();
+        let end = total.saturating_sub(self.region_scrollback_offset);
+        let start = end.saturating_sub(height);
+        let mut rows = Vec::with_capacity(height);
+
+        for index in start..end {
+            if index < self.region_scrollback.len() {
+                rows.push(map_history(&self.region_scrollback[index]));
+            } else if let Some(row) = current.get(index - self.region_scrollback.len()) {
+                rows.push(row.clone());
+            }
         }
 
         rows
@@ -386,7 +439,7 @@ impl TerminalPane {
         if self.parser.screen().alternate_screen() {
             return self.alternate_history_offset;
         }
-        self.parser.screen().scrollback()
+        self.parser.screen().scrollback() + self.region_scrollback_offset
     }
 
     pub fn wants_sgr_mouse_events(&mut self) -> bool {
@@ -419,23 +472,50 @@ impl TerminalPane {
             return;
         }
 
-        let before = self.parser.screen().scrollback();
-        let next = if rows.is_negative() {
-            before.saturating_sub(rows.unsigned_abs())
-        } else {
-            before.saturating_add(rows as usize)
-        };
-        if next != before {
-            self.parser.screen_mut().set_scrollback(next);
+        let before = self.scrollback();
+        if rows.is_negative() {
+            let mut remaining = rows.unsigned_abs();
+            if self.region_scrollback_offset > 0 {
+                let consumed = remaining.min(self.region_scrollback_offset);
+                self.region_scrollback_offset -= consumed;
+                remaining -= consumed;
+            }
+            if remaining > 0 {
+                let parser_before = self.parser.screen().scrollback();
+                self.parser
+                    .screen_mut()
+                    .set_scrollback(parser_before.saturating_sub(remaining));
+            }
+        } else if rows > 0 {
+            let mut remaining = rows as usize;
+            if self.region_scrollback_offset == 0 {
+                let parser_before = self.parser.screen().scrollback();
+                self.parser
+                    .screen_mut()
+                    .set_scrollback(parser_before.saturating_add(remaining));
+                let parser_after = self.parser.screen().scrollback();
+                remaining = remaining.saturating_sub(parser_after.saturating_sub(parser_before));
+            }
+            if remaining > 0 && !self.region_scrollback.is_empty() {
+                self.region_scrollback_offset = self
+                    .region_scrollback_offset
+                    .saturating_add(remaining)
+                    .min(self.region_scrollback.len());
+            }
         }
-        if self.parser.screen().scrollback() != before {
+
+        if self.scrollback() != before {
             self.invalidate_render_cache();
         }
     }
 
     pub fn reset_scrollback(&mut self) {
-        if self.alternate_history_offset != 0 || self.parser.screen().scrollback() != 0 {
+        if self.alternate_history_offset != 0
+            || self.region_scrollback_offset != 0
+            || self.parser.screen().scrollback() != 0
+        {
             self.alternate_history_offset = 0;
+            self.region_scrollback_offset = 0;
             self.parser.screen_mut().set_scrollback(0);
             self.invalidate_render_cache();
         }
@@ -474,7 +554,131 @@ impl StyledTerminalCell {
     }
 }
 
+fn trim_styled_cells(cells: &mut Vec<StyledTerminalCell>) {
+    while cells
+        .last()
+        .is_some_and(|cell| cell.contents == " " && cell.bg == vt100::Color::Default)
+    {
+        cells.pop();
+    }
+}
+
+fn styled_cells_to_plain(cells: &[StyledTerminalCell]) -> String {
+    let mut text = String::new();
+    for cell in cells {
+        text.push_str(&cell.contents);
+    }
+    text
+}
+
 impl TerminalPane {
+    fn process_output_chunk(&mut self, chunk: &[u8]) {
+        for byte in chunk {
+            self.capture_top_origin_scroll_region_line_before(*byte);
+            self.parser.process(&[*byte]);
+            self.track_ansi_byte(*byte);
+        }
+        self.capture_alternate_snapshot();
+    }
+
+    fn capture_top_origin_scroll_region_line_before(&mut self, byte: u8) {
+        if byte != b'\n' {
+            return;
+        }
+
+        let Some((top, bottom)) = self.tracked_scroll_region else {
+            return;
+        };
+        if top != 0 || bottom >= self.size.rows.saturating_sub(1) {
+            return;
+        }
+
+        let (cursor_row, _) = self.parser.screen().cursor_position();
+        if cursor_row != bottom {
+            return;
+        }
+
+        let cells = self.styled_screen_row(top);
+        if cells.is_empty() {
+            return;
+        }
+        self.push_region_scrollback(cells);
+    }
+
+    fn push_region_scrollback(&mut self, cells: Vec<StyledTerminalCell>) {
+        self.region_scrollback.push(cells);
+        if self.region_scrollback_offset > 0 {
+            self.region_scrollback_offset = self
+                .region_scrollback_offset
+                .saturating_add(1)
+                .min(self.region_scrollback.len());
+        }
+
+        if self.region_scrollback.len() > self.region_scrollback_limit {
+            let overflow = self.region_scrollback.len() - self.region_scrollback_limit;
+            self.region_scrollback.drain(0..overflow);
+            self.region_scrollback_offset = self.region_scrollback_offset.saturating_sub(overflow);
+        }
+        self.invalidate_render_cache();
+    }
+
+    fn track_ansi_byte(&mut self, byte: u8) {
+        let state = std::mem::replace(&mut self.ansi_state, AnsiTrackState::Ground);
+        self.ansi_state = match state {
+            AnsiTrackState::Ground if byte == 0x1b => AnsiTrackState::Escape,
+            AnsiTrackState::Ground => AnsiTrackState::Ground,
+            AnsiTrackState::Escape if byte == b'[' => AnsiTrackState::Csi(Vec::new()),
+            AnsiTrackState::Escape if byte == 0x1b => AnsiTrackState::Escape,
+            AnsiTrackState::Escape => AnsiTrackState::Ground,
+            AnsiTrackState::Csi(mut bytes) => {
+                bytes.push(byte);
+                if (0x40..=0x7e).contains(&byte) {
+                    self.apply_tracked_csi(&bytes);
+                    AnsiTrackState::Ground
+                } else {
+                    AnsiTrackState::Csi(bytes)
+                }
+            }
+        };
+    }
+
+    fn apply_tracked_csi(&mut self, bytes: &[u8]) {
+        if bytes.last() != Some(&b'r') {
+            return;
+        }
+        let params = &bytes[..bytes.len().saturating_sub(1)];
+        if params.is_empty() {
+            self.tracked_scroll_region = None;
+            return;
+        }
+        if params
+            .iter()
+            .any(|byte| !byte.is_ascii_digit() && *byte != b';')
+        {
+            return;
+        }
+
+        let text = String::from_utf8_lossy(params);
+        let mut parts = text.split(';');
+        let top = parts
+            .next()
+            .and_then(|part| part.parse::<u16>().ok())
+            .unwrap_or(1);
+        let bottom = parts
+            .next()
+            .and_then(|part| part.parse::<u16>().ok())
+            .unwrap_or(self.size.rows);
+        if top == 0 || bottom == 0 || top > bottom {
+            return;
+        }
+
+        let top = top.saturating_sub(1).min(self.size.rows.saturating_sub(1));
+        let bottom = bottom
+            .saturating_sub(1)
+            .min(self.size.rows.saturating_sub(1));
+        self.tracked_scroll_region = Some((top, bottom));
+    }
+
     fn capture_alternate_snapshot(&mut self) {
         if !self.parser.screen().alternate_screen() {
             self.alternate_history_offset = 0;
@@ -591,5 +795,44 @@ mod tests {
             .collect();
 
         assert_eq!(lines, vec!["red", "plain"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn top_origin_scroll_region_history_scrolls_like_terminal_scrollback() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "printf '\\033[1;3r\\033[3;1H\\r\\nhistory001\\r\\nhistory002\\r\\nhistory003\\r\\nhistory004\\r\\nhistory005\\033[r'; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            pane.drain_output();
+            if pane
+                .visible_lines_snapshot()
+                .join("\n")
+                .contains("history005")
+            {
+                break;
+            }
+        }
+
+        assert_eq!(pane.scrollback(), 0);
+        pane.scrollback_by(2);
+        let output = pane.visible_lines_snapshot().join("\n");
+        assert!(output.contains("history001"), "output was {output:?}");
+        assert!(output.contains("history005"), "output was {output:?}");
     }
 }
