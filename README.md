@@ -353,6 +353,31 @@ pane has no Rudder scrollback to move and the inner TUI has explicitly requested
 mouse input, Rudder passes the wheel event through so Claude Code, Codex, Hunk,
 or another full-screen app can scroll its own view.
 
+Codex needs one extra guard. Rudder launches its pinned `rudder-codex` fork with
+`--no-alt-screen` and `CODEX_RUDDER_SCROLLBACK_SAFE=1`, so Codex keeps its
+normal renderer without clearing the parent pane's scrollback. Codex still
+inserts finalized transcript rows with top-origin terminal scroll regions rather
+than ordinary newlines. Rudder's embedded `vt100` parser does not expose those
+rows as normal scrollback, so the native worker pane mirrors rows that leave a
+top-origin scroll region into Rudder-owned pane scrollback before applying the
+bytes to the parser. Wheel and trackpad events then scroll that pane history
+first, which makes Codex and Claude worker panes follow the same rule: Rudder
+scrolls the visible worker transcript, and only forwards wheel events to an
+inner TUI when Rudder has no pane scrollback to move.
+
+Keep that behavior covered with:
+
+```bash
+npm run test:worker-scroll
+```
+
+That script includes the Codex-style top-origin scroll-region test plus the
+worker wheel routing tests for normal screen, alternate screen, and edge
+forwarding. If a local dashboard still behaves like an older build, check
+`rudder --version`, upgrade with `npm install -g @viraatdas/rudder@latest`, and
+restart existing Rudder dashboards so no stale `rudder-native` or managed Codex
+process is still running.
+
 ## Dashboard Shortcuts
 
 | Key | Action |
