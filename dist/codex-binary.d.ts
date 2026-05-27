@@ -1,6 +1,6 @@
 export declare const RUDDER_CODEX_REPOSITORY = "viraatdas/codex";
-export declare const RUDDER_CODEX_RELEASE = "rudder-codex-v0.1.0-upstream-db9cb04";
-export declare const RUDDER_CODEX_ASSET_SHA256 = "9f9577d244e83e5711b64b781527e32538b78d4005141dc33c6bed8f3296ded7";
+export declare const RUDDER_CODEX_RELEASE = "rudder-codex-v0.1.1-upstream-db9cb04";
+export declare const RUDDER_CODEX_ASSET_SHA256 = "ea08a91e85b35c0c4782a96535011dfcaeaff7259113e65ecf5260bc24368517";
 export declare function codexEnvVars(): Promise<Record<string, string>>;
 export declare function codexLaunchEnv(base?: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv>;
 export declare function ensureRudderCodexBinary(): Promise<string>;

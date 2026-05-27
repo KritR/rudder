@@ -6,8 +6,8 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { commandExists, ensureDir, rudderHome } from "./util.js";
 export const RUDDER_CODEX_REPOSITORY = "viraatdas/codex";
-export const RUDDER_CODEX_RELEASE = "rudder-codex-v0.1.0-upstream-db9cb04";
-export const RUDDER_CODEX_ASSET_SHA256 = "9f9577d244e83e5711b64b781527e32538b78d4005141dc33c6bed8f3296ded7";
+export const RUDDER_CODEX_RELEASE = "rudder-codex-v0.1.1-upstream-db9cb04";
+export const RUDDER_CODEX_ASSET_SHA256 = "ea08a91e85b35c0c4782a96535011dfcaeaff7259113e65ecf5260bc24368517";
 export async function codexEnvVars() {
     const codex = await ensureRudderCodexBinary();
     return {
@@ -50,26 +50,7 @@ function managedChecksumPath() {
 }
 function platformAssetNames() {
     if (process.platform === "darwin" && process.arch === "arm64") {
-        return [
-            "rudder-codex-darwin-arm64.gz.part-00",
-            "rudder-codex-darwin-arm64.gz.part-01",
-            "rudder-codex-darwin-arm64.gz.part-02",
-            "rudder-codex-darwin-arm64.gz.part-03",
-            "rudder-codex-darwin-arm64.gz.part-04",
-            "rudder-codex-darwin-arm64.gz.part-05",
-            "rudder-codex-darwin-arm64.gz.part-06",
-            "rudder-codex-darwin-arm64.gz.part-07",
-            "rudder-codex-darwin-arm64.gz.part-08",
-            "rudder-codex-darwin-arm64.gz.part-09",
-            "rudder-codex-darwin-arm64.gz.part-10",
-            "rudder-codex-darwin-arm64.gz.part-11",
-            "rudder-codex-darwin-arm64.gz.part-12",
-            "rudder-codex-darwin-arm64.gz.part-13",
-            "rudder-codex-darwin-arm64.gz.part-14",
-            "rudder-codex-darwin-arm64.gz.part-15",
-            "rudder-codex-darwin-arm64.gz.part-16",
-            "rudder-codex-darwin-arm64.gz.part-17",
-        ];
+        return ["rudder-codex-darwin-arm64.gz"];
     }
     throw new Error(`Rudder's pinned Codex fork does not have a managed binary for ${process.platform}/${process.arch} yet. Set RUDDER_CODEX_BIN to an executable override.`);
 }

@@ -14,9 +14,10 @@ use std::{
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -6959,10 +6960,7 @@ fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {
 }
 
 fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
-    // Minimum required modes: button press/release, drag/button motion, SGR coordinates.
-    // Avoid all-motion (?1003h), which creates noisy mouse-move traffic.
-    write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
-    stdout.flush()?;
+    execute!(stdout, EnableMouseCapture)?;
     Ok(())
 }
 
