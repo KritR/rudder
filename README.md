@@ -354,10 +354,11 @@ mouse input, Rudder passes the wheel event through so Claude Code, Codex, Hunk,
 or another full-screen app can scroll its own view.
 
 Codex needs one extra guard. Rudder launches its pinned `rudder-codex` fork with
-`--no-alt-screen`, `CODEX_RUDDER_SCROLLBACK_SAFE=1`, and `-c notify=[]`, so
-Codex keeps its normal renderer without clearing the parent pane's scrollback
-and does not inherit desktop-app notification hooks that expect the official
-signed app launch chain. Codex still inserts finalized transcript rows with
+`--no-alt-screen`, `CODEX_RUDDER_SCROLLBACK_SAFE=1`, `-c notify=[]`,
+`-c features.plugins=false`, and `-c features.computer_use=false`, so Codex keeps
+its normal renderer without clearing the parent pane's scrollback and does not
+inherit desktop-app notification hooks or bundled plugin helpers that expect the
+official signed app launch chain. Codex still inserts finalized transcript rows with
 top-origin terminal scroll regions rather than ordinary newlines. Rudder's
 embedded `vt100` parser does not expose those rows as normal scrollback, so the
 native worker pane mirrors rows that leave a top-origin scroll region into

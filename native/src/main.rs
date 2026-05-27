@@ -5717,6 +5717,14 @@ branch refs/heads/main\n";
             .windows(2)
             .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
         assert!(execute_codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.plugins=false"));
+        assert!(execute_codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
+        assert!(execute_codex
             .env
             .iter()
             .any(|(key, value)| key == "CODEX_RUDDER_SCROLLBACK_SAFE" && value == "1"));
@@ -5757,6 +5765,14 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.plugins=false"));
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
         assert!(!codex
             .args
             .iter()
@@ -5814,6 +5830,14 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
+        assert!(rudder_plan
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.plugins=false"));
+        assert!(rudder_plan
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
     }
 
     #[test]
@@ -6546,6 +6570,14 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "-c" && window[1] == "notify=[]"));
+        assert!(codex_command
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.plugins=false"));
+        assert!(codex_command
+            .args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
         assert!(codex_command
             .args
             .iter()
@@ -10715,6 +10747,10 @@ fn push_codex_rudder_config_overrides(args: &mut Vec<String>, effort: Option<Eff
     // notification hooks that expect the official signed app launch chain.
     args.push("-c".to_string());
     args.push("notify=[]".to_string());
+    args.push("-c".to_string());
+    args.push("features.plugins=false".to_string());
+    args.push("-c".to_string());
+    args.push("features.computer_use=false".to_string());
     args.push("-c".to_string());
     args.push("model_reasoning_summary=\"detailed\"".to_string());
     args.push("-c".to_string());
