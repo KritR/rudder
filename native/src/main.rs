@@ -1530,7 +1530,6 @@ impl App {
             )
         {
             if let Some(worker_area) = self.worker_area {
-                self.focus = FocusPane::Worker;
                 self.task_selection = None;
                 if self.handle_worker_selection_mouse(mouse, block_inner(worker_area)) {
                     return;
@@ -1542,7 +1541,6 @@ impl App {
             .task_area
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
         {
-            self.focus = FocusPane::Task;
             self.worker_selection = None;
             if self.handle_task_selection_mouse(mouse, block_inner(task_area)) {
                 return;
@@ -1554,7 +1552,6 @@ impl App {
             .agents_area
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
         {
-            self.focus = FocusPane::Agents;
             self.worker_selection = None;
             self.task_selection = None;
             self.handle_agents_mouse(mouse, agents_area);
@@ -1568,7 +1565,6 @@ impl App {
             return;
         };
 
-        self.focus = FocusPane::Worker;
         self.task_selection = None;
         let inner = block_inner(worker_area);
 
@@ -6324,7 +6320,7 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn click_in_agent_pane_focuses_agents() {
+    fn click_in_agent_pane_does_not_change_focus() {
         let mut app = App::new();
         app.focus = FocusPane::Task;
         app.agents_area = Some(Rect {
@@ -6341,7 +6337,7 @@ branch refs/heads/main\n";
             modifiers: KeyModifiers::empty(),
         });
 
-        assert_eq!(app.focus, FocusPane::Agents);
+        assert_eq!(app.focus, FocusPane::Task);
     }
 
     #[test]
@@ -6366,9 +6362,43 @@ branch refs/heads/main\n";
             modifiers: KeyModifiers::empty(),
         });
 
-        assert_eq!(app.focus, FocusPane::Agents);
+        assert_eq!(app.focus, FocusPane::Task);
         assert_eq!(app.selected_agent, 1);
         assert!(app.delete_pending.is_none());
+    }
+
+    #[test]
+    fn mouse_over_worker_and_task_does_not_change_focus() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        app.worker_area = Some(Rect {
+            x: 20,
+            y: 0,
+            width: 40,
+            height: 10,
+        });
+        app.task_area = Some(Rect {
+            x: 0,
+            y: 12,
+            width: 60,
+            height: 4,
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 21,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Agents);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 13,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Agents);
     }
 
     #[cfg(not(windows))]
