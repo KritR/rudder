@@ -1,4 +1,10 @@
-import type { RunRecord, VcsMode } from "./types.js";
+import type { MergeStrategy, RunRecord, VcsMode } from "./types.js";
+export type RebaseResult = {
+    success: boolean;
+    baseRef: string;
+    conflictedFiles: string[];
+    error?: string;
+};
 export declare function findRepoRoot(cwd?: string): string;
 export declare function isGitRepo(cwd: string): boolean;
 export declare function isJjRepo(cwd: string): boolean;
@@ -43,7 +49,14 @@ export declare function removeJjWorkspace(params: {
     workspacePath: string;
 }): Promise<void>;
 export declare function removeRunWorkspace(run: RunRecord, force?: boolean): Promise<void>;
-export declare function mergeRunIntoCurrentBranch(run: RunRecord, allowDirty?: boolean): Promise<RunRecord>;
+export declare function mergeRunIntoCurrentBranch(run: RunRecord, allowDirty?: boolean, strategy?: MergeStrategy): Promise<RunRecord>;
+export declare function syncRunWorktree(run: RunRecord, baseBranch: string): Promise<RunRecord>;
+export declare function rebaseWorktreeOntoBase(params: {
+    repoRoot: string;
+    worktreePath: string;
+    baseBranch: string;
+}): Promise<RebaseResult>;
+export declare function resolveRebaseBaseRef(repoRoot: string, baseBranch: string): Promise<string>;
 export declare function mergeJjRunIntoCurrentWorkspace(run: RunRecord, allowDirty?: boolean): Promise<RunRecord>;
 export declare function conflictedFiles(repoRoot: string): Promise<string[]>;
 export declare function jjConflictedFiles(workspacePath: string): Promise<string[]>;
