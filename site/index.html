@@ -6,13 +6,13 @@
     <title>Rudder</title>
     <meta
       name="description"
-      content="Rudder is the terminal OS for running Claude Code and Codex agents in parallel, with native panes, isolated worktrees, review, merge, and cloud continuation."
+      content="Rudder is the terminal OS for running Claude Code and Codex agents in parallel, with native panes, isolated worktrees, review, and merge."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="Run Claude Code and Codex in parallel with native worker panes, isolated git worktrees, review, merge, and cloud continuation."
+      content="Run Claude Code and Codex in parallel with native worker panes, isolated git worktrees, review, and merge."
     />
     <meta property="og:image" content="/screenshot.png" />
     <meta name="theme-color" content="#f5f3ee" />
@@ -356,84 +356,132 @@
         color: var(--magenta);
       }
 
-      .details {
+      .control-stage {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
         gap: 18px;
         margin-top: 32px;
       }
 
-      .panel {
-        border-top: 1px solid var(--line);
-        padding-top: 18px;
+      .key-map,
+      .type-card,
+      .command-strip {
+        border: 1px solid var(--line);
+        background: var(--panel);
       }
 
-      .panel h3 {
-        margin-bottom: 14px;
-        font-size: 14px;
-        line-height: 1.2;
+      .key-map {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        min-height: 260px;
+      }
+
+      .key-tile {
+        display: grid;
+        align-content: space-between;
+        min-width: 0;
+        padding: 24px;
+        border-right: 1px solid var(--soft-line);
+        transition: background 180ms ease, transform 180ms ease;
+      }
+
+      .key-tile:last-child {
+        border-right: 0;
+      }
+
+      .key-tile:hover {
+        background: #f8f6ee;
+        transform: translateY(-2px);
+      }
+
+      .key {
+        display: inline-flex;
+        width: fit-content;
+        padding: 5px 8px;
+        border: 1px solid currentColor;
+        color: var(--cyan);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
         font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
       }
 
-      .rows {
-        display: grid;
-        gap: 10px;
+      .key-tile strong {
+        display: block;
+        margin-top: 42px;
+        font-size: clamp(26px, 4vw, 46px);
+        font-weight: 390;
+        line-height: 0.96;
       }
 
-      .row {
-        display: grid;
-        grid-template-columns: minmax(120px, max-content) minmax(0, 1fr);
-        gap: 18px;
-        align-items: baseline;
+      .key-tile span:not(.key) {
+        display: block;
+        margin-top: 14px;
         color: var(--muted);
         font-size: 15px;
         line-height: 1.45;
       }
 
-      .row code {
+      .control-side {
+        display: grid;
+        gap: 18px;
+      }
+
+      .type-card {
+        min-height: 128px;
+        padding: 20px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .type-label {
+        display: block;
+        margin-bottom: 18px;
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+      }
+
+      .typed-line {
         color: var(--ink);
+        font-size: clamp(18px, 2.8vw, 26px);
+        line-height: 1.2;
+        overflow-wrap: anywhere;
+      }
+
+      .cursor {
+        display: inline-block;
+        width: 0.58em;
+        color: var(--green);
+        animation: blink 1s steps(2, start) infinite;
+      }
+
+      .command-strip {
+        display: grid;
+      }
+
+      .command-chip {
+        display: grid;
+        grid-template-columns: minmax(96px, max-content) minmax(0, 1fr);
+        gap: 16px;
+        align-items: center;
+        padding: 15px 18px;
+        border-top: 1px solid var(--soft-line);
+      }
+
+      .command-chip:first-child {
+        border-top: 0;
+      }
+
+      .command-chip code {
+        color: var(--magenta);
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 13px;
         white-space: nowrap;
       }
 
-      .roadmap {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-        gap: 18px;
-        margin-top: 32px;
-      }
-
-      .roadmap-item {
-        padding: 22px;
-        border-left: 3px solid var(--line);
-        background: rgba(255, 253, 247, 0.62);
-      }
-
-      .roadmap-item h3 {
-        margin-bottom: 10px;
-        font-size: 17px;
-        font-weight: 650;
-      }
-
-      .roadmap-item p {
+      .command-chip span {
         color: var(--muted);
         font-size: 15px;
-        line-height: 1.6;
-      }
-
-      footer {
-        display: flex;
-        flex-wrap: wrap;
-        justify-content: space-between;
-        gap: 16px;
-        margin-top: 82px;
-        padding-top: 24px;
-        border-top: 1px solid var(--soft-line);
-        color: var(--muted);
-        font-size: 14px;
+        line-height: 1.35;
       }
 
       .motion-ready [data-reveal] {
@@ -446,15 +494,30 @@
         transform: translateY(18px);
       }
 
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
+
       @media (max-width: 960px) {
-        .section-head,
-        .roadmap {
+        .section-head {
           grid-template-columns: 1fr;
         }
 
         .grid,
-        .details {
+        .control-stage,
+        .key-map {
           grid-template-columns: 1fr;
+        }
+
+        .key-tile {
+          border-right: 0;
+          border-bottom: 1px solid var(--soft-line);
+        }
+
+        .key-tile:last-child {
+          border-bottom: 0;
         }
 
         .terminal-bar {
@@ -530,9 +593,9 @@
           border-bottom: 0;
         }
 
-        .row {
+        .command-chip {
           grid-template-columns: 1fr;
-          gap: 3px;
+          gap: 5px;
         }
       }
 
@@ -562,7 +625,6 @@
         <nav aria-label="Primary navigation">
           <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
           <a href="https://github.com/viraatdas/rudder">GitHub</a>
-          <a href="https://github.com/viraatdas/rudder/issues/7">JJ workspaces</a>
           <a href="/login">Sign in</a>
         </nav>
       </header>
@@ -574,7 +636,7 @@
           <p class="lede" data-reveal>
             Rudder runs Claude Code and Codex side by side in actual terminal
             panes, gives every task an isolated git worktree, and keeps review,
-            merge, and cloud handoff in one focused dashboard.
+            merge, and focused task control in one dashboard.
           </p>
           <div class="actions" data-reveal>
             <div class="install">
@@ -603,8 +665,8 @@ rudder</code>
               <span>Forwarded to Claude Code or Codex, so native queues and menus keep working.</span>
             </div>
             <div class="terminal-stat">
-              <strong>Wheel / trackpad</strong>
-              <span>Scrolls the pane under the pointer without stealing focus.</span>
+              <strong>Trackpad scroll</strong>
+              <span>Moves Rudder pane history like terminal scrollback.</span>
             </div>
             <div class="terminal-stat">
               <strong>/main or /m</strong>
@@ -620,7 +682,7 @@ rudder</code>
               Rudder does not replay a simplified transcript UI. The worker pane
               is the harness itself, with Rudder handling the outer workflow:
               pane focus, scrollback, worktree isolation, task summaries, review,
-              merge, and cloud continuation.
+              and merge.
             </p>
           </div>
 
@@ -657,98 +719,49 @@ rudder</code>
 
         <section class="section" aria-labelledby="shortcuts-title">
           <div class="section-head" data-reveal>
-            <h2 id="shortcuts-title">The controls stay predictable.</h2>
+            <h2 id="shortcuts-title">Muscle memory, not mode wrestling.</h2>
             <p>
-              Focus changes are explicit. Mouse hover does not move focus, and
-              trackpad scrolling feels like terminal pane scrollback instead of
-              child-app roulette.
+              Three fixed pane jumps. Native Tab inside Claude and Codex. A task
+              line that starts agents instead of making you manage windows.
             </p>
           </div>
 
-          <div class="details" aria-label="Rudder shortcuts and commands" data-reveal-group>
-            <div class="panel">
-              <h3>Focus</h3>
-              <div class="rows">
-                <div class="row"><code>Option-1/2/3</code><span>Focus agents, worker, or task directly.</span></div>
-                <div class="row"><code>Tab / Shift+Tab</code><span>Forwarded to the focused worker TUI.</span></div>
-                <div class="row"><code>Ctrl-G</code><span>Toggle Rudder nav mode while inside a worker.</span></div>
-                <div class="row"><code>Mouse hover</code><span>Never changes pane focus.</span></div>
-                <div class="row"><code>Ctrl-C</code><span>Leave Rudder from any pane.</span></div>
+          <div class="control-stage" aria-label="Rudder controls">
+            <div class="key-map" data-key-map>
+              <div class="key-tile">
+                <span class="key">Option-1</span>
+                <strong>Agents</strong>
+                <span>Pick the run, review status, merge, or delete.</span>
+              </div>
+              <div class="key-tile">
+                <span class="key">Option-2</span>
+                <strong>Worker</strong>
+                <span>Type directly into Claude Code or Codex.</span>
+              </div>
+              <div class="key-tile">
+                <span class="key">Option-3</span>
+                <strong>Task</strong>
+                <span>Start the next agent without leaving the dashboard.</span>
               </div>
             </div>
 
-            <div class="panel">
-              <h3>Agents</h3>
-              <div class="rows">
-                <div class="row"><code>j / k</code><span>Select an agent in the left pane.</span></div>
-                <div class="row"><code>v</code><span>Open or close live diff review.</span></div>
-                <div class="row"><code>m / M</code><span>Merge selected worktree, or all completed worktrees.</span></div>
-                <div class="row"><code>R</code><span>Combine completed worktrees and start a review-all agent.</span></div>
-                <div class="row"><code>dd</code><span>Delete an agent and remove its worktree after confirmation.</span></div>
+            <div class="control-side">
+              <div class="type-card" data-type-card>
+                <span class="type-label">task pane</span>
+                <div class="typed-line"><span data-type-text>/main audit worker scroll</span><span class="cursor">_</span></div>
               </div>
-            </div>
 
-            <div class="panel">
-              <h3>Task</h3>
-              <div class="rows">
-                <div class="row"><code>/model</code><span>Choose provider, model, and effort.</span></div>
-                <div class="row"><code>/main or /m</code><span>Spawn a main-branch agent using the selected model.</span></div>
-                <div class="row"><code>/plan</code><span>Use native read-only planning before implementation.</span></div>
-                <div class="row"><code>/cloud</code><span>Onload this workspace, or start fresh on Fly.</span></div>
-                <div class="row"><code>/usage</code><span>Show tokens and estimated cost for this session.</span></div>
-              </div>
-            </div>
-
-            <div class="panel">
-              <h3>Scroll</h3>
-              <div class="rows">
-                <div class="row"><code>wheel</code><span>Scroll the pane under the pointer.</span></div>
-                <div class="row"><code>trackpad</code><span>Moves Rudder pane history one terminal row at a time.</span></div>
-                <div class="row"><code>PageUp/PageDown</code><span>Scroll the focused worker by roughly one page.</span></div>
-                <div class="row"><code>selection drag</code><span>Copies text from worker scrollback.</span></div>
+              <div class="command-strip">
+                <div class="command-chip"><code>Tab</code><span>stays inside the worker</span></div>
+                <div class="command-chip"><code>/model</code><span>switch Claude, Codex, model, effort</span></div>
+                <div class="command-chip"><code>v</code><span>open review</span></div>
+                <div class="command-chip"><code>m</code><span>merge when ready</span></div>
               </div>
             </div>
           </div>
         </section>
 
-        <section class="section" aria-labelledby="workspace-title">
-          <div class="section-head" data-reveal>
-            <h2 id="workspace-title">Worktrees today, JJ on the roadmap.</h2>
-            <p>
-              Rudder's current concurrency model is intentionally git-native.
-              Issue #7 tracks adding a JJ workspace mode so teams that live in
-              jj can keep the same Rudder dashboard while using the jj CLI as
-              the workspace interface.
-            </p>
-          </div>
-
-          <div class="roadmap" data-reveal-group>
-            <article class="roadmap-item">
-              <h3>Shipping path</h3>
-              <p>
-                Normal agents run in isolated git worktrees. Main agents created
-                with <code>/main</code> or <code>/m</code> stay grouped in the
-                agents pane so base-branch conversations are separate from task
-                worktrees.
-              </p>
-            </article>
-            <article class="roadmap-item">
-              <h3>Tracked next</h3>
-              <p>
-                Native JJ workspace support is open and tracked in
-                <a href="https://github.com/viraatdas/rudder/issues/7">issue #7</a>.
-                The goal is to let Rudder multiplex work through jj without
-                turning the worker pane into a separate implementation.
-              </p>
-            </article>
-          </div>
-        </section>
       </main>
-
-      <footer>
-        <span>Rudder is open source and ships as <code>@viraatdas/rudder</code>.</span>
-        <span><a href="https://github.com/viraatdas/rudder">GitHub</a> / <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a></span>
-      </footer>
     </div>
 
     <script type="module">
@@ -770,6 +783,67 @@ rudder</code>
             duration: 0.45,
             ease: [0.22, 1, 0.36, 1],
           });
+        }, { margin: "0px 0px -12% 0px" });
+
+        inView("[data-key-map]", (element) => {
+          const tiles = Array.from(element.children);
+          animate(tiles, { opacity: [0, 1], y: [22, 0] }, {
+            delay: stagger(0.08),
+            duration: 0.52,
+            ease: [0.22, 1, 0.36, 1],
+          });
+          animate(tiles.map((tile) => tile.querySelector(".key")).filter(Boolean), { y: [-6, 0] }, {
+            delay: stagger(0.08, { startDelay: 0.18 }),
+            duration: 0.38,
+            ease: "easeOut",
+          });
+        }, { margin: "0px 0px -12% 0px" });
+
+        inView(".command-strip", (element) => {
+          animate(Array.from(element.children), { opacity: [0, 1], x: [14, 0] }, {
+            delay: stagger(0.05),
+            duration: 0.36,
+            ease: [0.22, 1, 0.36, 1],
+          });
+        }, { margin: "0px 0px -12% 0px" });
+
+        inView("[data-type-card]", () => {
+          const target = document.querySelector("[data-type-text]");
+          if (!target) return;
+
+          const phrases = ["/main audit worker scroll", "/model codex gpt-5.5", "fix parser edge cases", "v review  m merge"];
+          let phraseIndex = 0;
+          let charIndex = 0;
+          let deleting = false;
+
+          const tick = () => {
+            const phrase = phrases[phraseIndex];
+            target.textContent = phrase.slice(0, charIndex);
+
+            if (!deleting && charIndex < phrase.length) {
+              charIndex += 1;
+              window.setTimeout(tick, 44);
+              return;
+            }
+
+            if (!deleting) {
+              deleting = true;
+              window.setTimeout(tick, 980);
+              return;
+            }
+
+            if (charIndex > 0) {
+              charIndex -= 1;
+              window.setTimeout(tick, 24);
+              return;
+            }
+
+            deleting = false;
+            phraseIndex = (phraseIndex + 1) % phrases.length;
+            window.setTimeout(tick, 220);
+          };
+
+          tick();
         }, { margin: "0px 0px -12% 0px" });
       }
 
