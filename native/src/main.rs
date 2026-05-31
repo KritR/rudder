@@ -1029,16 +1029,20 @@ impl App {
             self.selected_agent = 0;
             return;
         }
-        let position = visible
+        let exact = visible
             .iter()
-            .position(|&index| index == self.selected_agent)
-            .unwrap_or_else(|| {
-                visible
-                    .iter()
-                    .position(|&index| index >= self.selected_agent)
-                    .unwrap_or_else(|| visible.len().saturating_sub(1))
-            });
-        self.selected_agent = visible[(position + 1).min(visible.len().saturating_sub(1))];
+            .position(|&index| index == self.selected_agent);
+        let step = match exact {
+            // Still visible: advance to the following agent.
+            Some(position) => position + 1,
+            // Hidden/removed: the first visible index at or after the old
+            // selection already IS the natural next agent, so do not skip it.
+            None => visible
+                .iter()
+                .position(|&index| index >= self.selected_agent)
+                .unwrap_or_else(|| visible.len().saturating_sub(1)),
+        };
+        self.selected_agent = visible[step.min(visible.len().saturating_sub(1))];
     }
 
     fn visible_agent_indices(&self) -> Vec<usize> {

@@ -281,6 +281,11 @@ impl TerminalPane {
         self.size = size;
         self.last_alternate_snapshot.clear();
         self.tracked_scroll_region = None;
+        // Region scrollback rows were captured at the old column width; rendering
+        // them under the new geometry splices mismatched-width rows. Drop the
+        // captured history and offset so the post-resize view is consistent.
+        self.region_scrollback.clear();
+        self.region_scrollback_offset = 0;
         self.invalidate_render_cache();
         Ok(())
     }
