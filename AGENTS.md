@@ -49,7 +49,7 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   └── worker/            the cloud worker container (entrypoint + supervisor)
 ├── site/                 Marketing site (static, deployed to rudder.viraat.dev)
 ├── tests/                Node integration tests (*.test.mjs against dist/)
-├── dist/                 Built JS + the copied native binary. COMMITTED + shipped.
+├── dist/                 Build output (JS + copied native binary). Not tracked; built on publish.
 ├── assets/               Static assets bundled into the npm package
 ├── package.json          npm metadata; build/test scripts
 ├── Cargo.toml            workspace manifest for the native crate
@@ -58,9 +58,11 @@ plus a worker image, used only when a task is handed off to the cloud.
 └── AGENTS.md             this file
 ```
 
-`dist/` is intentionally checked in: the npm `files` allowlist ships `dist/`,
-`assets/`, `README.md`, `package.json`. After any source change that should ship,
-rebuild so `dist/` (including `dist/native/rudder-native`) is current.
+`dist/` is build output and is NOT tracked in git (it was removed from the repo
+in PR #15). The npm `files` allowlist still ships `dist/`, `assets/`, `README.md`,
+`package.json`, and `prepack` runs the full build, so `npm publish` always packs
+a fresh `dist/` (including `dist/native/rudder-native`). Rebuild before
+publishing; there is nothing to commit under `dist/`.
 
 ---
 
@@ -422,7 +424,9 @@ Always, before shipping a source change:
 1. `npm run check` (or `npm run build`),
 2. `cargo test --manifest-path native/Cargo.toml` if `native/` changed,
 3. `node --test tests/*.test.mjs`,
-4. rebuild so `dist/` (incl. `dist/native/rudder-native`) is current and committed.
+4. rebuild before publishing so the packed `dist/` (incl.
+   `dist/native/rudder-native`) is current. `prepack` does this automatically;
+   `dist/` is not committed, so there is nothing to stage.
 
 ---
 
@@ -448,8 +452,9 @@ Always, before shipping a source change:
   user's global Codex install.
 - **Style.** No em dashes in copy or UI strings. Avoid "massively parallel"
   framing in marketing copy.
-- **`dist/` is committed.** Forgetting to rebuild ships stale JS or a stale native
-  binary.
+- **`dist/` is build output, not committed** (removed from git in PR #15).
+  `prepack` rebuilds it on publish; do not `git add dist/`. Forgetting to rebuild
+  before publishing would ship stale JS or a stale native binary.
 
 ---
 
