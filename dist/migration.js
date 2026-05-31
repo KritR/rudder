@@ -38,7 +38,14 @@ const RESUMABLE_BACKENDS = new Set(["claude"]);
  */
 export async function findMigrationCandidates(repoRoot) {
     const runsDir = path.join(repoRoot, ".rudder", "runs");
-    const entries = await fsp.readdir(runsDir, { withFileTypes: true }).catch(() => []);
+    const entries = await fsp.readdir(runsDir, { withFileTypes: true }).catch((err) => {
+        // A missing runs dir means "no candidates"; surface real access failures
+        // (EACCES/EIO/ENOTDIR) instead of masking them as an empty result.
+        if (err && err.code === "ENOENT") {
+            return [];
+        }
+        throw err;
+    });
     const out = [];
     for (const entry of entries) {
         if (!entry.isDirectory()) {

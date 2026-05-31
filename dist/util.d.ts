@@ -8,9 +8,15 @@ export declare function ensureDir(dir: string): Promise<void>;
 export declare function pathExists(filePath: string): Promise<boolean>;
 export declare function pathExistsSync(filePath: string): boolean;
 export declare function readJson<T>(filePath: string): Promise<T | null>;
+export declare function withPathLock<T>(filePath: string, fn: () => Promise<T>): Promise<T>;
 export declare function writeJson(filePath: string, value: JsonValue, options?: {
     mode?: number;
 }): Promise<void>;
+/**
+ * Atomically read, transform, and write a JSON file under the per-path lock so
+ * a concurrent writer cannot clobber fields between the read and the write.
+ */
+export declare function updateJson<T>(filePath: string, transform: (current: T | null) => JsonValue): Promise<void>;
 export declare function commandExists(command: string): boolean;
 export declare class MissingToolError extends Error {
     readonly tool: string;

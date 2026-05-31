@@ -3,9 +3,7 @@ type Detection = {
     claudeCommand: boolean;
     codexCommand: boolean;
     acpxCommand: boolean;
-    jjCommand: boolean;
     acpxVersion?: string;
-    jjVersion?: string;
     npmAcpxLatest?: string;
     anthropicEnv?: boolean;
     openaiEnv?: boolean;

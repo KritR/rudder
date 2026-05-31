@@ -143,17 +143,46 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     setSelectedRunId((current) => current ?? nextRuns[0]?.id);
   }, [defaults.backend, defaults.model, preferencesLoaded]);
 
+  // Read the latest refresh and the typing state through refs so the poll
+  // timer is created once instead of being torn down on every keystroke (which
+  // could starve the periodic refresh while the user types steadily).
+  const refreshRef = useRef(refresh);
   useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => {
-      void refresh();
-    }, input ? 1500 : 900);
-    return () => clearInterval(timer);
-  }, [input, refresh]);
+    refreshRef.current = refresh;
+  }, [refresh]);
+  const inputActiveRef = useRef(input.length > 0);
+  useEffect(() => {
+    inputActiveRef.current = input.length > 0;
+  }, [input]);
 
   useEffect(() => {
     let cancelled = false;
-    const configuredDefault = modelForBackend(backend, config);
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => {
+      timer = setTimeout(async () => {
+        if (cancelled) {
+          return;
+        }
+        await refreshRef.current();
+        if (!cancelled) {
+          schedule();
+        }
+      }, inputActiveRef.current ? 1500 : 900);
+    };
+    void refreshRef.current();
+    schedule();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, []);
+
+  // Depend on the derived configured default (a string), not the whole config
+  // object, which is reallocated on every refresh tick. Otherwise discovery
+  // re-fires constantly and resets the menu index out from under the user.
+  const configuredDefault = modelForBackend(backend, config);
+  useEffect(() => {
+    let cancelled = false;
     void discoverModelOptions(backend, configuredDefault)
       .then((options) => {
         if (!cancelled) {
@@ -164,12 +193,13 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       .catch(() => {
         if (!cancelled) {
           setDiscoveredModels(fallbackModelOptions(backend, configuredDefault));
+          setModelMenuIndex(0);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [backend, config]);
+  }, [backend, configuredDefault]);
 
   const selectedIndex = Math.max(0, runs.findIndex((run) => run.id === selectedRunId));
   const selectedRun = runs[selectedIndex];
@@ -180,6 +210,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     () => discoveredModels.length ? discoveredModels : fallbackModelOptions(backend, modelForBackend(backend, config)),
     [backend, config, discoveredModels],
   );
+  // Keep the highlighted option in range when the list shrinks asynchronously
+  // (e.g. discovery falls back to a shorter list while the menu is open).
+  useEffect(() => {
+    setModelMenuIndex((index) => Math.min(index, Math.max(0, modelOptions.length - 1)));
+  }, [modelOptions.length]);
   const commandOptions = useMemo(() => filterCommands(input), [input]);
   const commandMenuOpen = input.startsWith("/") && !modelMenuOpen && commandOptions.length > 0;
 

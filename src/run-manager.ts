@@ -20,18 +20,15 @@ import {
   runDir,
   saveRunRecord,
 } from "./state.js";
-import type { BackendId, EffortLevel, JsonValue, RunRecord, RudderEvent, VcsMode, VerificationResult } from "./types.js";
+import type { BackendId, EffortLevel, JsonValue, RunRecord, RudderEvent, VerificationResult } from "./types.js";
 import {
   appendEvent,
 } from "./state.js";
 import {
   activeRunsForCheckout,
-  createRunJjWorkspace,
   createRunWorktree,
   currentBranch,
   currentCommit,
-  currentJjChangeId,
-  detectVcsMode,
   findRepoRoot,
   mergeRunIntoCurrentBranch,
   processAlive,
@@ -89,19 +86,18 @@ export async function startRun(params: {
         ? config.backends.codex?.model
         : config.backends.acpx?.model);
   const effort = params.effort ?? effortForBackend(backend, config);
-  const vcs = detectVcsMode(repoRoot, config.vcs);
 
   const active = await activeRunsForCheckout(repoRoot, repoRoot);
   if (params.queue && active.length > 0) {
     throw new Error("Queue mode is not implemented yet; omit --queue to create a worktree run.");
   }
   const useWorktree = Boolean(params.worktree || active.length > 0);
-  const baseCommit = await baseRevision(repoRoot, vcs, useWorktree);
-  const targetBranch = await targetRevision(repoRoot, vcs);
+  const baseCommit = await baseRevision(repoRoot, useWorktree);
+  const targetBranch = await targetRevision(repoRoot);
   const id = newRunId(params.task);
   const worktreeInfo = useWorktree
-    ? await createRunWorkspace({ vcs, repoRoot, runId: id, task: params.task, baseCommit })
-    : { path: repoRoot, branch: undefined, workspaceName: undefined };
+    ? await createRunWorkspace({ repoRoot, runId: id, task: params.task, baseCommit })
+    : { path: repoRoot, branch: undefined };
   const run = await createRunRecord({
     id,
     repoRoot,
@@ -111,10 +107,8 @@ export async function startRun(params: {
     effort,
     targetBranch,
     baseCommit,
-    vcs,
     useWorktree,
     worktreeBranch: worktreeInfo.branch,
-    worktreeWorkspaceName: worktreeInfo.workspaceName,
     worktreePath: worktreeInfo.path,
   });
   await emit(run, {
@@ -122,7 +116,7 @@ export async function startRun(params: {
     runId: run.id,
     type: "run.created",
     message: useWorktree
-      ? `Created ${workspaceKind(vcs)} ${shortenHome(worktreeInfo.path)}`
+      ? `Created worktree ${shortenHome(worktreeInfo.path)}`
       : "Created run in current checkout",
   });
   await writeAgentContext(repoRoot);
@@ -154,7 +148,7 @@ export async function startRun(params: {
   if (!params.quiet && !params.silent) {
     console.log(`Started ${run.id}`);
     console.log(`  backend: ${backend}${model ? ` (${model})` : ""}`);
-    console.log(`  mode:    ${useWorktree ? `${workspaceKind(vcs)} ${shortenHome(worktreeInfo.path)}` : "current checkout"}`);
+    console.log(`  mode:    ${useWorktree ? `worktree ${shortenHome(worktreeInfo.path)}` : "current checkout"}`);
   }
   if (params.detach || !isTty()) {
     if (params.silent) {
@@ -200,11 +194,10 @@ export async function startNativeRun(params: {
       ? config.backends.claude?.model
       : config.backends.codex?.model);
   const effort = params.effort ?? effortForBackend(backend, config);
-  const vcs = detectVcsMode(repoRoot, config.vcs);
-  const baseCommit = await baseRevision(repoRoot, vcs, true);
-  const targetBranch = await targetRevision(repoRoot, vcs);
+  const baseCommit = await baseRevision(repoRoot, true);
+  const targetBranch = await targetRevision(repoRoot);
   const id = newRunId(params.task);
-  const worktreeInfo = await createRunWorkspace({ vcs, repoRoot, runId: id, task: params.task, baseCommit });
+  const worktreeInfo = await createRunWorkspace({ repoRoot, runId: id, task: params.task, baseCommit });
   const run = await createRunRecord({
     id,
     repoRoot,
@@ -214,10 +207,8 @@ export async function startNativeRun(params: {
     effort,
     targetBranch,
     baseCommit,
-    vcs,
     useWorktree: true,
     worktreeBranch: worktreeInfo.branch,
-    worktreeWorkspaceName: worktreeInfo.workspaceName,
     worktreePath: worktreeInfo.path,
   });
   run.session = {
@@ -231,7 +222,7 @@ export async function startNativeRun(params: {
     ts: nowIso(),
     runId: run.id,
     type: "run.created",
-    message: `Created ${workspaceKind(vcs)} ${shortenHome(worktreeInfo.path)}`,
+    message: `Created worktree ${shortenHome(worktreeInfo.path)}`,
   });
   await writeAgentContext(repoRoot);
 
@@ -343,9 +334,8 @@ export async function startNativePlan(params: {
       ? config.backends.claude?.model
       : config.backends.codex?.model);
   const effort = params.effort ?? effortForBackend(backend, config);
-  const vcs = detectVcsMode(repoRoot, config.vcs);
-  const baseCommit = await baseRevision(repoRoot, vcs, false);
-  const targetBranch = await targetRevision(repoRoot, vcs);
+  const baseCommit = await baseRevision(repoRoot, false);
+  const targetBranch = await targetRevision(repoRoot);
   const id = newRunId(params.task);
   const run = await createRunRecord({
     id,
@@ -357,7 +347,6 @@ export async function startNativePlan(params: {
     mode: "plan",
     targetBranch,
     baseCommit,
-    vcs,
     useWorktree: false,
     worktreePath: repoRoot,
   });
@@ -751,7 +740,7 @@ export async function writeAgentContext(repoRoot: string): Promise<void> {
 
 function formatAgentContextRun(run: RunRecord): string {
   const location = run.worktree.enabled
-    ? `${workspaceKind(run.vcs ?? "git")}=${shortenHome(run.worktree.path)}`
+    ? `worktree=${shortenHome(run.worktree.path)}`
     : "current checkout";
   const prompt = run.currentPrompt && run.currentPrompt !== run.task ? ` current="${run.currentPrompt.slice(0, 140)}"` : "";
   return `- ${run.id}: ${run.status}, ${run.backend}, ${location}, task="${run.task.slice(0, 140)}"${prompt}`;
@@ -802,34 +791,20 @@ function toNativeBackend(backend: BackendId): Exclude<BackendId, "acpx"> {
 }
 
 async function createRunWorkspace(params: {
-  vcs: VcsMode;
   repoRoot: string;
   runId: string;
   task: string;
   baseCommit: string;
-}): Promise<{ path: string; branch?: string; workspaceName?: string }> {
-  if (params.vcs === "jj") {
-    return await createRunJjWorkspace(params);
-  }
+}): Promise<{ path: string; branch?: string }> {
   return await createRunWorktree(params);
 }
 
-async function baseRevision(repoRoot: string, vcs: VcsMode, useWorktree: boolean): Promise<string> {
-  if (vcs === "jj") {
-    return await currentJjChangeId(repoRoot) || "";
-  }
+async function baseRevision(repoRoot: string, useWorktree: boolean): Promise<string> {
   return useWorktree ? await worktreeBaseCommit(repoRoot) : await currentCommit(repoRoot);
 }
 
-async function targetRevision(repoRoot: string, vcs: VcsMode): Promise<string> {
-  if (vcs === "jj") {
-    return await currentJjChangeId(repoRoot) || "@";
-  }
+async function targetRevision(repoRoot: string): Promise<string> {
   return await currentBranch(repoRoot);
-}
-
-function workspaceKind(vcs: VcsMode): string {
-  return vcs === "jj" ? "jj workspace" : "worktree";
 }
 
 function effortForBackend(backend: BackendId, config: Awaited<ReturnType<typeof loadConfig>>): EffortLevel | undefined {
@@ -873,7 +848,7 @@ export async function listProjectRuns(options?: { json?: boolean }): Promise<voi
     return;
   }
   for (const run of runs) {
-    const wt = run.worktree.enabled ? ` ${workspaceKind(run.vcs ?? "git")}=${shortenHome(run.worktree.path)}` : "";
+    const wt = run.worktree.enabled ? ` worktree=${shortenHome(run.worktree.path)}` : "";
     console.log(`${run.id}  ${run.status}  ${run.backend}${wt}  ${run.task}`);
   }
 }
@@ -1149,9 +1124,6 @@ function canCleanupRun(run: RunRecord, force: boolean): boolean {
   }
   if (force) {
     return true;
-  }
-  if ((run.vcs ?? "git") === "jj") {
-    return run.status === "merged" || run.status === "completed";
   }
   return run.status === "merged";
 }

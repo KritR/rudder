@@ -27,17 +27,20 @@
           BlinkMacSystemFont,
           "Segoe UI",
           sans-serif;
-        font-weight: 360;
+        font-weight: 400;
         --paper: #f5f3ee;
         --ink: #151515;
-        --muted: #5f5d57;
+        --muted: #46433d;
         --line: #24231f;
         --soft-line: #d8d3c8;
         --panel: #fffdf7;
-        --cyan: #00818a;
-        --green: #0c8a3d;
-        --amber: #b45f06;
-        --magenta: #b13b88;
+        --cyan: #006d75;
+        --green: #0a7030;
+        --amber: #934e04;
+        --magenta: #95306f;
+        --shadow-color: #1f1d18;
+        --shadow-sm: 6px 6px 0 var(--shadow-color);
+        --shadow-lg: 12px 12px 0 var(--shadow-color);
       }
 
       * {
@@ -68,7 +71,7 @@
 
       a {
         color: inherit;
-        text-decoration-color: rgba(21, 21, 21, 0.35);
+        text-decoration-color: rgba(21, 21, 21, 0.55);
         text-decoration-thickness: 1px;
         text-underline-offset: 4px;
         transition: color 160ms ease, text-decoration-color 160ms ease;
@@ -168,7 +171,7 @@
         max-width: 100%;
         border: 1px solid var(--line);
         background: var(--panel);
-        box-shadow: 6px 6px 0 var(--line);
+        box-shadow: var(--shadow-sm);
       }
 
       .install code {
@@ -232,7 +235,7 @@
         aspect-ratio: 2000 / 930;
         border: 1px solid var(--line);
         background: #e9ebf0;
-        box-shadow: 12px 12px 0 var(--line);
+        box-shadow: var(--shadow-lg);
       }
 
       .shot img {
@@ -248,7 +251,7 @@
         border-style: solid;
         border-color: var(--line);
         background: var(--panel);
-        box-shadow: 12px 12px 0 var(--line);
+        box-shadow: var(--shadow-lg);
       }
 
       .terminal-stat {
@@ -313,6 +316,13 @@
         padding: 22px;
         border: 1px solid var(--line);
         background: var(--panel);
+        box-shadow: var(--shadow-sm);
+        transition: transform 180ms ease, box-shadow 180ms ease;
+      }
+
+      .card:hover {
+        transform: translate(-2px, -2px);
+        box-shadow: 8px 8px 0 var(--shadow-color);
       }
 
       .card h3 {
@@ -399,6 +409,8 @@
         width: fit-content;
         padding: 5px 8px;
         border: 1px solid currentColor;
+        border-radius: 2px;
+        box-shadow: 2px 2px 0 currentColor;
         color: var(--cyan);
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 13px;
@@ -407,7 +419,6 @@
 
       .key-tile strong {
         display: block;
-        margin-top: 42px;
         font-size: clamp(26px, 4vw, 46px);
         font-weight: 390;
         line-height: 0.96;
@@ -566,7 +577,7 @@
 
         .shot,
         .terminal-bar {
-          box-shadow: 6px 6px 0 var(--line);
+          box-shadow: 6px 6px 0 var(--shadow-color);
         }
 
         .shot {
@@ -852,9 +863,15 @@ rudder</code>
           const target = document.getElementById(button.dataset.copy);
           if (!target) return;
 
-          await navigator.clipboard.writeText(target.textContent.trim());
           const original = button.textContent;
-          button.textContent = "Copied";
+          let copied = true;
+          try {
+            await navigator.clipboard.writeText(target.textContent.trim());
+          } catch {
+            copied = false;
+          }
+          button.textContent = copied ? "Copied" : "Copy failed";
+          button.style.background = copied ? "var(--green)" : "var(--amber)";
 
           if (!reduceMotion) {
             animate(button, { scale: [1, 0.96, 1] }, { duration: 0.28, ease: "easeOut" });
@@ -862,6 +879,7 @@ rudder</code>
 
           window.setTimeout(() => {
             button.textContent = original;
+            button.style.background = "";
           }, 1200);
         });
       });

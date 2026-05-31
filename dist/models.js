@@ -72,7 +72,15 @@ async function discoverCodexModelsLocal() {
     if (!raw) {
         return [];
     }
-    const parsed = JSON.parse(raw);
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        // A partially-written cache (Codex writing concurrently) should degrade to
+        // "no local models" for this source, not reject the whole discovery.
+        return [];
+    }
     return (parsed.models ?? [])
         .filter((model) => model.slug && model.slug !== "codex-auto-review")
         .map((model) => ({

@@ -446,7 +446,7 @@ async function githubOAuthRequest<T>(url: string, body: Record<string, string>):
   const text = await response.text();
   const parsed = text ? parseJson(text) : null;
   if (!response.ok) {
-    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `${response.status} ${response.statusText}`);
+    throw new Error(responseErrorMessage(parsed) || text.trim() || `${response.status} ${response.statusText}`);
   }
   return parsed as T;
 }
@@ -1000,7 +1000,7 @@ async function cloudClient(options: { requireToken: boolean }): Promise<CloudCli
       const text = await response.text();
       const parsed = text ? parseJson(text) : null;
       if (!response.ok) {
-        const message = responseErrorMessage(parsed) ?? text.trim() ?? `${response.status} ${response.statusText}`;
+        const message = responseErrorMessage(parsed) || text.trim() || `${response.status} ${response.statusText}`;
         throw new Error(`Rudder Cloud request failed: ${message}`);
       }
       return parsed as T;

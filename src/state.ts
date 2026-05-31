@@ -20,6 +20,7 @@ import {
   shortHash,
   slugPrefix,
   slugify,
+  updateJson,
   writeJson,
 } from "./util.js";
 import { llmSummarizeTask, summarizeTask } from "./task-summary.js";
@@ -317,7 +318,16 @@ export async function createRunRecord(params: {
 export async function saveRunRecord(record: RunRecord): Promise<void> {
   record.taskSummary = record.taskSummary || summarizeTask(record.task);
   record.updatedAt = nowIso();
-  await writeJson(runRecordPath(record.repoRoot, record.id), record);
+  await updateJson<RunRecord>(runRecordPath(record.repoRoot, record.id), (prev) => {
+    // A long-lived in-memory `record` can be stale: the background LLM
+    // summarizer reads + rewrites run.json out of band. Preserve the title it
+    // persisted instead of clobbering it with the naive summary.
+    if (prev?.taskSummaryLlm && !record.taskSummaryLlm) {
+      record.taskSummary = prev.taskSummary;
+      record.taskSummaryLlm = true;
+    }
+    return record;
+  });
 }
 
 const inflightLlmSummaries = new Set<string>();

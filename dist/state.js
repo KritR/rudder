@@ -1,6 +1,6 @@
 import path from "node:path";
 import fsp from "node:fs/promises";
-import { ensureDir, newRunId, nowIso, readJson, rudderHome, shortHash, slugPrefix, slugify, writeJson, } from "./util.js";
+import { ensureDir, newRunId, nowIso, readJson, rudderHome, shortHash, slugPrefix, slugify, updateJson, writeJson, } from "./util.js";
 import { llmSummarizeTask, summarizeTask } from "./task-summary.js";
 export function globalConfigPath() {
     return path.join(rudderHome(), "config.json");
@@ -239,7 +239,16 @@ export async function createRunRecord(params) {
 export async function saveRunRecord(record) {
     record.taskSummary = record.taskSummary || summarizeTask(record.task);
     record.updatedAt = nowIso();
-    await writeJson(runRecordPath(record.repoRoot, record.id), record);
+    await updateJson(runRecordPath(record.repoRoot, record.id), (prev) => {
+        // A long-lived in-memory `record` can be stale: the background LLM
+        // summarizer reads + rewrites run.json out of band. Preserve the title it
+        // persisted instead of clobbering it with the naive summary.
+        if (prev?.taskSummaryLlm && !record.taskSummaryLlm) {
+            record.taskSummary = prev.taskSummary;
+            record.taskSummaryLlm = true;
+        }
+        return record;
+    });
 }
 const inflightLlmSummaries = new Set();
 export async function loadRunRecord(repoRoot, runId) {

@@ -701,8 +701,12 @@ async function packageVersion(): Promise<string> {
   if (!raw) {
     return "unknown";
   }
-  const parsed = JSON.parse(raw) as { version?: string };
-  return parsed.version ?? "unknown";
+  try {
+    const parsed = JSON.parse(raw) as { version?: string };
+    return parsed.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function printHelp(): void {

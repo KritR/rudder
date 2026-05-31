@@ -78,13 +78,39 @@ export async function readJson<T>(filePath: string): Promise<T | null> {
   }
 }
 
-export async function writeJson(
+/**
+ * Serializes async work per file path so concurrent writers (and
+ * read-modify-write sequences) to the same file cannot interleave. Each call
+ * runs after the previous one for that path settles, regardless of outcome.
+ */
+const pathLocks = new Map<string, Promise<unknown>>();
+
+export function withPathLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(filePath);
+  const run = (pathLocks.get(key) ?? Promise.resolve()).then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  pathLocks.set(key, tail);
+  void tail.then(() => {
+    if (pathLocks.get(key) === tail) {
+      pathLocks.delete(key);
+    }
+  });
+  return run;
+}
+
+async function writeJsonRaw(
   filePath: string,
   value: JsonValue,
   options?: { mode?: number },
 ): Promise<void> {
   await ensureDir(path.dirname(filePath));
-  const temp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  // Unique temp name per write: two concurrent writes to the same path within
+  // the same millisecond must not share a temp file, or one rename consumes the
+  // other's temp and the loser throws ENOENT.
+  const temp = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fsp.writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, {
     encoding: "utf8",
     mode: options?.mode ?? 0o644,
@@ -93,6 +119,28 @@ export async function writeJson(
   if (options?.mode !== undefined) {
     await fsp.chmod(filePath, options.mode);
   }
+}
+
+export function writeJson(
+  filePath: string,
+  value: JsonValue,
+  options?: { mode?: number },
+): Promise<void> {
+  return withPathLock(filePath, () => writeJsonRaw(filePath, value, options));
+}
+
+/**
+ * Atomically read, transform, and write a JSON file under the per-path lock so
+ * a concurrent writer cannot clobber fields between the read and the write.
+ */
+export function updateJson<T>(
+  filePath: string,
+  transform: (current: T | null) => JsonValue,
+): Promise<void> {
+  return withPathLock(filePath, async () => {
+    const current = await readJson<T>(filePath);
+    await writeJsonRaw(filePath, transform(current));
+  });
 }
 
 export function commandExists(command: string): boolean {
@@ -107,7 +155,6 @@ const TOOL_INSTALL_HINTS: Record<string, string> = {
   claude: "Install with `npm install -g @anthropic-ai/claude-code` (see https://github.com/anthropics/claude-code).",
   codex: "Install with `npm install -g @openai/codex` (see https://github.com/openai/codex).",
   acpx: "Install with `npm install -g acpx@latest` or run `rudder onboard`.",
-  jj: "Install Jujutsu and ensure `jj` is on PATH.",
 };
 
 export class MissingToolError extends Error {

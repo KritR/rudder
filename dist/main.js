@@ -641,8 +641,13 @@ async function packageVersion() {
     if (!raw) {
         return "unknown";
     }
-    const parsed = JSON.parse(raw);
-    return parsed.version ?? "unknown";
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed.version ?? "unknown";
+    }
+    catch {
+        return "unknown";
+    }
 }
 function printHelp() {
     console.log(`rudder

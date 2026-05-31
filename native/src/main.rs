@@ -212,6 +212,9 @@ impl AgentMode {
 struct App {
     focus: FocusPane,
     nav_mode: bool,
+    /// One-shot leader armed by Ctrl+W: the next keypress runs a dashboard
+    /// command (focus a pane, review, merge, ...) instead of reaching the pane.
+    leader_pending: bool,
     worker_view: WorkerView,
     cwd: PathBuf,
     branch: Option<String>,
@@ -484,6 +487,7 @@ impl App {
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
+            leader_pending: false,
             worker_view: WorkerView::Terminal,
             cwd,
             branch,
@@ -664,6 +668,12 @@ impl App {
             // fall through and let the key be handled normally
         }
 
+        // One-shot leader: Ctrl+W arms it (below) and the next keypress is
+        // routed here as a dashboard command instead of going to the pane.
+        if self.leader_pending {
+            return self.handle_leader_key(key);
+        }
+
         if self.handle_cloud_prompt_key(key) {
             return false;
         }
@@ -688,33 +698,62 @@ impl App {
             return false;
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+            self.leader_pending = true;
+            self.nav_mode = false;
+            self.notice = Some(
+                "Ctrl+W: 1 agents  2 worker  3 task  v review  m merge  R review-all  M merge-all  Esc cancels"
+                    .to_string(),
+            );
+            return false;
+        }
+
         if self.nav_mode {
             return self.handle_nav_key(key);
         }
 
-        if key
+        // Option/Alt + 1/2/3 (and v) jumps directly between panes. Many macOS
+        // terminals (Terminal.app and default iTerm2) do not report an Alt
+        // modifier for Option+key and instead emit the typographic character it
+        // produces on a US layout, so accept those bare characters as well:
+        // Option+1=¡, Option+2=™, Option+3=£, Option+v=√.
+        let alt_like = key
             .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::META)
-        {
-            match key.code {
-                KeyCode::Char('1') => {
-                    self.focus = FocusPane::Agents;
-                    return false;
-                }
-                KeyCode::Char('2') => {
-                    self.focus = FocusPane::Worker;
-                    return false;
-                }
-                KeyCode::Char('3') => {
-                    self.focus = FocusPane::Task;
-                    return false;
-                }
-                KeyCode::Char('v') => {
-                    self.toggle_worker_view();
-                    return false;
-                }
-                _ => {}
+            .intersects(KeyModifiers::ALT | KeyModifiers::META);
+        match key.code {
+            KeyCode::Char('1') if alt_like => {
+                self.focus = FocusPane::Agents;
+                return false;
             }
+            KeyCode::Char('2') if alt_like => {
+                self.focus = FocusPane::Worker;
+                return false;
+            }
+            KeyCode::Char('3') if alt_like => {
+                self.focus = FocusPane::Task;
+                return false;
+            }
+            KeyCode::Char('v') if alt_like => {
+                self.toggle_worker_view();
+                return false;
+            }
+            KeyCode::Char('\u{00a1}') => {
+                self.focus = FocusPane::Agents;
+                return false;
+            }
+            KeyCode::Char('\u{2122}') => {
+                self.focus = FocusPane::Worker;
+                return false;
+            }
+            KeyCode::Char('\u{00a3}') => {
+                self.focus = FocusPane::Task;
+                return false;
+            }
+            KeyCode::Char('\u{221a}') => {
+                self.toggle_worker_view();
+                return false;
+            }
+            _ => {}
         }
 
         match self.focus {
@@ -754,6 +793,48 @@ impl App {
             KeyCode::Char('d') => self.delete_selected_agent(),
             KeyCode::Char('q') => return true,
             _ => {}
+        }
+        false
+    }
+
+    /// Runs a single dashboard command after the Ctrl+W leader is armed, then
+    /// disarms. Mirrors nav mode but is one-shot rather than sticky.
+    fn handle_leader_key(&mut self, key: KeyEvent) -> bool {
+        self.leader_pending = false;
+        match key.code {
+            KeyCode::Esc => {
+                self.delete_pending = None;
+                self.notice = Some("leader cancelled".to_string());
+            }
+            KeyCode::Char('1') => {
+                self.delete_pending = None;
+                self.focus = FocusPane::Agents;
+            }
+            KeyCode::Char('2') => {
+                self.delete_pending = None;
+                self.focus = FocusPane::Worker;
+            }
+            KeyCode::Char('3') => {
+                self.delete_pending = None;
+                self.focus = FocusPane::Task;
+            }
+            KeyCode::Char('v') => self.toggle_worker_view(),
+            KeyCode::Char('r') => self.start_rename_selected_agent(),
+            KeyCode::Char('u') => self.request_sync_selected_agent(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
+            KeyCode::Char('m') => self.request_merge_selected_agent(),
+            KeyCode::Char('R') => self.review_all_ready(),
+            KeyCode::Char('M') => self.request_merge_all_ready(),
+            KeyCode::Char('d') => self.delete_selected_agent(),
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Double Ctrl+W keeps the leader armed rather than cancelling.
+                self.leader_pending = true;
+            }
+            _ => {
+                self.notice = Some("leader: unknown key (Esc to cancel)".to_string());
+            }
         }
         false
     }
@@ -1410,7 +1491,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Option-1/2/3 pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
+                    "Option-1/2/3 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
                         .to_string(),
                 );
             }
@@ -2825,7 +2906,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 pane  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /sync  /goal"
+                    "Option-1/2/3 or ^W pane  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /sync  /goal"
                         .to_string(),
                 );
                 true
@@ -6930,6 +7011,60 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn ctrl_w_leader_then_digit_focuses_pane() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(app.leader_pending);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!app.leader_pending);
+        assert_eq!(app.focus, FocusPane::Worker);
+    }
+
+    #[test]
+    fn ctrl_w_leader_is_one_shot() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(app.focus, FocusPane::Agents);
+        // The leader disarmed after one command: a bare digit is not a command.
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.focus, FocusPane::Agents);
+    }
+
+    #[test]
+    fn ctrl_w_leader_escape_cancels_without_action() {
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(app.leader_pending);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.leader_pending);
+        assert_eq!(app.focus, FocusPane::Worker);
+    }
+
+    #[test]
+    fn option_typographic_chars_focus_panes() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        // Option+1 on a US macOS layout arrives as the bare char ¡.
+        app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a1}'), KeyModifiers::NONE));
+        assert_eq!(app.focus, FocusPane::Agents);
+        // Option+3 = £
+        app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a3}'), KeyModifiers::NONE));
+        assert_eq!(app.focus, FocusPane::Task);
+    }
+
+    #[test]
+    fn alt_digit_still_focuses_pane() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.focus, FocusPane::Worker);
+    }
+
+    #[test]
     fn merge_all_command_opens_confirmation() {
         let mut app = App::new();
         let mut run = test_agent_run("run-1", "test task");
@@ -8170,9 +8305,9 @@ fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
+        "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan  /sync"
+        "Enter start  Up/Down history  Option-1/2/3 or ^W pane  /plan  /rudder-plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -8271,9 +8406,9 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
+        "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan  /sync"
+        "Enter start  Up/Down history  Option-1/2/3 or ^W pane  /plan  /rudder-plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -8912,9 +9047,9 @@ fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> us
 
 fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
     let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
+        "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan  /sync"
+        "Enter start  Up/Down history  Option-1/2/3 or ^W pane  /plan  /rudder-plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
